@@ -4,8 +4,11 @@ OpenAI 账号自动注册（密码注册 + OAuth 换 token）。
 流程概要：Worker 临时邮箱 → OAuth 授权链 → 注册表单与密码 → 邮箱 OTP（若需要）
 → 创建账户；若进入手机号页或无 workspace，则另起独立 Session 用邮箱密码登录完成 OAuth。
 
-依赖环境变量（可由 gui 写入进程环境）：WORKER_DOMAIN、FREEMAIL_USERNAME、FREEMAIL_PASSWORD；
-可选 TOKEN_OUTPUT_DIR、OPENAI_SSL_VERIFY、SKIP_NET_CHECK。支持 --proxy 与命令行循环参数。
+依赖环境变量（可由 gui 写入进程环境）：MAIL_SERVICE_PROVIDER、WORKER_DOMAIN、
+FREEMAIL_USERNAME、FREEMAIL_PASSWORD；
+可选 TOKEN_OUTPUT_DIR、OPENAI_SSL_VERIFY、SKIP_NET_CHECK、MAILFREE_RANDOM_DOMAIN。
+可选 MAIL_ALLOWED_DOMAINS（JSON 数组或逗号分隔域名）。
+支持 --proxy 与命令行循环参数。
 """
 
 import argparse
@@ -28,6 +31,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from curl_cffi import requests
+from mail_services import MailServiceError, build_mail_service, normalize_mail_provider
 
 
 def _out(msg: str, end: str = "\n", flush: bool = False) -> None:
@@ -71,16 +75,19 @@ def _load_dotenv(path: str = ".env") -> None:
 
 _load_dotenv()
 
-# --- Worker 邮箱与输出目录（可由 .env 或 GUI 注入）---
+# --- 邮箱服务与输出目录（可由 .env 或 GUI 注入）---
 WORKER_DOMAIN = os.getenv("WORKER_DOMAIN", "").strip()
 if WORKER_DOMAIN and not WORKER_DOMAIN.startswith("http"):
     WORKER_DOMAIN = f"https://{WORKER_DOMAIN}"
 WORKER_DOMAIN = WORKER_DOMAIN.rstrip("/")
 FREEMAIL_USERNAME = os.getenv("FREEMAIL_USERNAME", "").strip()
 FREEMAIL_PASSWORD = os.getenv("FREEMAIL_PASSWORD", "").strip()
+MAIL_SERVICE_PROVIDER = normalize_mail_provider(os.getenv("MAIL_SERVICE_PROVIDER", "mailfree"))
+MAIL_ALLOWED_DOMAINS: List[str] = []
 TOKEN_OUTPUT_DIR = os.getenv("TOKEN_OUTPUT_DIR", "").strip()
 
-_freemail_session_cookie: Optional[str] = None
+_mail_service_client: Any = None
+_mail_service_sig: tuple[str, str, str, str, bool] | None = None
 
 
 def _ssl_verify() -> bool:
@@ -95,71 +102,172 @@ def _skip_net_check() -> bool:
     return flag in {"1", "true", "yes", "on"}
 
 
-def _freemail_login(proxies: Any = None) -> Optional[str]:
-    """登录 freemail 服务，返回 session cookie 值；失败返回 None"""
-    global _freemail_session_cookie
-    if _freemail_session_cookie:
-        return _freemail_session_cookie
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
     try:
-        res = requests.post(
-            f"{WORKER_DOMAIN}/api/login",
-            json={"username": FREEMAIL_USERNAME, "password": FREEMAIL_PASSWORD},
-            proxies=proxies,
-            impersonate="safari",
-            verify=_ssl_verify(),
-            timeout=15,
+        val = int(raw)
+    except Exception:
+        return default
+    return max(lo, min(hi, val))
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except Exception:
+        return default
+    return max(lo, min(hi, val))
+
+
+def _env_list(name: str) -> List[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        out = [str(x).strip() for x in parsed if str(x).strip()]
+        return list(dict.fromkeys(out))
+    out = [x.strip() for x in raw.split(",") if x.strip()]
+    return list(dict.fromkeys(out))
+
+
+MAIL_ALLOWED_DOMAINS = _env_list("MAIL_ALLOWED_DOMAINS")
+
+
+def _email_domain(email: str) -> str:
+    try:
+        if "@" not in str(email or ""):
+            return ""
+        return str(email or "").split("@", 1)[1].strip().lower()
+    except Exception:
+        return ""
+
+
+def _mail_service_signature() -> tuple[str, str, str, str, bool]:
+    provider = normalize_mail_provider(MAIL_SERVICE_PROVIDER)
+    return (
+        provider,
+        str(WORKER_DOMAIN or "").strip().rstrip("/"),
+        str(FREEMAIL_USERNAME or "").strip(),
+        str(FREEMAIL_PASSWORD or ""),
+        _ssl_verify(),
+    )
+
+
+def _mail_service_reset() -> None:
+    global _mail_service_client, _mail_service_sig
+    _mail_service_client = None
+    _mail_service_sig = None
+
+
+def _freemail_session_cookie_reset() -> None:
+    """兼容旧调用：重置邮箱服务会话缓存。"""
+    _mail_service_reset()
+
+
+def _get_mail_service_client():
+    global _mail_service_client, _mail_service_sig
+    sig = _mail_service_signature()
+    if _mail_service_client is not None and _mail_service_sig == sig:
+        return _mail_service_client
+
+    provider, base_url, username, password, verify_ssl = sig
+    try:
+        client = build_mail_service(
+            provider,
+            base_url=base_url,
+            username=username,
+            password=password,
+            verify_ssl=verify_ssl,
         )
-        if res.status_code == 200:
-            cookie_val = res.cookies.get("mailfree-session")
-            if not cookie_val:
-                raw_header = res.headers.get("Set-Cookie", "")
-                m = re.search(r"mailfree-session=([^;]+)", raw_header)
-                if m:
-                    cookie_val = m.group(1)
-            if cookie_val:
-                _freemail_session_cookie = cookie_val
-                return cookie_val
-        _err(f"freemail 登录失败: {res.status_code} {res.text[:200]}")
-    except Exception as e:
-        _err(f"freemail 登录请求出错: {e}")
-    return None
+    except MailServiceError as e:
+        raise RuntimeError(str(e)) from e
 
-
-def _freemail_session_cookie_reset():
-    global _freemail_session_cookie
-    _freemail_session_cookie = None
+    _mail_service_client = client
+    _mail_service_sig = sig
+    return client
 
 
 def get_email_and_token(proxies: Any = None) -> tuple:
     """创建临时邮箱并获取 Token 以兼容原流程"""
     try:
-        if not WORKER_DOMAIN or not FREEMAIL_USERNAME or not FREEMAIL_PASSWORD:
-            _err("未配置 WORKER_DOMAIN 或 FREEMAIL_USERNAME/FREEMAIL_PASSWORD")
-            return "", ""
+        client = _get_mail_service_client()
+        allow_domains = [str(x).strip() for x in (MAIL_ALLOWED_DOMAINS or []) if str(x).strip()]
+        if allow_domains:
+            _info(f"已指定注册域名 {len(allow_domains)} 个")
+        random_domain = os.getenv("MAILFREE_RANDOM_DOMAIN", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        try:
+            domains = client.list_domains(proxies=proxies)
+        except Exception:
+            domains = []
 
-        cookie = _freemail_login(proxies)
-        if not cookie:
-            return "", ""
+        effective_domains: List[str] = []
+        if domains:
+            if allow_domains:
+                allow_set = {str(x).strip().lower() for x in allow_domains if str(x).strip()}
+                effective_domains = [
+                    str(d).strip()
+                    for d in domains
+                    if str(d).strip() and str(d).strip().lower() in allow_set
+                ]
+                missing = [
+                    str(x).strip()
+                    for x in allow_domains
+                    if str(x).strip()
+                    and str(x).strip().lower() not in {str(d).strip().lower() for d in domains}
+                ]
+                if missing:
+                    show = ", ".join(missing[:4])
+                    suffix = "..." if len(missing) > 4 else ""
+                    _warn(f"指定域名不可用 {len(missing)} 个: {show}{suffix}")
+            else:
+                effective_domains = [str(d).strip() for d in domains if str(d).strip()]
+
+        if effective_domains:
+            if random_domain:
+                if allow_domains:
+                    _info(f"mailfree 将在已选域名 {len(effective_domains)} 个中随机切换")
+                else:
+                    _info(f"mailfree 可用域名 {len(effective_domains)} 个，注册时随机切换")
+            else:
+                fixed_domain = str(effective_domains[0]).strip()
+                if allow_domains:
+                    _info(
+                        f"mailfree 已选域名 {len(effective_domains)} 个，"
+                        f"当前固定使用 {fixed_domain}"
+                    )
+                else:
+                    _info(f"mailfree 可用域名 {len(effective_domains)} 个，当前固定使用 {fixed_domain}")
+        elif domains:
+            _warn("指定域名均不可用，将由服务端默认域名策略兜底")
+        else:
+            _warn("mailfree 未返回可用域名列表，将由服务端默认域名策略兜底")
 
         for _ in range(5):
-            res = requests.get(
-                f"{WORKER_DOMAIN}/api/generate",
-                cookies={"mailfree-session": cookie},
-                proxies=proxies,
-                impersonate="safari",
-                verify=_ssl_verify(),
-                timeout=15,
-            )
-            if res.status_code == 200:
-                j = res.json()
-                email = j.get("email")
-                if email:
-                    return email, email
-            if res.status_code == 401:
-                _freemail_session_cookie_reset()
-                cookie = _freemail_login(proxies)
-                if not cookie:
-                    break
+            try:
+                email = client.generate_mailbox(
+                    random_domain=random_domain,
+                    allowed_domains=allow_domains,
+                    proxies=proxies,
+                )
+            except MailServiceError as e:
+                _warn(f"临时邮箱生成失败，准备重试: {e}")
+                email = ""
+            if email:
+                return email, email
 
         _err("临时邮箱创建失败")
         return "", ""
@@ -168,95 +276,29 @@ def get_email_and_token(proxies: Any = None) -> tuple:
         return "", ""
 
 
-def _extract_mail_content(mail_data: Dict[str, Any]) -> str:
-    """合并邮件主题与正文字段，供正则提取 OTP。"""
-    subject = str(mail_data.get("subject") or "")
-    intro = str(mail_data.get("intro") or "")
-    text = str(mail_data.get("text") or "")
-    html = mail_data.get("html") or ""
-    raw = str(mail_data.get("raw") or "")
-    if isinstance(html, list):
-        html = "\n".join(str(x) for x in html)
-    return "\n".join([subject, intro, text, str(html), raw])
-
-
-def _extract_otp_code(content: str) -> str:
-    """从邮件正文中提取 6 位数字验证码。"""
-    if not content:
-        return ""
-    patterns = [
-        r"Your ChatGPT code is\s*(\d{6})",
-        r"ChatGPT code is\s*(\d{6})",
-        r"verification code to continue:\s*(\d{6})",
-        r"Subject:.*?(\d{6})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
-        if match:
-            return match.group(1)
-    fallback = re.search(r"(?<!\d)(\d{6})(?!\d)", content)
-    return fallback.group(1) if fallback else ""
-
-
 def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
     """轮询 Worker 邮箱取 OpenAI 6 位码；邮件按 id 降序优先看较新。"""
-    if not WORKER_DOMAIN or not FREEMAIL_USERNAME or not FREEMAIL_PASSWORD:
-        _err("未配置 WORKER_DOMAIN 或 FREEMAIL_USERNAME/FREEMAIL_PASSWORD")
-        return ""
-
-    cookie = _freemail_login(proxies)
-    if not cookie:
+    _ = token
+    try:
+        client = _get_mail_service_client()
+    except Exception as e:
+        _err(f"邮箱服务初始化失败: {e}")
         return ""
 
     _out(f"[*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
+    poll_rounds = _env_int("OTP_POLL_MAX_ROUNDS", 40, 5, 300)
+    poll_interval = _env_float("OTP_POLL_INTERVAL_SEC", 3.0, 0.2, 15.0)
 
-    for _ in range(40):
-        _out(".", end="", flush=True)
-        try:
-            res = requests.get(
-                f"{WORKER_DOMAIN}/api/emails",
-                params={"mailbox": email},
-                cookies={"mailfree-session": cookie},
-                proxies=proxies,
-                impersonate="safari",
-                verify=_ssl_verify(),
-                timeout=15,
-            )
-            if res.status_code == 200:
-                raw = res.json()
-                if isinstance(raw, list):
-                    mail_list = raw
-                elif isinstance(raw, dict):
-                    mail_list = (
-                        raw.get("messages")
-                        or raw.get("emails")
-                        or raw.get("data", {}).get("emails")
-                        or []
-                    )
-                else:
-                    mail_list = []
-                if isinstance(mail_list, list) and mail_list:
-                    dict_msgs = [m for m in mail_list if isinstance(m, dict)]
-                    if dict_msgs:
-                        dict_msgs.sort(
-                            key=lambda m: str(m.get("id") or m.get("_id") or ""),
-                            reverse=True,
-                        )
-                        iterable = dict_msgs
-                    else:
-                        iterable = mail_list
-                    for msg in iterable:
-                        if not isinstance(msg, dict):
-                            continue
-                        content = _extract_mail_content(msg)
-                        code = _extract_otp_code(content)
-                        if code:
-                            _out(f"\n[*] 已收到验证码: {code}")
-                            return code
-        except Exception:
-            pass
-
-        time.sleep(3)
+    code = client.poll_otp_code(
+        email,
+        poll_rounds=poll_rounds,
+        poll_interval=poll_interval,
+        proxies=proxies,
+        progress_cb=lambda: _out(".", end="", flush=True),
+    )
+    if code:
+        _out(f"\n[*] 已收到验证码: {code}")
+        return code
 
     _out("\n[*] 超时，未收到验证码")
     return ""
@@ -434,6 +476,7 @@ def _post_with_retry(
     retries: int = 2,
 ) -> Any:
     last_error: Optional[Exception] = None
+    backoff_base = _env_float("HTTP_RETRY_BACKOFF_BASE_SEC", 2.0, 0.2, 10.0)
     for attempt in range(retries + 1):
         try:
             if json_body is not None:
@@ -457,7 +500,7 @@ def _post_with_retry(
             last_error = e
             if attempt >= retries:
                 break
-            time.sleep(2 * (attempt + 1))
+            time.sleep(backoff_base * (attempt + 1))
     if last_error:
         raise last_error
     raise RuntimeError("Request failed without exception")
@@ -602,10 +645,10 @@ def _init_accounts_file(output_dir: str = "") -> str:
     return file_name
 
 
-def _append_account_to_file(account: Dict[str, Any]) -> None:
-    """将一个 account 追加写入 accounts JSON 文件"""
+def _append_account_to_file(account: Dict[str, Any]) -> bool:
+    """将一个 account 追加写入 accounts JSON 文件，成功返回 True。"""
     if not _ACCOUNTS_FILE_PATH:
-        return
+        return False
     try:
         with open(_ACCOUNTS_FILE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -613,8 +656,10 @@ def _append_account_to_file(account: Dict[str, Any]) -> None:
         data["accounts"].append(account)
         with open(_ACCOUNTS_FILE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
     except Exception as e:
         _warn(f"写入 accounts 文件失败: {e}")
+        return False
 
 
 # --- HTTP 会话、重定向与注册主流程 ---
@@ -631,6 +676,8 @@ def _session_get_with_tls_retry(
 ) -> Any:
     """curl_cffi 在 Windows 上偶发 TLS(35)/OpenSSL 抖动，做有限次退避重试。"""
     last_err: Optional[Exception] = None
+    delay_base = _env_float("TLS_RETRY_BASE_SEC", 1.0, 0.2, 5.0)
+    delay_step = _env_float("TLS_RETRY_STEP_SEC", 0.85, 0.1, 3.0)
     for attempt in range(max_attempts):
         try:
             return session.get(
@@ -659,7 +706,7 @@ def _session_get_with_tls_retry(
             )
             if not transient or attempt >= max_attempts - 1:
                 raise
-            delay = 1.0 + attempt * 0.85
+            delay = delay_base + attempt * delay_step
             _warn(
                 f"TLS/连接异常，{delay:.1f}s 后重试 ({attempt + 1}/{max_attempts})…"
             )
@@ -724,6 +771,8 @@ def _build_sentinel_for_session(
         return None
     payload = json.dumps({"p": "", "id": did, "flow": flow}, separators=(",", ":"))
     max_attempts = 5
+    delay_base = _env_float("SENTINEL_RETRY_BASE_SEC", 1.0, 0.2, 5.0)
+    delay_step = _env_float("SENTINEL_RETRY_STEP_SEC", 0.85, 0.1, 3.0)
     for attempt in range(max_attempts):
         try:
             sen_resp = requests.post(
@@ -743,7 +792,7 @@ def _build_sentinel_for_session(
             if not _is_transient_net_error(e) or attempt >= max_attempts - 1:
                 _warn(f"Sentinel({flow}) 请求异常: {e}")
                 return None
-            delay = 1.0 + attempt * 0.85
+            delay = delay_base + attempt * delay_step
             _warn(
                 f"Sentinel({flow}) 网络异常，{delay:.1f}s 后重试 ({attempt + 1}/{max_attempts})…"
             )
@@ -753,7 +802,7 @@ def _build_sentinel_for_session(
             if attempt >= max_attempts - 1:
                 _warn(f"Sentinel({flow}) HTTP {sen_resp.status_code}")
                 return None
-            delay = 1.0 + attempt * 0.85
+            delay = delay_base + attempt * delay_step
             _warn(
                 f"Sentinel({flow}) HTTP {sen_resp.status_code}，{delay:.1f}s 后重试…"
             )
@@ -1092,7 +1141,9 @@ def _login_via_password_and_finish_oauth(
                 verify=_ssl_verify(),
                 timeout=15,
             )
-            time.sleep(0.5)
+            wait_workspace = _env_float("REGISTER_WORKSPACE_WAIT_SEC", 0.5, 0.0, 3.0)
+            if wait_workspace > 0:
+                time.sleep(wait_workspace)
             workspace_referer = "https://auth.openai.com/workspace"
         except Exception as e:
             _warn(f"GET /workspace: {e}")
@@ -1221,6 +1272,7 @@ def run(proxy: Optional[str]):
     email, dev_token = get_email_and_token(proxies)
     if not email or not dev_token:
         return None, ""
+    email_domain = _email_domain(email)
     _info(f"临时邮箱: {email}")
     masked = (dev_token[:8] + "…") if dev_token else ""
     _info(f"邮箱会话 JWT 前缀: {masked}")
@@ -1376,7 +1428,9 @@ def run(proxy: Optional[str]):
         else:
             _info("无需邮箱 OTP，直接进入创建账户前步骤")
 
-        time.sleep(1.5)
+        post_wait = _env_float("REGISTER_POST_WAIT_SEC", 1.5, 0.0, 6.0)
+        if post_wait > 0:
+            time.sleep(post_wait)
         if register_continue:
             state_url = (
                 register_continue
@@ -1391,7 +1445,9 @@ def run(proxy: Optional[str]):
                     verify=_ssl_verify(),
                     timeout=15,
                 )
-                time.sleep(1)
+                continue_wait = _env_float("REGISTER_CONTINUE_WAIT_SEC", 1.0, 0.0, 5.0)
+                if continue_wait > 0:
+                    time.sleep(continue_wait)
             except Exception as e:
                 _warn(f"访问 continue_url: {e}")
 
@@ -1420,6 +1476,15 @@ def run(proxy: Optional[str]):
                     "registration_disallowed（风控/频控）：建议拉长冷却、换 IP 或减少并发"
                 )
             _err(f"create_account 失败: {fail_body[:500]}")
+            if "registration_disallowed" in fail_body and email_domain:
+                return (
+                    None,
+                    password,
+                    {
+                        "email_domain": email_domain,
+                        "error_code": "registration_disallowed",
+                    },
+                )
             return None, password
 
         try:
@@ -1458,7 +1523,9 @@ def run(proxy: Optional[str]):
                     verify=_ssl_verify(),
                     timeout=15,
                 )
-                time.sleep(0.5)
+                wait_workspace = _env_float("REGISTER_WORKSPACE_WAIT_SEC", 0.5, 0.0, 3.0)
+                if wait_workspace > 0:
+                    time.sleep(wait_workspace)
                 workspace_referer = "https://auth.openai.com/workspace"
             except Exception as e:
                 _warn(f"GET /workspace: {e}")

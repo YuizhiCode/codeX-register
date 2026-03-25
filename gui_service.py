@@ -38,6 +38,51 @@ from gui_http_utils import (
     _merge_http_headers,
     _urlopen_request,
 )
+from gui_service_data_ops import (
+    accounts_txt_path as _data_accounts_txt_path,
+    build_email_source_files_map as _data_build_email_source_files_map,
+    build_local_account_index as _data_build_local_account_index,
+    delete_json_files as _data_delete_json_files,
+    email_from_account_entry as _data_email_from_account_entry,
+    emails_from_accounts_json as _data_emails_from_accounts_json,
+    list_accounts as _data_list_accounts,
+    list_json_files as _data_list_json_files,
+    save_json_file_note as _data_save_json_file_note,
+    source_label as _data_source_label,
+    sync_selected_accounts as _data_sync_selected_accounts,
+)
+from gui_service_mail_ops import (
+    get_mail_client as _mail_get_mail_client,
+    mail_clear_emails as _mail_mail_clear_emails,
+    mail_client_signature as _mail_mail_client_signature,
+    mail_content_preview as _mail_mail_content_preview,
+    mail_delete_email as _mail_mail_delete_email,
+    mail_delete_emails as _mail_mail_delete_emails,
+    mail_delete_mailbox as _mail_mail_delete_mailbox,
+    mail_delete_mailboxes as _mail_mail_delete_mailboxes,
+    mail_domain_stats as _mail_mail_domain_stats,
+    mail_generate_mailbox as _mail_mail_generate_mailbox,
+    mail_get_email_detail as _mail_mail_get_email_detail,
+    mail_list_emails as _mail_mail_list_emails,
+    mail_overview as _mail_mail_overview,
+    mail_providers as _mail_mail_providers,
+    mail_proxy as _mail_mail_proxy,
+    mail_sender_text as _mail_mail_sender_text,
+    record_mail_domain_error as _mail_record_mail_domain_error,
+    record_mail_domain_registered as _mail_record_mail_domain_registered,
+)
+from gui_service_remote_test import (
+    batch_test_remote_accounts as _remote_batch_test_remote_accounts,
+    consume_test_event_stream as _remote_consume_test_event_stream,
+    is_account_deactivated_error as _remote_is_account_deactivated_error,
+    is_rate_limited_error as _remote_is_rate_limited_error,
+    is_ssl_retryable_error as _remote_is_ssl_retryable_error,
+    is_token_invalidated_error as _remote_is_token_invalidated_error,
+    refresh_api_success as _remote_refresh_api_success,
+    revive_remote_tokens as _remote_revive_remote_tokens,
+    set_remote_test_state as _remote_set_remote_test_state,
+    try_refresh_remote_token as _remote_try_refresh_remote_token,
+)
 from mail_services import (
     MailServiceError,
     available_mail_providers,
@@ -735,445 +780,60 @@ class RegisterService:
         return {}
 
     def _mail_proxy(self) -> dict[str, str] | None:
-        raw = str(self.cfg.get("proxy") or "").strip()
-        if not raw:
-            return None
-        return {"http": raw, "https": raw}
+        return _mail_mail_proxy(self)
 
     def _mail_client_signature(self) -> tuple[str, str, str, str, bool]:
-        provider = normalize_mail_provider(self.cfg.get("mail_service_provider") or "mailfree")
-        domain = str(self.cfg.get("worker_domain") or "").strip()
-        if domain and not domain.startswith("http"):
-            domain = f"https://{domain}"
-        return (
-            provider,
-            domain.rstrip("/"),
-            str(self.cfg.get("freemail_username") or "").strip(),
-            str(self.cfg.get("freemail_password") or ""),
-            bool(self.cfg.get("openai_ssl_verify", True)),
-        )
+        return _mail_mail_client_signature(self)
 
     def _get_mail_client(self):
-        sig = self._mail_client_signature()
-        with self._lock:
-            cached = self._mail_client
-            cached_sig = self._mail_client_sig
-        if cached is not None and cached_sig == sig:
-            return cached
-
-        provider, base_url, username, password, verify_ssl = sig
-        try:
-            client = build_mail_service(
-                provider,
-                base_url=base_url,
-                username=username,
-                password=password,
-                verify_ssl=verify_ssl,
-                logger=None,
-            )
-        except MailServiceError as e:
-            raise RuntimeError(str(e)) from e
-
-        with self._lock:
-            self._mail_client = client
-            self._mail_client_sig = sig
-        return client
+        return _mail_get_mail_client(self)
 
     @staticmethod
     def _mail_content_preview(text: str, limit: int = 200) -> str:
-        s = str(text or "").replace("\r", " ").replace("\n", " ").strip()
-        if len(s) <= limit:
-            return s
-        return s[:limit] + "…"
+        return _mail_mail_content_preview(text, limit=limit)
 
     @staticmethod
     def _mail_sender_text(raw_sender: Any) -> str:
-        if isinstance(raw_sender, dict):
-            name = str(raw_sender.get("name") or "").strip()
-            addr = str(raw_sender.get("address") or raw_sender.get("email") or "").strip()
-            if name and addr:
-                return f"{name} <{addr}>"
-            return name or addr
-        if isinstance(raw_sender, list):
-            vals = [RegisterService._mail_sender_text(x) for x in raw_sender]
-            vals = [v for v in vals if v]
-            return ", ".join(vals)
-        return str(raw_sender or "").strip()
+        return _mail_mail_sender_text(raw_sender)
 
     def _record_mail_domain_error(self, domain: str) -> int:
-        d = str(domain or "").strip().lower()
-        if not d:
-            return 0
-        with self._lock:
-            counts = self._normalize_domain_error_counts(self.cfg.get("mail_domain_error_counts") or {})
-            now = int(counts.get(d, 0)) + 1
-            counts[d] = now
-            self.cfg["mail_domain_error_counts"] = counts
-            save_config(self.cfg)
-        return now
+        return _mail_record_mail_domain_error(self, domain)
 
     def _record_mail_domain_registered(self, domain: str) -> int:
-        d = str(domain or "").strip().lower()
-        if not d:
-            return 0
-        with self._lock:
-            counts = self._normalize_domain_registered_counts(
-                self.cfg.get("mail_domain_registered_counts") or {}
-            )
-            now = int(counts.get(d, 0)) + 1
-            counts[d] = now
-            self.cfg["mail_domain_registered_counts"] = counts
-            save_config(self.cfg)
-        return now
+        return _mail_record_mail_domain_registered(self, domain)
 
     def mail_domain_stats(self) -> dict[str, Any]:
-        with self._lock:
-            provider = normalize_mail_provider(self.cfg.get("mail_service_provider") or "mailfree")
-            selected = self._normalize_domain_list(self.cfg.get("mail_domain_allowlist") or [])
-            counts = self._normalize_domain_error_counts(self.cfg.get("mail_domain_error_counts") or {})
-            registered = self._normalize_domain_registered_counts(
-                self.cfg.get("mail_domain_registered_counts") or {}
-            )
-        return {
-            "provider": provider,
-            "selected": selected,
-            "error_counts": counts,
-            "registered_counts": registered,
-        }
+        return _mail_mail_domain_stats(self)
 
     def mail_providers(self) -> dict[str, Any]:
-        with self._lock:
-            current = normalize_mail_provider(self.cfg.get("mail_service_provider") or "mailfree")
-        return {
-            "items": available_mail_providers(),
-            "current": current,
-        }
+        return _mail_mail_providers(self)
 
     def mail_overview(self, limit: Any = 120, offset: Any = 0) -> dict[str, Any]:
-        lim = self._to_int(limit, 120, 1, 500)
-        off = self._to_int(offset, 0, 0, 100000)
-        providers = available_mail_providers()
-        current = normalize_mail_provider(self.cfg.get("mail_service_provider") or "mailfree")
-        selected = self._normalize_domain_list(self.cfg.get("mail_domain_allowlist") or [])
-        err_counts = self._normalize_domain_error_counts(self.cfg.get("mail_domain_error_counts") or {})
-        registered_counts = self._normalize_domain_registered_counts(
-            self.cfg.get("mail_domain_registered_counts") or {}
-        )
-        client = self._get_mail_client()
-        proxy = self._mail_proxy()
-
-        try:
-            domains = client.list_domains(proxies=proxy)
-            mailboxes = client.list_mailboxes(limit=lim, offset=off, proxies=proxy)
-        except MailServiceError as e:
-            raise RuntimeError(str(e)) from e
-
-        rows: list[dict[str, Any]] = []
-        for idx, it in enumerate(mailboxes):
-            if not isinstance(it, dict):
-                continue
-            addr = str(it.get("address") or it.get("mailbox") or it.get("email") or "").strip()
-            if not addr:
-                continue
-            created = str(it.get("created_at") or it.get("created") or "-")
-            expires = str(it.get("expires_at") or it.get("expires") or "-")
-            try:
-                count = int(it.get("count") or 0)
-            except Exception:
-                count = 0
-            rows.append(
-                {
-                    "key": f"{addr}:{idx}",
-                    "address": addr,
-                    "created_at": created,
-                    "expires_at": expires,
-                    "count": max(0, count),
-                }
-            )
-
-        domains_out = [str(x).strip().lower() for x in domains if str(x).strip()]
-        domain_stats = {
-            dm: {
-                "selected": (dm in selected) if selected else True,
-                "errors": int(err_counts.get(dm, 0)),
-                "registered": int(registered_counts.get(dm, 0)),
-            }
-            for dm in domains_out
-        }
-
-        return {
-            "providers": providers,
-            "current": current,
-            "domains": domains_out,
-            "selected_domains": selected,
-            "domain_error_counts": err_counts,
-            "domain_registered_counts": registered_counts,
-            "domain_stats": domain_stats,
-            "mailboxes": rows,
-            "mailbox_total": len(rows),
-        }
+        return _mail_mail_overview(self, limit=limit, offset=offset)
 
     def mail_generate_mailbox(self) -> dict[str, Any]:
-        client = self._get_mail_client()
-        proxy = self._mail_proxy()
-        random_domain = bool(self.cfg.get("mailfree_random_domain", True))
-        selected_domains = self._normalize_domain_list(self.cfg.get("mail_domain_allowlist") or [])
-        try:
-            email = client.generate_mailbox(
-                random_domain=random_domain,
-                allowed_domains=selected_domains,
-                proxies=proxy,
-            )
-        except MailServiceError as e:
-            raise RuntimeError(str(e)) from e
-        self.log(f"[邮箱] 已生成临时邮箱: {email}")
-        return {"email": email, "random_domain": random_domain}
+        return _mail_mail_generate_mailbox(self)
 
     def mail_list_emails(self, mailbox: str) -> dict[str, Any]:
-        target = str(mailbox or "").strip()
-        if not target:
-            raise ValueError("请先选择邮箱账号")
-        client = self._get_mail_client()
-        proxy = self._mail_proxy()
-        try:
-            mails = client.list_emails(target, proxies=proxy)
-        except MailServiceError as e:
-            raise RuntimeError(str(e)) from e
-
-        rows: list[dict[str, Any]] = []
-        for idx, it in enumerate(mails):
-            if not isinstance(it, dict):
-                continue
-            mid = str(it.get("id") or f"mail-{idx}").strip()
-            sender = self._mail_sender_text(it.get("from") or it.get("sender"))
-            subject = str(it.get("subject") or "(无主题)").strip() or "(无主题)"
-            received = str(it.get("date") or it.get("created_at") or "-")
-            preview = self._mail_content_preview(it.get("preview") or it.get("intro") or it.get("text") or "")
-            rows.append(
-                {
-                    "key": f"{mid}:{idx}",
-                    "id": mid,
-                    "from": sender,
-                    "subject": subject,
-                    "date": received,
-                    "preview": preview,
-                    "mailbox": target,
-                }
-            )
-
-        return {"mailbox": target, "total": len(rows), "items": rows}
+        return _mail_mail_list_emails(self, mailbox)
 
     def mail_get_email_detail(self, email_id: str) -> dict[str, Any]:
-        target = str(email_id or "").strip()
-        if not target:
-            raise ValueError("邮件 ID 不能为空")
-        client = self._get_mail_client()
-        proxy = self._mail_proxy()
-        try:
-            detail = client.get_email_detail(target, proxies=proxy)
-        except MailServiceError as e:
-            raise RuntimeError(str(e)) from e
-
-        content = str(detail.get("content") or "").strip()
-        if not content:
-            try:
-                content = json.dumps(detail, ensure_ascii=False, indent=2)
-            except Exception:
-                content = self._mail_content_preview(str(detail), limit=1000)
-        return {
-            "id": str(detail.get("id") or target),
-            "from": str(detail.get("from") or "-"),
-            "subject": str(detail.get("subject") or "(无主题)"),
-            "date": str(detail.get("date") or "-"),
-            "text": str(detail.get("text") or ""),
-            "html": str(detail.get("html") or ""),
-            "raw": str(detail.get("raw") or ""),
-            "content": content,
-        }
+        return _mail_mail_get_email_detail(self, email_id)
 
     def mail_delete_email(self, email_id: str) -> dict[str, Any]:
-        target = str(email_id or "").strip()
-        if not target:
-            raise ValueError("邮件 ID 不能为空")
-        client = self._get_mail_client()
-        proxy = self._mail_proxy()
-        try:
-            res = client.delete_email(target, proxies=proxy)
-        except MailServiceError as e:
-            raise RuntimeError(str(e)) from e
-        self.log(f"[邮箱] 已删除邮件: id={target}")
-        return {
-            "id": target,
-            "success": bool(res.get("success", True)) if isinstance(res, dict) else True,
-        }
+        return _mail_mail_delete_email(self, email_id)
 
     def mail_delete_emails(self, ids: list[Any]) -> dict[str, Any]:
-        ordered: list[str] = []
-        seen: set[str] = set()
-        for raw in ids:
-            mid = str(raw or "").strip()
-            if not mid or mid in seen:
-                continue
-            seen.add(mid)
-            ordered.append(mid)
-        if not ordered:
-            raise ValueError("请先选择要删除的邮件")
-
-        ok = 0
-        fail = 0
-        errors: list[dict[str, str]] = []
-        for mid in ordered:
-            try:
-                self.mail_delete_email(mid)
-                ok += 1
-            except Exception as e:
-                fail += 1
-                err_text = str(e)
-                self.log(f"[邮箱] 删除邮件失败: id={mid} -> {err_text}")
-                errors.append({"id": mid, "error": err_text})
-
-        return {
-            "ok": ok,
-            "fail": fail,
-            "total": len(ordered),
-            "errors": errors,
-        }
+        return _mail_mail_delete_emails(self, ids)
 
     def mail_clear_emails(self, mailbox: str) -> dict[str, Any]:
-        target = str(mailbox or "").strip()
-        if not target:
-            raise ValueError("请先选择邮箱账号")
-        client = self._get_mail_client()
-        proxy = self._mail_proxy()
-        try:
-            res = client.clear_emails(target, proxies=proxy)
-        except MailServiceError as e:
-            raise RuntimeError(str(e)) from e
-        deleted = 0
-        if isinstance(res, dict):
-            try:
-                deleted = int(res.get("deleted") or 0)
-            except Exception:
-                deleted = 0
-        self.log(f"[邮箱] 已清空邮箱 {target}，删除 {deleted} 封")
-        return {"mailbox": target, "deleted": max(0, deleted)}
+        return _mail_mail_clear_emails(self, mailbox)
 
     def mail_delete_mailbox(self, address: str) -> dict[str, Any]:
-        target = str(address or "").strip()
-        if not target:
-            raise ValueError("请先选择邮箱账号")
-        client = self._get_mail_client()
-        proxy = self._mail_proxy()
-        try:
-            res = client.delete_mailbox(target, proxies=proxy)
-        except MailServiceError as e:
-            raise RuntimeError(str(e)) from e
-        method = str(res.get("api_method") or "") if isinstance(res, dict) else ""
-        path = str(res.get("api_path") or "") if isinstance(res, dict) else ""
-        api_text = f"{method} {path}".strip()
-        if api_text:
-            self.log(f"[邮箱] 已删除邮箱账号: {target} · 接口 {api_text}")
-        else:
-            self.log(f"[邮箱] 已删除邮箱账号: {target}")
-        return {
-            "address": target,
-            "success": True,
-            "api_method": method,
-            "api_path": path,
-        }
+        return _mail_mail_delete_mailbox(self, address)
 
     def mail_delete_mailboxes(self, addresses: list[Any]) -> dict[str, Any]:
-        ordered: list[str] = []
-        seen: set[str] = set()
-        for raw in addresses:
-            addr = str(raw or "").strip()
-            if not addr or addr in seen:
-                continue
-            seen.add(addr)
-            ordered.append(addr)
-        if not ordered:
-            raise ValueError("请先选择要删除的邮箱")
-
-        total = len(ordered)
-        worker_count = min(
-            total,
-            self._to_int(self.cfg.get("mail_delete_concurrency"), 4, 1, 12),
-        )
-        self.log(f"[邮箱] 批量删除启动: 总数 {total}，并发 {worker_count}")
-
-        ok = 0
-        fail = 0
-        errors: list[dict[str, str]] = []
-        api_used: dict[str, int] = {}
-        state_lock = threading.Lock()
-
-        def _run_one(idx_addr: tuple[int, str]) -> tuple[int, dict[str, Any]]:
-            idx, addr = idx_addr
-            try:
-                res = self.mail_delete_mailbox(addr)
-                method = str((res or {}).get("api_method") or "")
-                path = str((res or {}).get("api_path") or "")
-                api = f"{method} {path}".strip()
-                with state_lock:
-                    nonlocal ok
-                    ok += 1
-                    if api:
-                        api_used[api] = int(api_used.get(api, 0)) + 1
-                return idx, {"address": addr, "success": True, "api": api}
-            except Exception as e:
-                err_text = str(e)
-                self.log(f"[邮箱] 删除失败: {addr} -> {err_text}")
-                with state_lock:
-                    nonlocal fail
-                    fail += 1
-                return idx, {"address": addr, "success": False, "error": err_text}
-
-        ordered_pairs = list(enumerate(ordered))
-        results_by_idx: dict[int, dict[str, Any]] = {}
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(_run_one, it) for it in ordered_pairs]
-            for fut in as_completed(futures):
-                try:
-                    idx, item = fut.result()
-                except Exception as e:
-                    idx = -1
-                    item = {"address": "-", "success": False, "error": str(e)}
-                results_by_idx[idx] = item
-
-        ordered_results: list[dict[str, Any]] = []
-        for i in range(total):
-            item = results_by_idx.get(i) or {
-                "address": ordered[i],
-                "success": False,
-                "error": "未知错误",
-            }
-            ordered_results.append(item)
-            if not item.get("success"):
-                errors.append(
-                    {
-                        "address": str(item.get("address") or ""),
-                        "error": str(item.get("error") or "未知错误"),
-                    }
-                )
-
-        api_summary = [
-            {"api": k, "count": int(v)}
-            for k, v in sorted(api_used.items(), key=lambda x: (-int(x[1]), str(x[0])))
-        ]
-        if api_summary:
-            apis = "；".join([f"{it['api']} ×{it['count']}" for it in api_summary[:4]])
-            self.log(f"[邮箱] 批量删除接口统计: {apis}")
-
-        self.log(f"[邮箱] 批量删除结束: 成功 {ok}，失败 {fail}")
-        return {
-            "ok": ok,
-            "fail": fail,
-            "total": total,
-            "errors": errors,
-            "api_summary": api_summary,
-            "concurrency": worker_count,
-            "results": ordered_results,
-        }
+        return _mail_mail_delete_mailboxes(self, addresses)
 
     def start(self, run_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
@@ -1955,372 +1615,40 @@ class RegisterService:
             self._set_progress(0)
 
     def _accounts_txt_path(self) -> str:
-        """与 r_with_pwd 写入逻辑一致：有 TOKEN_OUTPUT_DIR 则用其下 accounts.txt。"""
-        outdir = os.getenv("TOKEN_OUTPUT_DIR", "").strip()
-        if outdir:
-            return os.path.join(outdir, ACCOUNTS_TXT)
-        return ACCOUNTS_TXT
+        return _data_accounts_txt_path(self)
 
     @staticmethod
     def _emails_from_accounts_json(fp: str) -> set[str]:
-        """从导出 JSON 的 accounts 数组收集邮箱，用于删文件时同步 accounts.txt。"""
-        emails: set[str] = set()
-        try:
-            with open(fp, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for acc in data.get("accounts", []):
-                if not isinstance(acc, dict):
-                    continue
-                e = (
-                    acc.get("name")
-                    or (acc.get("credentials") or {}).get("email")
-                    or (acc.get("extra") or {}).get("email")
-                )
-                if e and isinstance(e, str):
-                    emails.add(e.strip())
-        except Exception:
-            pass
-        return emails
+        return _data_emails_from_accounts_json(fp)
 
     @staticmethod
     def _email_from_account_entry(acc: dict[str, Any]) -> str:
-        if not isinstance(acc, dict):
-            return ""
-        e = str(acc.get("name") or "").strip().lower()
-        if e:
-            return e
-        creds = acc.get("credentials") or {}
-        if isinstance(creds, dict):
-            return str(creds.get("email") or "").strip().lower()
-        return ""
+        return _data_email_from_account_entry(acc)
 
     def _build_local_account_index(self) -> dict[str, dict[str, Any]]:
-        """从本地 accounts_*.json 建立 email -> account 字典（新文件优先）。"""
-        out: dict[str, dict[str, Any]] = {}
-        files = sorted(glob.glob("accounts_*.json"), key=os.path.getmtime, reverse=True)
-        for fp in files:
-            try:
-                with open(fp, "r", encoding="utf-8") as f:
-                    root = json.load(f)
-                arr = root.get("accounts", [])
-                if not isinstance(arr, list):
-                    continue
-                for acc in arr:
-                    em = self._email_from_account_entry(acc)
-                    if em and em not in out and isinstance(acc, dict):
-                        out[em] = acc
-            except Exception:
-                continue
-        return out
+        return _data_build_local_account_index(self)
 
     def _build_email_source_files_map(self) -> dict[str, list[str]]:
-        """建立 email -> [来源文件名...] 映射（按文件时间倒序）。"""
-        out: dict[str, list[str]] = {}
-        files = sorted(glob.glob("accounts_*.json"), key=os.path.getmtime, reverse=True)
-        for fp in files:
-            name = os.path.basename(fp)
-            try:
-                with open(fp, "r", encoding="utf-8") as f:
-                    root = json.load(f)
-                arr = root.get("accounts", [])
-                if not isinstance(arr, list):
-                    continue
-                for acc in arr:
-                    if not isinstance(acc, dict):
-                        continue
-                    em = self._email_from_account_entry(acc)
-                    if not em:
-                        continue
-                    lst = out.setdefault(em, [])
-                    if name not in lst:
-                        lst.append(name)
-            except Exception:
-                continue
-        return out
+        return _data_build_email_source_files_map(self)
 
     @staticmethod
     def _source_label(files: list[str]) -> str:
-        if not files:
-            return "-"
-        if len(files) == 1:
-            return files[0]
-        return f"{files[0]} +{len(files) - 1}"
+        return _data_source_label(files)
 
     def save_json_file_note(self, path: str, note: str) -> dict[str, Any]:
-        target = os.path.abspath(str(path or "").strip())
-        if not target:
-            raise ValueError("path 不能为空")
-
-        allow = {os.path.abspath(p) for p in glob.glob("accounts_*.json")}
-        if target not in allow or not os.path.isfile(target):
-            raise ValueError("目标 JSON 文件不存在或不可编辑")
-
-        name = os.path.basename(target)
-        clean = str(note or "").strip()
-        if len(clean) > 120:
-            clean = clean[:120]
-
-        with self._lock:
-            notes = self._normalize_json_file_notes(self.cfg.get("json_file_notes") or {})
-            if clean:
-                notes[name] = clean
-            else:
-                notes.pop(name, None)
-            self.cfg["json_file_notes"] = notes
-            save_config(self.cfg)
-
-        self.log(f"已保存备注: {name} -> {clean or '-'}")
-        return {
-            "path": target,
-            "name": name,
-            "note": clean,
-        }
+        return _data_save_json_file_note(self, path, note)
 
     def list_json_files(self) -> dict[str, Any]:
-        with self._lock:
-            notes_map = self._normalize_json_file_notes(self.cfg.get("json_file_notes") or {})
-
-        files = sorted(
-            glob.glob("accounts_*.json"),
-            key=os.path.getmtime,
-            reverse=True,
-        )
-        items: list[dict[str, Any]] = []
-        total = 0
-        for fp in files:
-            fp_abs = os.path.abspath(fp)
-            name = os.path.basename(fp_abs)
-            try:
-                with open(fp_abs, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                cnt = len(data.get("accounts", []))
-            except Exception:
-                cnt = 0
-            try:
-                cdate = datetime.fromtimestamp(os.path.getctime(fp_abs)).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                cdate = "-"
-            total += cnt
-            items.append(
-                {
-                    "path": fp_abs,
-                    "name": name,
-                    "count": cnt,
-                    "created": cdate,
-                    "note": str(notes_map.get(name) or ""),
-                    "file_color_idx": self._file_color_index(name),
-                }
-            )
-        return {"items": items, "file_count": len(items), "account_total": total}
+        return _data_list_json_files(self)
 
     def list_accounts(self) -> dict[str, Any]:
-        lines: list[str] = []
-        ap = self._accounts_txt_path()
-        if os.path.exists(ap):
-            try:
-                with open(ap, "r", encoding="utf-8") as f:
-                    lines = [l.strip() for l in f if l.strip()]
-            except Exception:
-                lines = []
-
-        local_counts: dict[str, int] = {}
-        for line in lines:
-            ep = line.split("----", 1)[0].strip().lower()
-            if ep:
-                local_counts[ep] = local_counts.get(ep, 0) + 1
-
-        email_files_map = self._build_email_source_files_map()
-        file_options = [
-            os.path.basename(p)
-            for p in sorted(glob.glob("accounts_*.json"), key=os.path.getmtime, reverse=True)
-        ]
-
-        with self._lock:
-            remote_ready = self._remote_sync_status_ready
-            remote_counts = dict(self._remote_email_counts)
-
-        items: list[dict[str, Any]] = []
-        for i, line in enumerate(lines, start=1):
-            parts = line.split("----", 1)
-            email = parts[0]
-            pwd = parts[1] if len(parts) > 1 else ""
-            ep = email.strip().lower()
-            status = "normal"
-            src_files = list(email_files_map.get(ep, []))
-            primary_source = str(src_files[0] if src_files else "")
-            if remote_ready:
-                remote_cnt = int(remote_counts.get(ep, 0))
-                local_cnt = int(local_counts.get(ep, 0))
-                if local_cnt > 1 or remote_cnt > 1:
-                    status = "dup"
-                elif remote_cnt > 0:
-                    status = "ok"
-                else:
-                    status = "pending"
-            items.append(
-                {
-                    "key": f"{i}:{email}",
-                    "index": i,
-                    "email": email,
-                    "password": pwd,
-                    "status": status,
-                    "source": self._source_label(src_files),
-                    "source_files": src_files,
-                    "source_primary": primary_source,
-                    "source_color_idx": self._file_color_index(primary_source),
-                }
-            )
-        return {
-            "path": ap,
-            "total": len(items),
-            "items": items,
-            "file_options": file_options,
-        }
+        return _data_list_accounts(self)
 
     def delete_json_files(self, paths: list[str]) -> dict[str, Any]:
-        if not paths:
-            raise ValueError("请先选择要删除的 JSON 文件")
-
-        allow = {os.path.abspath(p) for p in glob.glob("accounts_*.json")}
-        selected = [os.path.abspath(str(p)) for p in paths]
-
-        removed_files = 0
-        removed_lines = 0
-        skipped: list[str] = []
-        all_emails: set[str] = set()
-        removed_names: set[str] = set()
-
-        for fp in selected:
-            if fp not in allow:
-                skipped.append(fp)
-                continue
-            if not os.path.isfile(fp):
-                skipped.append(fp)
-                continue
-            all_emails |= self._emails_from_accounts_json(fp)
-            try:
-                os.remove(fp)
-                removed_files += 1
-                removed_names.add(os.path.basename(fp))
-            except Exception:
-                skipped.append(fp)
-
-        if removed_names:
-            with self._lock:
-                notes = self._normalize_json_file_notes(self.cfg.get("json_file_notes") or {})
-                changed = False
-                for name in removed_names:
-                    if name in notes:
-                        notes.pop(name, None)
-                        changed = True
-                if changed:
-                    self.cfg["json_file_notes"] = notes
-                    save_config(self.cfg)
-
-        acct_path = self._accounts_txt_path()
-        if all_emails and os.path.isfile(acct_path):
-            email_lower = {e.lower() for e in all_emails}
-            try:
-                with open(acct_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                kept: list[str] = []
-                for raw in lines:
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    ep = line.split("----", 1)[0].strip().lower()
-                    if ep in email_lower:
-                        removed_lines += 1
-                        continue
-                    kept.append(raw if raw.endswith("\n") else raw + "\n")
-                with open(acct_path, "w", encoding="utf-8") as f:
-                    f.writelines(kept)
-            except Exception as e:
-                self.log(f"更新 {acct_path} 失败: {e}")
-
-        self.log(
-            f"已删除 {removed_files} 个 JSON；从账号列表移除 {removed_lines} 行（{acct_path}）"
-        )
-        return {
-            "removed_files": removed_files,
-            "removed_lines": removed_lines,
-            "skipped": skipped,
-        }
+        return _data_delete_json_files(self, paths)
 
     def sync_selected_accounts(self, emails: list[str]) -> dict[str, Any]:
-        selected = [str(e).strip().lower() for e in emails if str(e).strip()]
-        if not selected:
-            raise ValueError("请先勾选要同步的账号")
-
-        with self._lock:
-            if self._sync_busy:
-                raise RuntimeError("同步正在进行中，请稍候")
-            self._sync_busy = True
-
-        ok = 0
-        fail = 0
-        missing: list[str] = []
-        try:
-            url = str(self.cfg.get("accounts_sync_api_url") or "").strip()
-            tok = str(self.cfg.get("accounts_sync_bearer_token") or "").strip()
-            verify_ssl = bool(self.cfg.get("openai_ssl_verify", True))
-            proxy_arg = str(self.cfg.get("proxy") or "").strip() or None
-
-            if not url:
-                raise ValueError("请先填写同步 API 地址")
-            if not tok:
-                raise ValueError("请先填写 Bearer Token")
-
-            auth = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
-            emails_uniq = list(dict.fromkeys(selected))
-            local_map = self._build_local_account_index()
-
-            found_accounts: list[dict[str, Any]] = []
-            for em in emails_uniq:
-                acc = local_map.get(em)
-                if not acc:
-                    missing.append(em)
-                    continue
-                found_accounts.append(acc)
-
-            for em in missing:
-                self.log(f"同步跳过 {em}: 本地 JSON 中未找到该账号详情")
-
-            if not found_accounts:
-                fail = len(emails_uniq)
-                raise RuntimeError("本地 JSON 中未找到可同步账号")
-
-            payload = {
-                "data": {"accounts": found_accounts, "proxies": []},
-                "skip_default_group_bind": True,
-            }
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Authorization": auth,
-            }
-            code, text = _http_post_json(
-                url,
-                body,
-                headers,
-                verify_ssl=verify_ssl,
-                proxy=proxy_arg,
-            )
-            if 200 <= code < 300:
-                ok = len(found_accounts)
-                fail = len(missing)
-                self.log(f"批量同步成功 HTTP {code}，账号 {ok} 个")
-            else:
-                fail = len(found_accounts) + len(missing)
-                snippet = (text or "")[:500].replace("\n", " ")
-                raise RuntimeError(f"批量同步失败 HTTP {code} {snippet}")
-
-            return {"ok": ok, "fail": fail, "missing": missing}
-        finally:
-            with self._lock:
-                self._sync_busy = False
-            self.log(f"同步结束：成功 {ok}，失败 {fail}")
+        return _data_sync_selected_accounts(self, emails)
 
     @staticmethod
     def _remote_item_groups_label(it: dict[str, Any]) -> str:
@@ -2647,202 +1975,27 @@ class RegisterService:
 
     @staticmethod
     def _consume_test_event_stream(resp) -> tuple[bool, str, str]:
-        """解析测试接口 SSE 流，返回 (是否成功, 摘要文本, 错误信息)。"""
-        pending = ""
-        content_parts: list[str] = []
-        complete_success: bool | None = None
-        err_msg = ""
-
-        def _feed_line(line: str) -> None:
-            nonlocal complete_success, err_msg
-            s = line.strip()
-            if not s or s.startswith(":"):
-                return
-            if not s.startswith("data:"):
-                return
-            raw = s[5:].strip()
-            if not raw or raw == "[DONE]":
-                return
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                return
-            typ = str(payload.get("type") or "")
-            if typ == "content":
-                text = str(payload.get("text") or "")
-                if text:
-                    content_parts.append(text)
-                return
-            if typ == "test_complete":
-                if "success" in payload:
-                    complete_success = bool(payload.get("success"))
-                m = str(payload.get("message") or payload.get("error") or "").strip()
-                if m:
-                    err_msg = m
-                return
-            if typ in {"error", "failed"}:
-                m = str(payload.get("message") or payload.get("error") or "").strip()
-                if m:
-                    err_msg = m
-
-        while True:
-            chunk = resp.read(1024)
-            if not chunk:
-                break
-            pending += chunk.decode("utf-8", "replace")
-            while "\n" in pending:
-                line, pending = pending.split("\n", 1)
-                _feed_line(line)
-        if pending:
-            _feed_line(pending)
-
-        summary = "".join(content_parts).strip()
-        if not summary:
-            summary = err_msg or "无有效返回"
-        if len(summary) > 220:
-            summary = summary[:220] + "…"
-
-        if complete_success is None:
-            ok = bool(content_parts) and not err_msg
-        else:
-            ok = bool(complete_success) and not err_msg
-        return ok, summary, err_msg
+        return _remote_consume_test_event_stream(resp)
 
     @staticmethod
     def _is_ssl_retryable_error(msg: str) -> bool:
-        """判断错误是否属于可重试的 SSL/TLS 握手类异常。"""
-        low = str(msg or "").lower()
-        keys = [
-            "ssl",
-            "tls",
-            "handshake",
-            "wrong version number",
-            "certificate verify",
-            "sslv3",
-            "unexpected eof",
-            "decryption failed",
-            "bad record mac",
-            "eof occurred",
-        ]
-        return any(k in low for k in keys)
+        return _remote_is_ssl_retryable_error(msg)
 
     @staticmethod
     def _is_token_invalidated_error(msg: str) -> bool:
-        """判断错误是否属于 access token 失效。"""
-        low = str(msg or "").strip().lower()
-        if not low:
-            return False
-        keys = [
-            "token_invalidated",
-            "token_revoked",
-            "invalidated oauth token",
-            "encountered invalidated oauth token",
-            "authentication token has been invalidated",
-            "invalid authentication token",
-            "token invalid",
-            "token expired",
-            "access token expired",
-            "jwt expired",
-            "身份验证令牌已失效",
-            "令牌已失效",
-            "token 已失效",
-        ]
-        return any(k in low for k in keys)
+        return _remote_is_token_invalidated_error(msg)
 
     @staticmethod
     def _is_account_deactivated_error(msg: str) -> bool:
-        low = str(msg or "").strip().lower()
-        if not low:
-            return False
-        keys = [
-            "account has been deactivated",
-            "access deactivated",
-            "账号已被封禁",
-            "账户已被封禁",
-            "deactivated",
-        ]
-        return any(k in low for k in keys)
+        return _remote_is_account_deactivated_error(msg)
 
     @staticmethod
     def _is_rate_limited_error(msg: str) -> bool:
-        low = str(msg or "").strip().lower()
-        if not low:
-            return False
-        if "429" in low:
-            return True
-        keys = ["rate limit", "too many requests", "请求过于频繁", "限流"]
-        return any(k in low for k in keys)
+        return _remote_is_rate_limited_error(msg)
 
     @staticmethod
     def _refresh_api_success(code: int, text: str) -> tuple[bool, str]:
-        """解析 token 刷新接口响应。"""
-        raw = str(text or "")
-        snippet = raw.replace("\n", " ").strip()[:220]
-
-        if not (200 <= int(code or 0) < 300):
-            return False, f"HTTP {code}: {snippet}"
-
-        if not raw.strip():
-            return True, f"HTTP {code}"
-
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            low = raw.lower()
-            if (
-                "success" in low
-                or "refreshed" in low
-                or "ok" == low.strip()
-                or "刷新成功" in raw
-                or "已刷新" in raw
-            ):
-                return True, snippet or f"HTTP {code}"
-            return False, snippet or f"HTTP {code}"
-
-        if isinstance(payload, dict):
-            if "code" in payload:
-                try:
-                    cval = int(payload.get("code") or 0)
-                except Exception:
-                    cval = -1
-                msg = str(payload.get("message") or payload.get("error") or "").strip()
-                if cval == 0:
-                    return True, msg or "code=0"
-                msg_low = msg.lower()
-                if msg and (
-                    "already valid" in msg_low
-                    or "token valid" in msg_low
-                    or "already refreshed" in msg_low
-                    or "已是最新" in msg
-                    or "无需刷新" in msg
-                ):
-                    return True, msg
-                return False, f"code={cval} {msg}".strip()
-
-            if payload.get("success") is True or payload.get("ok") is True:
-                msg = str(payload.get("message") or payload.get("msg") or "").strip()
-                return True, msg or "success=true"
-
-            data = payload.get("data")
-            if isinstance(data, dict):
-                if data.get("success") is True or data.get("ok") is True:
-                    msg = str(data.get("message") or data.get("msg") or "").strip()
-                    return True, msg or "data.success=true"
-
-            msg = str(payload.get("message") or payload.get("error") or "").strip()
-            msg_low = msg.lower()
-            if msg and (
-                "refreshed" in msg_low
-                or "refresh success" in msg_low
-                or "already valid" in msg_low
-                or "已刷新" in msg
-                or "刷新成功" in msg
-            ):
-                return True, msg
-            if msg:
-                return False, msg
-
-        return False, snippet or f"HTTP {code}"
+        return _remote_refresh_api_success(code, text)
 
     def _try_refresh_remote_token(
         self,
@@ -2853,74 +2006,14 @@ class RegisterService:
         verify_ssl: bool,
         proxy_arg: str | None,
     ) -> tuple[bool, str, str]:
-        """尝试调用管理端刷新指定账号 token，返回 (是否成功, 详情, 命中接口)。"""
-        aid_clean = str(aid or "").strip()
-        if not aid_clean:
-            return False, "账号 ID 为空", ""
-
-        aid_enc = urllib.parse.quote(aid_clean)
-        root = str(base or "").rstrip("/")
-        body_empty = json.dumps({}, ensure_ascii=False).encode("utf-8")
-        body_id = json.dumps({"id": aid_clean}, ensure_ascii=False).encode("utf-8")
-
-        post_candidates: list[tuple[str, bytes]] = [
-            (f"{root}/{aid_enc}/refresh", body_empty),
-            (f"{root}/{aid_enc}/refresh-token", body_empty),
-            (f"{root}/{aid_enc}/refresh_token", body_empty),
-            (f"{root}/{aid_enc}/token/refresh", body_empty),
-            (f"{root}/{aid_enc}/relogin", body_empty),
-            (f"{root}/refresh", body_id),
-            (f"{root}/refresh-token", body_id),
-            (f"{root}/refresh_token", body_id),
-            (f"{root}/token/refresh", body_id),
-        ]
-        get_candidates: list[str] = [
-            f"{root}/{aid_enc}/refresh",
-            f"{root}/{aid_enc}/refresh-token",
-            f"{root}/{aid_enc}/refresh_token",
-        ]
-
-        last_detail = ""
-
-        for url, body in post_candidates:
-            code, text = _http_post_json(
-                url,
-                body,
-                {
-                    "Accept": "application/json",
-                    "Authorization": auth,
-                    "Content-Type": "application/json",
-                },
-                verify_ssl=verify_ssl,
-                timeout=90,
-                proxy=proxy_arg,
-            )
-            ok_refresh, detail = self._refresh_api_success(code, text)
-            if ok_refresh:
-                return True, detail or f"POST {url} HTTP {code}", f"POST {url}"
-            if code not in {404, 405} and detail:
-                last_detail = detail
-
-        for url in get_candidates:
-            code, text = _http_get(
-                url,
-                {
-                    "Accept": "application/json",
-                    "Authorization": auth,
-                },
-                verify_ssl=verify_ssl,
-                timeout=90,
-                proxy=proxy_arg,
-            )
-            ok_refresh, detail = self._refresh_api_success(code, text)
-            if ok_refresh:
-                return True, detail or f"GET {url} HTTP {code}", f"GET {url}"
-            if code not in {404, 405} and detail:
-                last_detail = detail
-
-        if last_detail:
-            return False, last_detail, ""
-        return False, "未找到可用的 token 刷新接口", ""
+        return _remote_try_refresh_remote_token(
+            self,
+            aid,
+            base=base,
+            auth=auth,
+            verify_ssl=verify_ssl,
+            proxy_arg=proxy_arg,
+        )
 
     def _set_remote_test_state(
         self,
@@ -2930,364 +2023,19 @@ class RegisterService:
         summary: str,
         duration_ms: int,
     ) -> None:
-        """更新测试状态缓存并回填到远端列表行。"""
-        aid = str(account_id).strip()
-        if not aid:
-            return
-        status = str(status_text or "").strip() or "失败"
-        text = (summary or "-").strip()
-        if len(text) > 220:
-            text = text[:220] + "…"
-        at = datetime.now().strftime("%H:%M:%S")
-        state = {
-            "status": status,
-            "result": text,
-            "at": at,
-            "duration_ms": str(max(0, int(duration_ms))),
-        }
-
-        with self._lock:
-            self._remote_test_state[aid] = state
-            for row in self._remote_rows:
-                if str(row.get("id") or "").strip() != aid:
-                    continue
-                row["test_status"] = state["status"]
-                row["test_result"] = state["result"]
-                row["test_at"] = state["at"]
+        _remote_set_remote_test_state(
+            self,
+            account_id,
+            status_text=status_text,
+            summary=summary,
+            duration_ms=duration_ms,
+        )
 
     def batch_test_remote_accounts(self, ids: list[Any]) -> dict[str, Any]:
-        """批量测试远端账号（按给定 id 列表顺序）。"""
-        ordered_ids: list[str] = []
-        seen: set[str] = set()
-        for raw in ids:
-            aid = str(raw).strip()
-            if not aid or aid in seen:
-                continue
-            seen.add(aid)
-            ordered_ids.append(aid)
-        if not ordered_ids:
-            raise ValueError("请先选择要测试的账号")
-
-        with self._lock:
-            if self._remote_busy:
-                raise RuntimeError("服务端列表拉取中，请稍后再测")
-            if self._remote_test_busy:
-                raise RuntimeError("批量测试进行中，请稍候")
-            self._remote_test_busy = True
-            self._remote_test_stats = {
-                "total": len(ordered_ids),
-                "done": 0,
-                "ok": 0,
-                "fail": 0,
-            }
-
-        ok = 0
-        fail = 0
-        results: list[dict[str, Any]] = []
-
-        try:
-            tok = str(self.cfg.get("accounts_sync_bearer_token") or "").strip()
-            base = str(self.cfg.get("accounts_list_api_base") or "").strip()
-            if not tok:
-                raise ValueError("请先填写 Bearer Token")
-            if not base:
-                raise ValueError("请先填写账号列表 API")
-
-            verify_ssl = bool(self.cfg.get("openai_ssl_verify", True))
-            proxy_arg = str(self.cfg.get("proxy") or "").strip() or None
-            auth = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
-            total = len(ordered_ids)
-            worker_count = min(
-                total,
-                self._to_int(self.cfg.get("remote_test_concurrency"), 4, 1, 12),
-            )
-            ssl_retry_limit = self._to_int(self.cfg.get("remote_test_ssl_retry"), 2, 0, 5)
-
-            self.log(
-                f"[批量测试] 启动：总数 {total}，并发 {worker_count}，"
-                f"SSL 重试 {ssl_retry_limit}"
-            )
-
-            q: Queue[str] = Queue()
-            for aid in ordered_ids:
-                q.put(aid)
-
-            state_lock = threading.Lock()
-
-            def _run_one(aid: str) -> tuple[bool, str, int, str]:
-                t0 = time.time()
-                success = False
-                summary = ""
-                status_text = "失败"
-
-                ssl_retry_done = 0
-
-                while True:
-                    success = False
-                    summary = ""
-                    try:
-                        test_url = f"{base.rstrip('/')}/{urllib.parse.quote(aid)}/test"
-                        body = json.dumps(
-                            {
-                                "model_id": "gpt-5.4",
-                                "prompt": "",
-                            },
-                            ensure_ascii=False,
-                        ).encode("utf-8")
-                        req = urllib.request.Request(
-                            test_url,
-                            data=body,
-                            method="POST",
-                            headers=_merge_http_headers(
-                                {
-                                    "Authorization": auth,
-                                    "Accept": "text/event-stream",
-                                    "Cache-Control": "no-cache",
-                                    "Content-Type": "application/json",
-                                }
-                            ),
-                        )
-                        with _urlopen_request(
-                            req,
-                            verify_ssl=verify_ssl,
-                            timeout=240,
-                            proxy=proxy_arg,
-                        ) as resp:
-                            code = int(resp.getcode() or 0)
-                            if not (200 <= code < 300):
-                                raise RuntimeError(f"HTTP {code}")
-                            success, summary, err_msg = self._consume_test_event_stream(resp)
-                            if err_msg and not summary:
-                                summary = err_msg
-                    except urllib.error.HTTPError as e:
-                        raw = e.read().decode("utf-8", "replace")
-                        summary = f"HTTP {e.code}: {(raw or '')[:220]}"
-                        success = False
-                    except Exception as e:
-                        summary = _hint_connect_error(str(e)).replace("\n", " ")[:220]
-                        success = False
-
-                    if success:
-                        summary = "测试通过"
-                        status_text = "成功"
-                        break
-
-                    if self._is_account_deactivated_error(summary):
-                        status_text = "封禁"
-                        summary = "账号封禁(deactivated)"
-                        break
-
-                    if self._is_rate_limited_error(summary):
-                        status_text = "429限流"
-                        summary = "429 限流"
-                        break
-
-                    if self._is_token_invalidated_error(summary):
-                        status_text = "Token过期"
-                        summary = "Token 过期/失效"
-                        break
-
-                    if ssl_retry_done >= ssl_retry_limit:
-                        break
-                    if not self._is_ssl_retryable_error(summary):
-                        break
-
-                    ssl_retry_done += 1
-                    wait = round(0.8 * ssl_retry_done, 2)
-                    self.log(
-                        f"[批量测试] id={aid} SSL/TLS 异常，"
-                        f"{wait}s 后重试 ({ssl_retry_done}/{ssl_retry_limit})"
-                    )
-                    time.sleep(wait)
-
-                cost_ms = int((time.time() - t0) * 1000)
-                return success, summary, cost_ms, status_text
-
-            def _worker(worker_no: int) -> None:
-                nonlocal ok, fail
-                while True:
-                    try:
-                        aid = q.get_nowait()
-                    except Empty:
-                        return
-
-                    self.log(f"[批量测试-W{worker_no}] 开始 id={aid}")
-                    success, summary, cost_ms, status_text = _run_one(aid)
-                    self._set_remote_test_state(
-                        aid,
-                        status_text=status_text,
-                        summary=summary,
-                        duration_ms=cost_ms,
-                    )
-
-                    with state_lock:
-                        if success:
-                            ok += 1
-                        else:
-                            fail += 1
-                        done = ok + fail
-                        ok_now = ok
-                        fail_now = fail
-                        results.append(
-                            {
-                                "id": aid,
-                                "success": success,
-                                "summary": summary,
-                                "duration_ms": cost_ms,
-                            }
-                        )
-
-                    with self._lock:
-                        self._remote_test_stats = {
-                            "total": total,
-                            "done": done,
-                            "ok": ok_now,
-                            "fail": fail_now,
-                        }
-
-                    if success:
-                        self.log(f"[批量测试-W{worker_no}] id={aid} 成功 ({cost_ms}ms)")
-                    else:
-                        self.log(f"[批量测试-W{worker_no}] id={aid} 失败 ({cost_ms}ms): {summary}")
-                    self.log(f"[批量测试] 进度 {done}/{total} · 成功 {ok_now} · 失败 {fail_now}")
-                    q.task_done()
-
-            workers: list[threading.Thread] = []
-            for i in range(1, worker_count + 1):
-                t = threading.Thread(target=_worker, args=(i,), daemon=True)
-                workers.append(t)
-                t.start()
-
-            for t in workers:
-                t.join()
-
-            order_map = {aid: idx for idx, aid in enumerate(ordered_ids)}
-            results.sort(key=lambda x: order_map.get(str(x.get("id") or ""), 10**9))
-
-            self.log(f"[批量测试] 结束：成功 {ok}，失败 {fail}")
-            return {
-                "ok": ok,
-                "fail": fail,
-                "total": len(ordered_ids),
-                "results": results,
-            }
-        finally:
-            with self._lock:
-                self._remote_test_busy = False
+        return _remote_batch_test_remote_accounts(self, ids)
 
     def revive_remote_tokens(self, ids: list[Any]) -> dict[str, Any]:
-        """批量刷新所选账号 token（用于 Token 过期复活）。"""
-        ordered_ids: list[str] = []
-        seen: set[str] = set()
-        for raw in ids:
-            aid = str(raw).strip()
-            if not aid or aid in seen:
-                continue
-            seen.add(aid)
-            ordered_ids.append(aid)
-        if not ordered_ids:
-            raise ValueError("请先选择要复活的账号")
-
-        with self._lock:
-            if self._remote_busy:
-                raise RuntimeError("服务端列表拉取中，请稍后再试")
-            if self._remote_test_busy:
-                raise RuntimeError("批量测试进行中，请稍后再试")
-            state_by_id = {
-                str(r.get("id") or "").strip(): str(r.get("test_status") or "").strip()
-                for r in self._remote_rows
-            }
-
-        candidates = [aid for aid in ordered_ids if state_by_id.get(aid) == "Token过期"]
-        skipped = [aid for aid in ordered_ids if aid not in set(candidates)]
-        if not candidates:
-            raise ValueError("所选账号中没有“Token过期”状态")
-
-        tok = str(self.cfg.get("accounts_sync_bearer_token") or "").strip()
-        base = str(self.cfg.get("accounts_list_api_base") or "").strip()
-        if not tok:
-            raise ValueError("请先填写 Bearer Token")
-        if not base:
-            raise ValueError("请先填写账号列表 API")
-
-        verify_ssl = bool(self.cfg.get("openai_ssl_verify", True))
-        proxy_arg = str(self.cfg.get("proxy") or "").strip() or None
-        auth = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
-        worker_count = min(
-            len(candidates),
-            self._to_int(self.cfg.get("remote_revive_concurrency"), 4, 1, 12),
-        )
-
-        self.log(
-            f"[复活] 启动：候选 {len(candidates)}，并发 {worker_count}"
-            + (f"，跳过 {len(skipped)}" if skipped else "")
-        )
-
-        ok = 0
-        fail = 0
-        state_lock = threading.Lock()
-        api_used: dict[str, int] = {}
-        results: list[dict[str, Any]] = []
-
-        def _run_one(aid: str) -> dict[str, Any]:
-            refreshed, detail, api = self._try_refresh_remote_token(
-                aid,
-                base=base,
-                auth=auth,
-                verify_ssl=verify_ssl,
-                proxy_arg=proxy_arg,
-            )
-            if refreshed:
-                self._set_remote_test_state(
-                    aid,
-                    status_text="已复活",
-                    summary="Token已刷新",
-                    duration_ms=0,
-                )
-                self.log(
-                    f"[复活] id={aid} 成功"
-                    + (f" · 接口 {api}" if api else "")
-                    + (f" · {detail}" if detail else "")
-                )
-                return {"id": aid, "success": True, "detail": detail, "api": api}
-
-            self.log(f"[复活] id={aid} 失败: {detail}")
-            return {"id": aid, "success": False, "detail": detail, "api": api}
-
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_map = {executor.submit(_run_one, aid): aid for aid in candidates}
-            for fut in as_completed(future_map):
-                aid = future_map[fut]
-                try:
-                    item = fut.result()
-                except Exception as e:
-                    item = {"id": aid, "success": False, "detail": str(e), "api": ""}
-
-                with state_lock:
-                    results.append(item)
-                    if item.get("success"):
-                        ok += 1
-                        api = str(item.get("api") or "").strip()
-                        if api:
-                            api_used[api] = int(api_used.get(api, 0)) + 1
-                    else:
-                        fail += 1
-
-        results.sort(key=lambda x: ordered_ids.index(str(x.get("id") or "")))
-        api_summary = [
-            {"api": k, "count": int(v)}
-            for k, v in sorted(api_used.items(), key=lambda x: (-int(x[1]), str(x[0])))
-        ]
-        self.log(f"[复活] 结束：成功 {ok}，失败 {fail}")
-        return {
-            "ok": ok,
-            "fail": fail,
-            "total": len(candidates),
-            "skipped": skipped,
-            "api_summary": api_summary,
-            "concurrency": worker_count,
-            "results": results,
-        }
+        return _remote_revive_remote_tokens(self, ids)
 
     def delete_remote_accounts(self, ids: list[Any]) -> dict[str, Any]:
         """批量删除远端账号。"""

@@ -1,0 +1,413 @@
+        <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides">
+          <div class="page-wrap">
+            <n-layout has-sider class="main-layout">
+              <n-layout-sider class="sider" :width="220" bordered>
+                <div class="brand">
+                  <h2>CodeX Register</h2>
+                  <p>Naive UI Web 控制台</p>
+                </div>
+                <n-menu :value="activeTab" :options="menuOptions" @update:value="activeTab = $event" />
+              </n-layout-sider>
+
+              <div class="main-right-layout">
+                <div class="header">
+                  <div class="header-title">
+                    <h1>注册任务面板</h1>
+                    <p>保持配置、运行、数据同步在同一页面完成</p>
+                  </div>
+                  <div class="header-status">
+                    <n-tag :type="statusTagType" size="large" :bordered="false">{{ status.status_text }}</n-tag>
+                    <div class="progress-wrap">
+                      <span>{{ progressPercent }}%</span>
+                      <n-progress type="line" :percentage="progressPercent" :show-indicator="false" />
+                    </div>
+                    <div class="run-metrics" :title="runSuccessRateText">{{ runSuccessRateText }}</div>
+                    <div class="run-metrics" :title="runRetryReasonText">{{ runRetryReasonText }}</div>
+                  </div>
+                </div>
+
+                <div class="content">
+                  <n-scrollbar class="content-inner-scroll">
+                  <div v-if="activeTab === 'dash'" class="tab-page">
+                    <n-card class="glass-card" title="运行任务" size="small">
+                    <div class="dash-grid">
+                      <div>
+                        <n-form label-placement="left" label-width="96" :model="dashForm">
+                          <n-form-item label="每文件注册数">
+                            <n-input-number v-model:value="dashForm.num_accounts" :min="1" style="width: 220px" />
+                          </n-form-item>
+                          <n-form-item label="文件数量">
+                            <n-input-number v-model:value="dashForm.num_files" :min="1" :max="200" style="width: 220px" />
+                          </n-form-item>
+                          <n-form-item label="当前文件并发">
+                            <n-input-number v-model:value="dashForm.concurrency" :min="1" :max="6" style="width: 220px" />
+                          </n-form-item>
+                          <n-form-item label="冷却最小(秒)">
+                            <n-input-number v-model:value="dashForm.sleep_min" :min="1" style="width: 220px" />
+                          </n-form-item>
+                          <n-form-item label="冷却最大(秒)">
+                            <n-input-number v-model:value="dashForm.sleep_max" :min="1" style="width: 220px" />
+                          </n-form-item>
+                          <n-form-item label="加速模式">
+                            <n-switch v-model:value="dashForm.fast_mode" />
+                          </n-form-item>
+                          <n-form-item label="代理地址">
+                            <n-input v-model:value="dashForm.proxy" placeholder="留空直连；例 http://127.0.0.1:7890" />
+                          </n-form-item>
+                        </n-form>
+                        <div class="dash-actions">
+                          <n-button type="primary" :loading="loading.start" :disabled="status.running" @click="startRun">开始注册</n-button>
+                          <n-button type="warning" ghost :disabled="!status.running" @click="stopRun">停止</n-button>
+                          <n-button secondary :loading="loading.save" @click="saveConfig(true)">保存配置</n-button>
+                          <n-tag type="info" :bordered="false">计划总数 {{ totalPlanCount }}</n-tag>
+                        </div>
+                      </div>
+
+                      <div>
+                        <n-alert type="info" title="运行说明" :show-icon="false">
+                          启动后会在后台按配置调用 r_with_pwd.run，日志实时出现在底部。<br />
+                          会按“文件数量 × 每文件注册数”分批创建 accounts_*.json；失败会自动补位，尽量补齐每个文件目标。<br />
+                          建议先保存配置，再开始任务；停止后可在「数据」页继续管理导出与同步。
+                        </n-alert>
+                        <n-alert style="margin-top: 10px" type="success" title="提速建议" :show-icon="false">
+                          并发仅作用于当前文件，建议 2~3；冷却 1~3 秒；开启加速模式可缩短 OTP 轮询与网络退避等待。<br />
+                          若启用 FlClash 动态换 IP，将自动跳过香港节点；并发时同一批任务共享同一节点，批次结束后再切换。
+                        </n-alert>
+                        <n-alert style="margin-top: 10px" type="warning" title="网络提醒" :show-icon="false">
+                          若管理端/API 访问失败，请确认代理地址与证书校验开关是否匹配当前网络。
+                        </n-alert>
+                      </div>
+                    </div>
+                  </n-card>
+                  </div>
+
+                  <div v-else-if="activeTab === 'data'" class="tab-page">
+                    <div class="split-grid">
+                      <n-card class="glass-card" title="导出 JSON" size="small">
+                        <template #header-extra>
+                          <span class="meta">{{ jsonInfo.file_count }} 个文件 · {{ jsonInfo.account_total }} 账号</span>
+                        </template>
+                        <div class="toolbar">
+                          <n-button class="toolbar-btn" @click="refreshJson(true)">刷新</n-button>
+                          <n-button class="toolbar-btn" @click="jsonSelectAll">全选</n-button>
+                          <n-button class="toolbar-btn" @click="jsonSelectNone">全不选</n-button>
+                          <n-button class="toolbar-btn" type="error" ghost @click="deleteSelectedJson">删除已勾选</n-button>
+                        </div>
+                        <n-data-table
+                          class="json-table"
+                          size="small"
+                          table-layout="fixed"
+                          :single-line="false"
+                          :columns="jsonColumns"
+                          :data="jsonRows"
+                          :row-key="rowKeyPath"
+                          :row-class-name="jsonRowClassName"
+                          v-model:checked-row-keys="jsonSelection"
+                        />
+                      </n-card>
+
+                      <n-card class="glass-card" title="账号列表" size="small">
+                        <template #header-extra>
+                          <span class="meta">共 {{ accountInfo.total }} 个 · {{ accountInfo.path }}</span>
+                        </template>
+                        <div class="toolbar">
+                          <n-button class="toolbar-btn" @click="refreshAccounts(true)">刷新</n-button>
+                          <n-select
+                            class="toolbar-select"
+                            v-model:value="accountBatchFiles"
+                            :options="accountInfo.file_options"
+                            multiple
+                            clearable
+                            :max-tag-count="1"
+                            placeholder="按文件名批量勾选"
+                          />
+                          <n-button class="toolbar-btn" @click="acctSelectByFiles">按文件勾选</n-button>
+                          <n-button class="toolbar-btn" @click="acctSelectAll">全选</n-button>
+                          <n-button class="toolbar-btn" @click="acctSelectNone">全不选</n-button>
+                          <n-button class="toolbar-btn" type="primary" :loading="loading.sync || status.sync_busy" @click="syncSelectedAccounts">同步已勾选</n-button>
+                        </div>
+                        <div class="account-table-wrap">
+                          <n-data-table
+                            class="account-table"
+                            size="small"
+                            table-layout="fixed"
+                            :single-line="false"
+                            :columns="accountColumns"
+                            :data="accountRows"
+                            :row-key="rowKeyAccount"
+                            :row-class-name="accountRowClassName"
+                            :max-height="430"
+                            v-model:checked-row-keys="accountSelection"
+                          />
+                        </div>
+                      </n-card>
+                    </div>
+
+                    <n-card class="glass-card" title="服务端账号（管理端）" size="small" style="margin-top: 12px">
+                      <div class="toolbar remote-toolbar">
+                        <n-input
+                          class="remote-search"
+                          v-model:value="remoteSearch"
+                          clearable
+                          placeholder="搜索名称/邮箱"
+                        />
+                        <n-button class="toolbar-btn" type="primary" :loading="loading.remote || status.remote_busy" @click="fetchRemoteAll">获取列表与额度</n-button>
+                        <n-button class="toolbar-btn" @click="remoteSelectAll">全选</n-button>
+                        <n-button class="toolbar-btn" @click="remoteSelectNone">全不选</n-button>
+                        <n-button class="toolbar-btn" @click="remoteSelectFailed">全选失败</n-button>
+                        <n-button class="toolbar-btn" @click="remoteSelectDuplicate">全选重复</n-button>
+                        <n-button
+                          class="toolbar-btn"
+                          type="success"
+                          :loading="loading.remote_test || status.remote_test_busy"
+                          @click="testSelectedRemoteAccounts"
+                        >批量测试已选</n-button>
+                        <n-button
+                          class="toolbar-btn"
+                          type="warning"
+                          :loading="loading.remote_revive"
+                          @click="reviveSelectedRemoteAccounts"
+                        >复活已选</n-button>
+                        <n-button
+                          class="toolbar-btn"
+                          type="error"
+                          :loading="loading.remote_delete"
+                          @click="deleteSelectedRemoteAccounts"
+                        >批量删除已选</n-button>
+                      </div>
+                      <div class="meta">{{ remoteInfoText }}</div>
+                      <n-data-table
+                        class="remote-table"
+                        size="small"
+                        table-layout="fixed"
+                        :single-line="false"
+                        :columns="remoteColumns"
+                        :data="remoteRows"
+                        :row-key="rowKeyRemote"
+                        :row-class-name="remoteRowClassName"
+                        v-model:checked-row-keys="remoteSelection"
+                      />
+                    </n-card>
+                  </div>
+
+                  <div v-else-if="activeTab === 'mail'" class="tab-page">
+                    <n-card class="glass-card" title="邮箱服务与账号管理" size="small">
+                      <div class="toolbar mail-top-toolbar">
+                        <n-select
+                          class="mail-provider-select"
+                          v-model:value="settingsForm.mail_service_provider"
+                          :options="mailProviders"
+                          placeholder="选择邮箱服务"
+                        />
+                        <n-button class="toolbar-btn" :loading="loading.mail_overview || loading.save" @click="refreshMailOverview(true)">保存并刷新</n-button>
+                        <n-button class="toolbar-btn" type="primary" :loading="loading.mail_generate" @click="generateMailbox">生成新邮箱</n-button>
+                      </div>
+                      <div class="meta">{{ mailInfoText }}</div>
+                      <div class="mail-domain-wrap">
+                        <button
+                          v-for="dm in mailDomains"
+                          :key="dm"
+                          type="button"
+                          class="domain-chip"
+                          :class="{ 'is-selected': isDomainSelected(dm), 'has-error': domainErrorCount(dm) > 0 }"
+                          :title="'已注册: ' + domainRegisteredCount(dm) + ' · registration_disallowed: ' + domainErrorCount(dm)"
+                          @click="toggleDomain(dm)"
+                        >
+                          <span>{{ dm }}</span>
+                          <span v-if="domainRegisteredCount(dm) > 0" class="domain-chip-badge domain-chip-badge-ok">{{ domainRegisteredCount(dm) }}</span>
+                          <span v-if="domainErrorCount(dm) > 0" class="domain-chip-badge">{{ domainErrorCount(dm) }}</span>
+                        </button>
+                        <span v-if="!mailDomains.length" class="meta">暂无域名，点击“保存并刷新”后加载</span>
+                      </div>
+                      <div class="meta" style="margin-top: 6px">点击域名标签可启用/禁用该域名；绿色角标为累计注册数，红色角标为 registration_disallowed 次数（均持久化保存）。</div>
+                    </n-card>
+
+                    <div class="split-grid mail-split-grid">
+                      <n-card class="glass-card" title="邮箱账号" size="small">
+                        <div class="meta">当前选中邮箱：{{ selectedMailbox || '-' }}</div>
+                        <div class="toolbar">
+                          <n-input
+                            class="remote-search"
+                            v-model:value="mailboxSearch"
+                            clearable
+                            placeholder="搜索邮箱地址"
+                          />
+                          <n-button class="toolbar-btn" @click="mailboxSelectAll">全选</n-button>
+                          <n-button class="toolbar-btn" @click="mailboxSelectNone">全不选</n-button>
+                          <n-button
+                            class="toolbar-btn"
+                            type="error"
+                            :loading="loading.mailbox_delete"
+                            @click="deleteSelectedMailboxes"
+                          >删除已选邮箱</n-button>
+                        </div>
+                        <n-data-table
+                          size="small"
+                          table-layout="fixed"
+                          :single-line="false"
+                          :columns="mailboxColumns"
+                          :data="filteredMailboxRows"
+                          :row-key="rowKeyMailbox"
+                          :row-props="mailboxRowProps"
+                          :max-height="350"
+                          v-model:checked-row-keys="mailboxSelection"
+                        />
+                      </n-card>
+
+                      <n-card class="glass-card" title="邮件列表" size="small">
+                        <template #header-extra>
+                          <span
+                            class="meta mail-header-meta"
+                            :title="'当前邮箱：' + (selectedMailbox || '-') + ' · 当前邮件：' + selectedMailLabel"
+                          >当前邮箱：{{ selectedMailbox || '-' }} · 当前邮件：{{ selectedMailLabel }}</span>
+                        </template>
+                        <div class="toolbar">
+                          <n-button class="toolbar-btn" :loading="loading.mail_emails" @click="refreshSelectedMailboxEmails">刷新邮件</n-button>
+                          <n-button
+                            class="toolbar-btn"
+                            type="error"
+                            ghost
+                            :loading="loading.mail_clear"
+                            @click="clearSelectedMailboxEmails"
+                          >清空当前邮箱</n-button>
+                          <n-button
+                            class="toolbar-btn"
+                            type="error"
+                            :loading="loading.mail_delete"
+                            @click="deleteSelectedEmails"
+                          >删除已选邮件</n-button>
+                        </div>
+                        <n-data-table
+                          size="small"
+                          table-layout="fixed"
+                          :single-line="false"
+                          :columns="mailColumns"
+                          :data="mailRows"
+                          :row-key="rowKeyMail"
+                          :row-props="mailRowProps"
+                          :max-height="350"
+                          v-model:checked-row-keys="mailSelection"
+                        />
+                      </n-card>
+                    </div>
+
+                    <n-modal
+                      v-model:show="showMailModal"
+                      preset="card"
+                      title="邮件内容"
+                      :mask-closable="true"
+                      style="width: min(1080px, 94vw)"
+                    >
+                      <div class="mail-detail-head">
+                        <div class="meta">ID：{{ mailDetail.id || '-' }}</div>
+                        <div class="meta">发件人：{{ mailDetail.from || '-' }}</div>
+                        <div class="meta">时间：{{ mailDetail.date || '-' }}</div>
+                        <div class="meta">主题：{{ mailDetail.subject || '-' }}</div>
+                      </div>
+                      <n-scrollbar class="mail-modal-scroll">
+                        <pre class="mail-detail-pre">{{ mailDetailText }}</pre>
+                      </n-scrollbar>
+                    </n-modal>
+                  </div>
+
+                  <div v-else-if="activeTab === 'settings'" class="tab-page">
+                    <n-card class="glass-card" title="MailFree 与服务配置" size="small">
+                    <div class="settings-two-col">
+                      <n-form class="settings-col" label-placement="left" label-width="180" :model="settingsForm">
+                        <n-form-item label="MailFree 服务地址">
+                          <n-input v-model:value="settingsForm.worker_domain" placeholder="https://mailfree.ylmty520.workers.dev" />
+                        </n-form-item>
+                        <n-form-item label="Freemail 用户名">
+                          <n-input v-model:value="settingsForm.freemail_username" />
+                        </n-form-item>
+                        <n-form-item label="Freemail 密码">
+                          <n-input v-model:value="settingsForm.freemail_password" type="password" show-password-on="click" />
+                        </n-form-item>
+                        <n-form-item label="MailFree 随机域名">
+                          <n-switch v-model:value="settingsForm.mailfree_random_domain" />
+                        </n-form-item>
+                        <n-form-item label="同步 API 地址">
+                          <n-input v-model:value="settingsForm.accounts_sync_api_url" />
+                        </n-form-item>
+                        <n-form-item label="账号列表 API">
+                          <n-input v-model:value="settingsForm.accounts_list_api_base" />
+                        </n-form-item>
+                        <n-form-item label="Bearer Token">
+                          <n-input v-model:value="settingsForm.accounts_sync_bearer_token" type="password" show-password-on="mousedown" />
+                        </n-form-item>
+                        <n-form-item label="Timezone">
+                          <n-input v-model:value="settingsForm.accounts_list_timezone" placeholder="Asia/Shanghai" />
+                        </n-form-item>
+                        <n-form-item label="校验 HTTPS 证书">
+                          <n-switch v-model:value="settingsForm.openai_ssl_verify" />
+                        </n-form-item>
+                        <n-form-item label="跳过网络地区检测">
+                          <n-switch v-model:value="settingsForm.skip_net_check" />
+                        </n-form-item>
+                      </n-form>
+
+                      <n-form class="settings-col" label-placement="left" label-width="180" :model="settingsForm">
+                        <n-form-item label="启用 FlClash 动态换 IP">
+                          <n-switch v-model:value="settingsForm.flclash_enable_switch" />
+                        </n-form-item>
+                        <n-form-item label="FlClash 控制器">
+                          <n-input v-model:value="settingsForm.flclash_controller" placeholder="127.0.0.1:9090" />
+                        </n-form-item>
+                        <n-form-item label="FlClash Secret（可空）">
+                          <n-input v-model:value="settingsForm.flclash_secret" type="password" show-password-on="click" placeholder="本地可留空" />
+                        </n-form-item>
+                        <n-form-item label="节点组名">
+                          <n-input v-model:value="settingsForm.flclash_group" placeholder="PROXY / 节点选择" />
+                        </n-form-item>
+                        <n-form-item label="切换策略">
+                          <n-select v-model:value="settingsForm.flclash_switch_policy" :options="flclashPolicyOptions" style="width: 220px" />
+                        </n-form-item>
+                        <n-form-item label="切换后等待(秒)">
+                          <n-input-number v-model:value="settingsForm.flclash_switch_wait_sec" :min="0" :max="10" :step="0.1" style="width: 220px" />
+                        </n-form-item>
+                        <n-form-item label="节点延迟测试链接">
+                          <n-input v-model:value="settingsForm.flclash_delay_test_url" placeholder="https://www.gstatic.com/generate_204" />
+                        </n-form-item>
+                        <n-form-item label="延迟测试超时(ms)">
+                          <n-input-number v-model:value="settingsForm.flclash_delay_timeout_ms" :min="500" :max="20000" :step="100" style="width: 220px" />
+                        </n-form-item>
+                        <n-form-item label="可用延迟阈值(ms)">
+                          <n-input-number v-model:value="settingsForm.flclash_delay_max_ms" :min="100" :max="30000" :step="100" style="width: 220px" />
+                        </n-form-item>
+                        <n-form-item label="延迟测试重试">
+                          <n-input-number v-model:value="settingsForm.flclash_delay_retry" :min="0" :max="5" style="width: 220px" />
+                        </n-form-item>
+                        <n-form-item label="批量测试并发">
+                          <n-input-number v-model:value="settingsForm.remote_test_concurrency" :min="1" :max="12" style="width: 220px" />
+                        </n-form-item>
+                        <n-form-item label="批量测试 SSL 重试">
+                          <n-input-number v-model:value="settingsForm.remote_test_ssl_retry" :min="0" :max="5" style="width: 220px" />
+                        </n-form-item>
+                      </n-form>
+                    </div>
+                    <n-space class="settings-actions">
+                      <n-button type="primary" :loading="loading.save" @click="saveConfig(true)">保存配置</n-button>
+                      <n-button @click="manualPoll">刷新状态</n-button>
+                    </n-space>
+                    </n-card>
+                  </div>
+
+                  <div v-else class="tab-page log-page">
+                    <n-card class="glass-card log-card" title="运行日志" size="small">
+                      <template #header-extra>
+                        <n-space :size="8">
+                          <n-button size="small" @click="manualPoll">刷新</n-button>
+                          <n-button size="small" @click="clearLogs">清空</n-button>
+                        </n-space>
+                      </template>
+                      <n-scrollbar ref="logScrollbarRef" class="log-scroll">
+                        <pre class="log-view">{{ logText || '暂无日志' }}</pre>
+                      </n-scrollbar>
+                    </n-card>
+                  </div>
+                  </n-scrollbar>
+                </div>
+              </div>
+            </n-layout>
+          </div>
+        </n-config-provider>

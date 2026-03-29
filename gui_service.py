@@ -43,6 +43,7 @@ from gui_service_data_ops import (
     build_email_source_files_map as _data_build_email_source_files_map,
     build_local_account_index as _data_build_local_account_index,
     delete_json_files as _data_delete_json_files,
+    export_codex_accounts as _data_export_codex_accounts,
     email_from_account_entry as _data_email_from_account_entry,
     emails_from_accounts_json as _data_emails_from_accounts_json,
     list_accounts as _data_list_accounts,
@@ -60,9 +61,12 @@ from gui_service_mail_ops import (
     mail_delete_emails as _mail_mail_delete_emails,
     mail_delete_mailbox as _mail_mail_delete_mailbox,
     mail_delete_mailboxes as _mail_mail_delete_mailboxes,
+    mail_delete_graph_account_file as _mail_mail_delete_graph_account_file,
     mail_domain_stats as _mail_mail_domain_stats,
     mail_generate_mailbox as _mail_mail_generate_mailbox,
     mail_get_email_detail as _mail_mail_get_email_detail,
+    mail_graph_account_files as _mail_mail_graph_account_files,
+    mail_import_graph_account_file as _mail_mail_import_graph_account_file,
     mail_list_emails as _mail_mail_list_emails,
     mail_overview as _mail_mail_overview,
     mail_providers as _mail_mail_providers,
@@ -89,6 +93,196 @@ from mail_services import (
     build_mail_service,
     normalize_mail_provider,
 )
+
+
+_OPENAI_SMS_BLOCKED_COUNTRY_IDS = {
+    0,    # Russia
+    3,    # China
+    14,   # Hong Kong
+    20,   # Macao
+    51,   # Belarus
+    57,   # Iran
+    110,  # Syria
+    113,  # Cuba
+    191,  # North Korea
+}
+
+_OPENAI_SMS_BLOCKED_COUNTRY_KEYWORDS = {
+    "russia",
+    "china",
+    "hong kong",
+    "macao",
+    "macau",
+    "belarus",
+    "iran",
+    "syria",
+    "cuba",
+    "north korea",
+    "democratic people's republic of korea",
+}
+
+_COUNTRY_ZH_BY_ENG = {
+    "united states": "美国",
+    "usa": "美国",
+    "usa (virtual)": "美国(虚拟)",
+    "united kingdom": "英国",
+    "germany": "德国",
+    "france": "法国",
+    "canada": "加拿大",
+    "australia": "澳大利亚",
+    "new zealand": "新西兰",
+    "japan": "日本",
+    "south korea": "韩国",
+    "north korea": "朝鲜",
+    "china": "中国",
+    "hong kong": "中国香港",
+    "macao": "中国澳门",
+    "taiwan": "中国台湾",
+    "singapore": "新加坡",
+    "malaysia": "马来西亚",
+    "thailand": "泰国",
+    "vietnam": "越南",
+    "indonesia": "印度尼西亚",
+    "philippines": "菲律宾",
+    "india": "印度",
+    "pakistan": "巴基斯坦",
+    "bangladesh": "孟加拉国",
+    "sri lanka": "斯里兰卡",
+    "nepal": "尼泊尔",
+    "myanmar": "缅甸",
+    "laos": "老挝",
+    "cambodia": "柬埔寨",
+    "brunei": "文莱",
+    "russia": "俄罗斯",
+    "ukraine": "乌克兰",
+    "belarus": "白俄罗斯",
+    "kazakhstan": "哈萨克斯坦",
+    "uzbekistan": "乌兹别克斯坦",
+    "kyrgyzstan": "吉尔吉斯斯坦",
+    "tajikistan": "塔吉克斯坦",
+    "turkmenistan": "土库曼斯坦",
+    "mongolia": "蒙古",
+    "turkey": "土耳其",
+    "georgia": "格鲁吉亚",
+    "armenia": "亚美尼亚",
+    "azerbaijan": "阿塞拜疆",
+    "israel": "以色列",
+    "saudi arabia": "沙特阿拉伯",
+    "united arab emirates": "阿联酋",
+    "qatar": "卡塔尔",
+    "kuwait": "科威特",
+    "bahrain": "巴林",
+    "oman": "阿曼",
+    "jordan": "约旦",
+    "lebanon": "黎巴嫩",
+    "iraq": "伊拉克",
+    "iran": "伊朗",
+    "yemen": "也门",
+    "syria": "叙利亚",
+    "egypt": "埃及",
+    "morocco": "摩洛哥",
+    "algeria": "阿尔及利亚",
+    "tunisia": "突尼斯",
+    "libya": "利比亚",
+    "sudan": "苏丹",
+    "south sudan": "南苏丹",
+    "ethiopia": "埃塞俄比亚",
+    "kenya": "肯尼亚",
+    "uganda": "乌干达",
+    "tanzania": "坦桑尼亚",
+    "nigeria": "尼日利亚",
+    "ghana": "加纳",
+    "south africa": "南非",
+    "zambia": "赞比亚",
+    "zimbabwe": "津巴布韦",
+    "botswana": "博茨瓦纳",
+    "namibia": "纳米比亚",
+    "mozambique": "莫桑比克",
+    "rwanda": "卢旺达",
+    "mauritius": "毛里求斯",
+    "mexico": "墨西哥",
+    "brazil": "巴西",
+    "argentina": "阿根廷",
+    "chile": "智利",
+    "peru": "秘鲁",
+    "colombia": "哥伦比亚",
+    "venezuela": "委内瑞拉",
+    "ecuador": "厄瓜多尔",
+    "bolivia": "玻利维亚",
+    "paraguay": "巴拉圭",
+    "uruguay": "乌拉圭",
+    "panama": "巴拿马",
+    "costa rica": "哥斯达黎加",
+    "guatemala": "危地马拉",
+    "honduras": "洪都拉斯",
+    "el salvador": "萨尔瓦多",
+    "nicaragua": "尼加拉瓜",
+    "dominican republic": "多米尼加",
+    "cuba": "古巴",
+    "jamaica": "牙买加",
+    "haiti": "海地",
+    "trinidad and tobago": "特立尼达和多巴哥",
+    "ireland": "爱尔兰",
+    "netherlands": "荷兰",
+    "belgium": "比利时",
+    "luxembourg": "卢森堡",
+    "switzerland": "瑞士",
+    "austria": "奥地利",
+    "italy": "意大利",
+    "spain": "西班牙",
+    "portugal": "葡萄牙",
+    "greece": "希腊",
+    "poland": "波兰",
+    "czech republic": "捷克",
+    "czechia": "捷克",
+    "slovakia": "斯洛伐克",
+    "hungary": "匈牙利",
+    "romania": "罗马尼亚",
+    "bulgaria": "保加利亚",
+    "croatia": "克罗地亚",
+    "slovenia": "斯洛文尼亚",
+    "serbia": "塞尔维亚",
+    "bosnia and herzegovina": "波黑",
+    "montenegro": "黑山",
+    "albania": "阿尔巴尼亚",
+    "north macedonia": "北马其顿",
+    "moldova": "摩尔多瓦",
+    "lithuania": "立陶宛",
+    "latvia": "拉脱维亚",
+    "estonia": "爱沙尼亚",
+    "denmark": "丹麦",
+    "sweden": "瑞典",
+    "norway": "挪威",
+    "finland": "芬兰",
+    "iceland": "冰岛",
+    "malta": "马耳他",
+    "cyprus": "塞浦路斯",
+}
+
+
+def _normalize_country_name(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name or "").strip().lower())
+
+
+def _country_name_zh(eng: str, chn: str = "") -> str:
+    raw_chn = str(chn or "").strip()
+    if raw_chn and re.search(r"[\u4e00-\u9fff]", raw_chn):
+        return raw_chn
+    key = _normalize_country_name(eng)
+    return str(_COUNTRY_ZH_BY_ENG.get(key) or str(eng or "").strip())
+
+
+def _is_openai_sms_country_allowed(country_id: int, eng_name: str) -> bool:
+    cid = int(country_id)
+    if cid in _OPENAI_SMS_BLOCKED_COUNTRY_IDS:
+        return False
+    key = _normalize_country_name(eng_name)
+    if not key:
+        return True
+    for kw in _OPENAI_SMS_BLOCKED_COUNTRY_KEYWORDS:
+        if kw in key:
+            return False
+    return True
 
 class StdoutCapture:
     """按行把 print 输出交给回调，供后台线程日志上屏。"""
@@ -154,9 +348,12 @@ class RegisterService:
             "success_cost_total_ms": 0,
             "success_cost_count": 0,
             "avg_success_sec": 0.0,
+            "sms_spent_usd": 0.0,
+            "sms_balance_usd": -1.0,
+            "sms_min_balance_usd": 0.0,
         }
         self._mail_client: Any | None = None
-        self._mail_client_sig: tuple[str, str, str, str, bool] | None = None
+        self._mail_client_sig: tuple[str, str, str, str, bool, str, str, str] | None = None
 
         self._apply_to_env()
         self.log("Web 控制台已就绪")
@@ -304,6 +501,9 @@ class RegisterService:
                 "success_cost_total_ms": 0,
                 "success_cost_count": 0,
                 "avg_success_sec": 0.0,
+                "sms_spent_usd": 0.0,
+                "sms_balance_usd": -1.0,
+                "sms_min_balance_usd": 0.0,
             }
             self._run_stats["success_rate"] = self._calc_run_success_rate_locked()
 
@@ -353,6 +553,46 @@ class RegisterService:
             rate = float(self._run_stats.get("success_rate") or 0.0)
         return retry_total, rate
 
+    def _record_run_sms_stats_from_meta(self, meta: dict[str, Any]) -> None:
+        if not isinstance(meta, dict) or not meta:
+            return
+        spent_raw = meta.get("sms_spent_usd")
+        bal_raw = meta.get("sms_balance_usd")
+        min_raw = meta.get("sms_min_balance_usd")
+
+        spent: float | None = None
+        bal: float | None = None
+        min_bal: float | None = None
+        try:
+            if spent_raw is not None:
+                spent = max(0.0, float(spent_raw))
+        except Exception:
+            spent = None
+        try:
+            if bal_raw is not None:
+                bal = float(bal_raw)
+        except Exception:
+            bal = None
+        try:
+            if min_raw is not None:
+                min_bal = max(0.0, float(min_raw))
+        except Exception:
+            min_bal = None
+
+        if spent is None and bal is None and min_bal is None:
+            return
+
+        with self._lock:
+            if spent is not None:
+                self._run_stats["sms_spent_usd"] = round(
+                    max(float(self._run_stats.get("sms_spent_usd") or 0.0), spent),
+                    4,
+                )
+            if bal is not None and bal >= 0:
+                self._run_stats["sms_balance_usd"] = round(bal, 4)
+            if min_bal is not None:
+                self._run_stats["sms_min_balance_usd"] = round(min_bal, 4)
+
     @staticmethod
     def _top_retry_reasons(reason_counts: dict[str, int], limit: int = 3) -> list[dict[str, Any]]:
         rows = [
@@ -371,11 +611,17 @@ class RegisterService:
             "otp_timeout": "未收到验证码(OTP超时)",
             "otp_validate_failed": "验证码校验失败",
             "mailbox_init_failed": "临时邮箱初始化失败",
+            "stopped_by_user": "用户手动停止",
             "net_check_failed": "网络地区检测失败",
             "auth_continue_failed": "注册前置接口失败(authorize/continue)",
             "register_password_failed": "密码提交失败(user/register)",
             "create_account_failed": "创建账号失败(create_account)",
+            "phone_gate": "手机号验证风控(add-phone)",
+            "phone_balance_insufficient": "手机号验证失败(HeroSMS余额不足)",
+            "phone_country_blocked": "手机号国家受限(OpenAI不支持)",
+            "phone_sms_timeout": "手机号验证码超时(HeroSMS)",
             "registration_disallowed": "registration_disallowed 风控",
+            "graph_pool_exhausted": "Microsoft 邮箱账号池已耗尽",
             "tls_error": "SSL/TLS 异常",
             "runtime_exception": "运行异常",
         }
@@ -412,6 +658,30 @@ class RegisterService:
         with self._lock:
             self._logs.clear()
             self._log_seq = 0
+
+    def clear_run_stats(self) -> dict[str, Any]:
+        with self._lock:
+            if self._running:
+                raise RuntimeError("任务运行中，无法清空统计")
+            self._run_stats = {
+                "planned_total": 0,
+                "success_count": 0,
+                "retry_total": 0,
+                "success_rate": 100.0,
+                "last_retry_reason": "",
+                "retry_reasons": {},
+                "started_at": 0.0,
+                "ended_at": 0.0,
+                "elapsed_sec": 0.0,
+                "success_cost_total_ms": 0,
+                "success_cost_count": 0,
+                "avg_success_sec": 0.0,
+                "sms_spent_usd": 0.0,
+                "sms_balance_usd": -1.0,
+                "sms_min_balance_usd": 0.0,
+            }
+        self.log("运行统计已清空")
+        return self.status()
         self.log("日志已清空")
 
     def fetch_logs(self, since: int) -> dict[str, Any]:
@@ -420,10 +690,79 @@ class RegisterService:
             last = self._log_seq
         return {"items": items, "last_id": last}
 
+    def _config_health_locked(self) -> tuple[list[str], list[str]]:
+        """返回 (blockers, warnings)。
+
+        - blockers: 启动注册前必须补齐，否则直接拒绝启动
+        - warnings: 建议完善项，不阻塞启动
+        """
+        cfg = dict(self.cfg)
+        blockers: list[str] = []
+        warnings: list[str] = []
+
+        provider = normalize_mail_provider(cfg.get("mail_service_provider") or "mailfree")
+        worker_domain = str(cfg.get("worker_domain") or "").strip()
+        freemail_user = str(cfg.get("freemail_username") or "").strip()
+        freemail_pass = str(cfg.get("freemail_password") or "").strip()
+        graph_file = str(cfg.get("graph_accounts_file") or "").strip()
+
+        if provider == "mailfree":
+            if not worker_domain:
+                blockers.append("邮箱服务地址未填写（worker_domain）")
+            if not freemail_user:
+                blockers.append("MailFree 用户名未填写（freemail_username）")
+            if not freemail_pass:
+                blockers.append("MailFree 密码未填写（freemail_password）")
+        elif provider == "graph":
+            if not graph_file:
+                blockers.append("Graph 账号文件未选择（graph_accounts_file）")
+            else:
+                graph_path = os.path.abspath(os.path.expanduser(graph_file))
+                if not os.path.isfile(graph_path):
+                    blockers.append(f"Graph 账号文件不存在：{graph_file}")
+
+        if bool(cfg.get("hero_sms_enabled", False)):
+            hero_key = str(cfg.get("hero_sms_api_key") or "").strip()
+            hero_country = str(cfg.get("hero_sms_country") or "").strip()
+            hero_min_balance = self._to_float(cfg.get("hero_sms_max_price"), 2.0, 0.0, 200.0)
+            if not hero_key:
+                warnings.append("SMS 已启用但 HeroSMS API Key 为空")
+            if not hero_country:
+                warnings.append("SMS 已启用但国家未设置（hero_sms_country）")
+            if hero_min_balance <= 0:
+                warnings.append("SMS 余额下限为 0，可能导致低余额下继续消耗")
+
+        if bool(cfg.get("flclash_enable_switch", False)):
+            flc_controller = str(cfg.get("flclash_controller") or "").strip()
+            flc_group = str(cfg.get("flclash_group") or "").strip()
+            if not flc_controller:
+                blockers.append("FlClash 已启用但控制器地址为空（flclash_controller）")
+            if not flc_group:
+                blockers.append("FlClash 已启用但策略组为空（flclash_group）")
+
+        sync_url = str(cfg.get("accounts_sync_api_url") or "").strip()
+        sync_token = str(cfg.get("accounts_sync_bearer_token") or "").strip()
+        list_base = str(cfg.get("accounts_list_api_base") or "").strip()
+        if not sync_url:
+            warnings.append("远端同步接口为空（accounts_sync_api_url）")
+        if not sync_token:
+            warnings.append("远端 Bearer Token 为空（accounts_sync_bearer_token）")
+        if not list_base:
+            warnings.append("远端列表接口为空（accounts_list_api_base）")
+
+        if self._to_int(cfg.get("concurrency"), 1, 1, 6) > 1 and not bool(
+            cfg.get("register_random_fingerprint", True)
+        ):
+            warnings.append("多并发 + 固定指纹，可能提高 invalid_auth_step/400 概率")
+
+        return blockers, warnings
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_run_elapsed_locked()
             reasons = dict(self._run_stats.get("retry_reasons") or {})
+            sms_min_cfg = self._to_float(self.cfg.get("hero_sms_max_price"), 2.0, 0.0, 200.0)
+            blockers, warnings = self._config_health_locked()
             return {
                 "running": self._running,
                 "status_text": self._status_text,
@@ -444,6 +783,14 @@ class RegisterService:
                 "run_retry_reasons_top": self._top_retry_reasons(reasons, limit=3),
                 "run_elapsed_sec": float(self._run_stats.get("elapsed_sec") or 0.0),
                 "run_avg_success_sec": float(self._run_stats.get("avg_success_sec") or 0.0),
+                "run_sms_spent_usd": float(self._run_stats.get("sms_spent_usd") or 0.0),
+                "run_sms_balance_usd": float(self._run_stats.get("sms_balance_usd") or -1.0),
+                "run_sms_min_balance_usd": float(
+                    self._run_stats.get("sms_min_balance_usd") or sms_min_cfg
+                ),
+                "config_blockers": blockers,
+                "config_warnings": warnings,
+                "config_ready": len(blockers) == 0,
             }
 
     def get_config(self) -> dict[str, Any]:
@@ -502,6 +849,13 @@ class RegisterService:
                 1,
                 12,
             )
+        if "mailbox_random_len" in data:
+            cfg["mailbox_random_len"] = self._to_int(
+                data.get("mailbox_random_len"),
+                cfg.get("mailbox_random_len", 0),
+                0,
+                32,
+            )
         if "accounts_list_ssl_retry" in data:
             cfg["accounts_list_ssl_retry"] = self._to_int(
                 data.get("accounts_list_ssl_retry"),
@@ -537,6 +891,13 @@ class RegisterService:
                 0,
                 5,
             )
+        if "hero_sms_max_price" in data:
+            cfg["hero_sms_max_price"] = self._to_float(
+                data.get("hero_sms_max_price"),
+                float(cfg.get("hero_sms_max_price", 2.0)),
+                0.0,
+                200.0,
+            )
 
         if cfg["sleep_max"] < cfg["sleep_min"]:
             cfg["sleep_max"] = cfg["sleep_min"]
@@ -552,10 +913,20 @@ class RegisterService:
             "worker_domain",
             "freemail_username",
             "freemail_password",
+            "graph_accounts_file",
+            "graph_tenant",
+            "graph_fetch_mode",
+            "mailbox_prefix",
+            "hero_sms_api_key",
+            "hero_sms_service",
+            "hero_sms_country",
+            "hero_sms_reuse_phone",
+            "hero_sms_auto_pick_country",
             "accounts_sync_api_url",
             "accounts_sync_bearer_token",
             "accounts_list_api_base",
             "accounts_list_timezone",
+            "codex_export_dir",
         ]
         for key in str_keys:
             if key in data:
@@ -571,10 +942,40 @@ class RegisterService:
                 data.get("skip_net_check"),
                 bool(cfg.get("skip_net_check", False)),
             )
+        if "graph_pre_refresh_before_run" in data:
+            cfg["graph_pre_refresh_before_run"] = self._to_bool(
+                data.get("graph_pre_refresh_before_run"),
+                bool(cfg.get("graph_pre_refresh_before_run", True)),
+            )
+        if "hero_sms_enabled" in data:
+            cfg["hero_sms_enabled"] = self._to_bool(
+                data.get("hero_sms_enabled"),
+                bool(cfg.get("hero_sms_enabled", False)),
+            )
+        if "hero_sms_reuse_phone" in data:
+            cfg["hero_sms_reuse_phone"] = self._to_bool(
+                data.get("hero_sms_reuse_phone"),
+                bool(cfg.get("hero_sms_reuse_phone", False)),
+            )
+        if "hero_sms_auto_pick_country" in data:
+            cfg["hero_sms_auto_pick_country"] = self._to_bool(
+                data.get("hero_sms_auto_pick_country"),
+                bool(cfg.get("hero_sms_auto_pick_country", False)),
+            )
         if "mailfree_random_domain" in data:
             cfg["mailfree_random_domain"] = self._to_bool(
                 data.get("mailfree_random_domain"),
                 bool(cfg.get("mailfree_random_domain", True)),
+            )
+        if "mailbox_custom_enabled" in data:
+            cfg["mailbox_custom_enabled"] = self._to_bool(
+                data.get("mailbox_custom_enabled"),
+                bool(cfg.get("mailbox_custom_enabled", False)),
+            )
+        if "register_random_fingerprint" in data:
+            cfg["register_random_fingerprint"] = self._to_bool(
+                data.get("register_random_fingerprint"),
+                bool(cfg.get("register_random_fingerprint", True)),
             )
         if "mail_domain_allowlist" in data:
             cfg["mail_domain_allowlist"] = self._normalize_domain_list(
@@ -614,6 +1015,11 @@ class RegisterService:
         cfg["mail_service_provider"] = normalize_mail_provider(
             cfg.get("mail_service_provider") or "mailfree"
         )
+        graph_mode = str(cfg.get("graph_fetch_mode") or "graph_api").strip().lower()
+        if graph_mode not in {"graph_api", "imap_xoauth2"}:
+            graph_mode = "graph_api"
+        cfg["graph_fetch_mode"] = graph_mode
+        cfg["hero_sms_country"] = str(cfg.get("hero_sms_country") or "US").strip() or "US"
         cfg["mail_domain_allowlist"] = self._normalize_domain_list(
             cfg.get("mail_domain_allowlist") or []
         )
@@ -652,6 +1058,12 @@ class RegisterService:
         with self._lock:
             self._running = running
 
+    def _wait_or_stop(self, seconds: float) -> bool:
+        wait_sec = max(0.0, float(seconds or 0.0))
+        if wait_sec <= 0:
+            return self._stop.is_set()
+        return self._stop.wait(wait_sec)
+
     def _apply_to_env(self) -> None:
         domain = str(self.cfg.get("worker_domain") or "").strip()
         if domain and not domain.startswith("http"):
@@ -662,9 +1074,37 @@ class RegisterService:
         os.environ["MAIL_SERVICE_PROVIDER"] = normalize_mail_provider(
             self.cfg.get("mail_service_provider") or "mailfree"
         )
+        os.environ["GRAPH_ACCOUNTS_FILE"] = str(self.cfg.get("graph_accounts_file") or "").strip()
+        os.environ["GRAPH_TENANT"] = str(self.cfg.get("graph_tenant") or "common").strip()
+        os.environ["GRAPH_FETCH_MODE"] = str(self.cfg.get("graph_fetch_mode") or "graph_api").strip()
+        os.environ["HERO_SMS_ENABLED"] = "1" if self.cfg.get("hero_sms_enabled") else "0"
+        os.environ["HERO_SMS_REUSE_PHONE"] = "1" if self.cfg.get("hero_sms_reuse_phone") else "0"
+        os.environ["HERO_SMS_API_KEY"] = str(self.cfg.get("hero_sms_api_key") or "").strip()
+        os.environ["HERO_SMS_SERVICE"] = str(self.cfg.get("hero_sms_service") or "").strip()
+        os.environ["HERO_SMS_COUNTRY"] = str(self.cfg.get("hero_sms_country") or "US").strip() or "US"
+        os.environ["HERO_SMS_AUTO_PICK_COUNTRY"] = (
+            "1" if self.cfg.get("hero_sms_auto_pick_country") else "0"
+        )
+        hero_sms_min_balance = self._to_float(self.cfg.get("hero_sms_max_price"), 2.0, 0.0, 200.0)
+        os.environ["HERO_SMS_MIN_BALANCE"] = str(hero_sms_min_balance)
+        # 兼容旧键名：仍保留 HERO_SMS_MAX_PRICE，实际语义为余额下限。
+        os.environ["HERO_SMS_MAX_PRICE"] = str(hero_sms_min_balance)
         os.environ["OPENAI_SSL_VERIFY"] = "1" if self.cfg.get("openai_ssl_verify") else "0"
         os.environ["SKIP_NET_CHECK"] = "1" if self.cfg.get("skip_net_check") else "0"
         os.environ["MAILFREE_RANDOM_DOMAIN"] = "1" if self.cfg.get("mailfree_random_domain", True) else "0"
+        os.environ["REGISTER_RANDOM_FINGERPRINT"] = "1" if self.cfg.get("register_random_fingerprint", True) else "0"
+        mailbox_custom_enabled = bool(self.cfg.get("mailbox_custom_enabled", False))
+        os.environ["MAILBOX_CUSTOM_ENABLED"] = "1" if mailbox_custom_enabled else "0"
+        os.environ["MAILBOX_PREFIX"] = (
+            str(self.cfg.get("mailbox_prefix") or "")
+            if mailbox_custom_enabled
+            else ""
+        )
+        os.environ["MAILBOX_RANDOM_LENGTH"] = str(
+            self._to_int(self.cfg.get("mailbox_random_len"), 0, 0, 32)
+            if mailbox_custom_enabled
+            else 0
+        )
         os.environ["MAIL_ALLOWED_DOMAINS"] = json.dumps(
             self._normalize_domain_list(self.cfg.get("mail_domain_allowlist") or []),
             ensure_ascii=False,
@@ -681,6 +1121,7 @@ class RegisterService:
             "REGISTER_POST_WAIT_SEC",
             "REGISTER_CONTINUE_WAIT_SEC",
             "REGISTER_WORKSPACE_WAIT_SEC",
+            "REGISTER_WORKSPACE_REFRESH_ROUNDS",
         ]
         if self.cfg.get("fast_mode"):
             os.environ["OTP_POLL_INTERVAL_SEC"] = "1"
@@ -692,7 +1133,8 @@ class RegisterService:
             os.environ["SENTINEL_RETRY_STEP_SEC"] = "0.45"
             os.environ["REGISTER_POST_WAIT_SEC"] = "0.4"
             os.environ["REGISTER_CONTINUE_WAIT_SEC"] = "0.3"
-            os.environ["REGISTER_WORKSPACE_WAIT_SEC"] = "0.2"
+            os.environ["REGISTER_WORKSPACE_WAIT_SEC"] = "0.6"
+            os.environ["REGISTER_WORKSPACE_REFRESH_ROUNDS"] = "4"
         else:
             for key in speed_env_keys:
                 os.environ.pop(key, None)
@@ -779,10 +1221,272 @@ class RegisterService:
             return data
         return {}
 
+    @staticmethod
+    def _parse_cf_trace(text: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for raw in str(text or "").splitlines():
+            line = raw.strip()
+            if not line or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            key = str(k or "").strip().lower()
+            if not key:
+                continue
+            out[key] = str(v or "").strip()
+        return out
+
+    def probe_flclash_nodes(
+        self,
+        *,
+        rounds: Any = 1,
+        per_round_limit: Any = 0,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if self._running:
+                raise RuntimeError("任务运行中，请先停止后再测试节点")
+
+        controller = self._normalize_flclash_controller(
+            str(self.cfg.get("flclash_controller") or "")
+        )
+        if not controller:
+            raise ValueError("请先填写 FlClash 控制器")
+
+        secret = str(self.cfg.get("flclash_secret") or "").strip()
+        preferred_group = str(self.cfg.get("flclash_group") or "PROXY").strip()
+        verify_ssl = bool(self.cfg.get("openai_ssl_verify", True))
+        proxy_arg = str(self.cfg.get("proxy") or "").strip() or None
+        switch_wait = self._to_float(self.cfg.get("flclash_switch_wait_sec"), 1.2, 0.0, 10.0)
+        rounds_num = self._to_int(rounds, 1, 1, 5)
+        per_round_limit_num = self._to_int(per_round_limit, 0, 0, 200)
+
+        data = self._flclash_request_json(
+            controller,
+            method="GET",
+            path="/proxies",
+            secret=secret,
+            timeout=20,
+        )
+        proxies = data.get("proxies") if isinstance(data, dict) else None
+        if not isinstance(proxies, dict):
+            raise RuntimeError("/proxies 返回格式异常")
+
+        def _proxy_type(obj: Any) -> str:
+            if isinstance(obj, dict):
+                return str(obj.get("type") or "").strip().lower()
+            return ""
+
+        preferred = [preferred_group, "节点选择", "PROXY", "GLOBAL"]
+        selector_candidates: list[tuple[str, dict[str, Any]]] = []
+        for key, val in proxies.items():
+            if not isinstance(val, dict):
+                continue
+            all_nodes = val.get("all")
+            if not isinstance(all_nodes, list) or not all_nodes:
+                continue
+            if _proxy_type(val) in {"selector", "select"}:
+                selector_candidates.append((str(key), val))
+
+        group_key = ""
+        group_obj: dict[str, Any] | None = None
+        for name in preferred:
+            if not name:
+                continue
+            obj = proxies.get(name)
+            if (
+                isinstance(obj, dict)
+                and isinstance(obj.get("all"), list)
+                and obj.get("all")
+                and _proxy_type(obj) in {"selector", "select"}
+            ):
+                group_key = str(name)
+                group_obj = obj
+                break
+        if group_obj is None and selector_candidates:
+            group_key, group_obj = selector_candidates[0]
+        if group_obj is None:
+            raise RuntimeError("未找到可切换的 Selector 代理组，请在设置中指定节点组名")
+
+        raw_nodes = [str(x).strip() for x in (group_obj.get("all") or []) if str(x).strip()]
+        nodes: list[str] = []
+        blocked_hk: list[str] = []
+        strategy_skipped: list[str] = []
+        for node in raw_nodes:
+            low = node.lower()
+            if low in {"direct", "reject", "pass"}:
+                continue
+            if self._is_hk_node_name(node):
+                blocked_hk.append(node)
+                continue
+            node_obj = proxies.get(node)
+            node_type = _proxy_type(node_obj)
+            if node_type in {"urltest", "fallback", "loadbalance", "relay"}:
+                strategy_skipped.append(node)
+                continue
+            if node not in nodes:
+                nodes.append(node)
+
+        if not nodes:
+            if blocked_hk:
+                raise RuntimeError("可用节点均为香港节点，已按规则跳过")
+            if strategy_skipped:
+                raise RuntimeError("候选均为自动策略组(URLTest/Fallback)，请改用具体节点组")
+            raise RuntimeError("代理组没有可用节点")
+
+        current = str(group_obj.get("now") or "").strip()
+        group_path = urllib.parse.quote(group_key, safe="")
+
+        def _build_round_order(now_node: str) -> list[str]:
+            if not nodes:
+                return []
+            if now_node in nodes:
+                idx = nodes.index(now_node)
+                return [nodes[(idx + i + 1) % len(nodes)] for i in range(len(nodes))]
+            return list(nodes)
+
+        def _switch_to(node_name: str) -> str:
+            self._flclash_request_json(
+                controller,
+                method="PUT",
+                path=f"/proxies/{group_path}",
+                secret=secret,
+                payload={"name": node_name},
+                timeout=20,
+            )
+            verify = self._flclash_request_json(
+                controller,
+                method="GET",
+                path=f"/proxies/{group_path}",
+                secret=secret,
+                timeout=20,
+            )
+            now_name = str(verify.get("now") or "").strip()
+            return now_name or node_name
+
+        def _probe_cf_trace() -> dict[str, str]:
+            code, text = _http_get(
+                "https://cloudflare.com/cdn-cgi/trace",
+                {"Accept": "text/plain"},
+                verify_ssl=verify_ssl,
+                timeout=25,
+                proxy=proxy_arg,
+            )
+            if not (200 <= code < 300):
+                snippet = (text or "")[:220].replace("\n", " ")
+                raise RuntimeError(f"CF Trace HTTP {code}: {snippet}")
+            trace = self._parse_cf_trace(text)
+            if not trace.get("ip") and not trace.get("loc"):
+                raise RuntimeError("CF Trace 响应缺少 ip/loc")
+            return trace
+
+        planned_per_round = len(nodes)
+        if per_round_limit_num > 0:
+            planned_per_round = min(planned_per_round, per_round_limit_num)
+
+        items: list[dict[str, Any]] = []
+        ok = 0
+        fail = 0
+        seq = 0
+        current_now = current
+
+        self.log(
+            f"[FlClash 节点测试] 开始：group={group_key}，候选 {len(nodes)} 个，"
+            f"轮数 {rounds_num}，每轮 {planned_per_round} 个"
+        )
+        if blocked_hk:
+            self.log(
+                f"[FlClash 节点测试] 已跳过香港节点 {len(blocked_hk)} 个"
+            )
+
+        for round_idx in range(1, rounds_num + 1):
+            order = _build_round_order(current_now)
+            if per_round_limit_num > 0:
+                order = order[:per_round_limit_num]
+
+            for node_name in order:
+                seq += 1
+                row = {
+                    "key": f"{round_idx}-{seq}",
+                    "round": round_idx,
+                    "seq": seq,
+                    "node": node_name,
+                    "active": "",
+                    "ip": "",
+                    "loc": "",
+                    "colo": "",
+                    "warp": "",
+                    "success": False,
+                    "detail": "",
+                    "tested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+                try:
+                    active_name = _switch_to(node_name)
+                    row["active"] = active_name
+                    if switch_wait > 0:
+                        time.sleep(switch_wait)
+
+                    trace = _probe_cf_trace()
+                    row["ip"] = str(trace.get("ip") or "")
+                    row["loc"] = str(trace.get("loc") or "")
+                    row["colo"] = str(trace.get("colo") or "")
+                    row["warp"] = str(trace.get("warp") or "")
+                    if active_name and active_name != node_name:
+                        row["detail"] = f"请求切换 {node_name}，实际 {active_name}"
+                    else:
+                        row["detail"] = "测试成功"
+                    row["success"] = True
+                    ok += 1
+                    current_now = active_name or node_name
+                    self.log(
+                        f"[FlClash 节点测试] R{round_idx} #{seq} {node_name} -> "
+                        f"{row['loc'] or '-'} {row['ip'] or '-'}"
+                    )
+                except Exception as e:
+                    fail += 1
+                    row["detail"] = str(e)
+                    self.log(
+                        f"[FlClash 节点测试] R{round_idx} #{seq} {node_name} 失败: {e}"
+                    )
+
+                items.append(row)
+
+        restored = False
+        restore_error = ""
+        restore_target = current
+        if restore_target:
+            try:
+                restored_now = _switch_to(restore_target)
+                restored = True
+                self.log(f"[FlClash 节点测试] 已恢复原节点: {restored_now or restore_target}")
+            except Exception as e:
+                restore_error = str(e)
+                self.log(f"[FlClash 节点测试] 恢复原节点失败: {e}")
+
+        self.log(f"[FlClash 节点测试] 完成：成功 {ok}，失败 {fail}")
+
+        return {
+            "controller": controller,
+            "group": group_key,
+            "rounds": rounds_num,
+            "per_round_limit": per_round_limit_num,
+            "candidate_total": len(nodes),
+            "planned_per_round": planned_per_round,
+            "attempts": len(items),
+            "ok": ok,
+            "fail": fail,
+            "blocked_hk_count": len(blocked_hk),
+            "blocked_hk_sample": blocked_hk[:8],
+            "strategy_skipped_count": len(strategy_skipped),
+            "restored": restored,
+            "restore_target": restore_target,
+            "restore_error": restore_error,
+            "items": items,
+        }
+
     def _mail_proxy(self) -> dict[str, str] | None:
         return _mail_mail_proxy(self)
 
-    def _mail_client_signature(self) -> tuple[str, str, str, str, bool]:
+    def _mail_client_signature(self) -> tuple[str, str, str, str, bool, str, str, str]:
         return _mail_mail_client_signature(self)
 
     def _get_mail_client(self):
@@ -811,6 +1515,15 @@ class RegisterService:
     def mail_overview(self, limit: Any = 120, offset: Any = 0) -> dict[str, Any]:
         return _mail_mail_overview(self, limit=limit, offset=offset)
 
+    def mail_graph_account_files(self) -> dict[str, Any]:
+        return _mail_mail_graph_account_files(self)
+
+    def mail_import_graph_account_file(self, filename: str, content: str) -> dict[str, Any]:
+        return _mail_mail_import_graph_account_file(self, filename, content)
+
+    def mail_delete_graph_account_file(self, filename: str) -> dict[str, Any]:
+        return _mail_mail_delete_graph_account_file(self, filename)
+
     def mail_generate_mailbox(self) -> dict[str, Any]:
         return _mail_mail_generate_mailbox(self)
 
@@ -835,12 +1548,277 @@ class RegisterService:
     def mail_delete_mailboxes(self, addresses: list[Any]) -> dict[str, Any]:
         return _mail_mail_delete_mailboxes(self, addresses)
 
+    def sms_overview(self, refresh: bool = False) -> dict[str, Any]:
+        with self._lock:
+            enabled = bool(self.cfg.get("hero_sms_enabled", False))
+            reuse_phone = bool(self.cfg.get("hero_sms_reuse_phone", False))
+            api_key = str(self.cfg.get("hero_sms_api_key") or "").strip()
+            service_code = str(self.cfg.get("hero_sms_service") or "").strip()
+            country = str(self.cfg.get("hero_sms_country") or "US").strip() or "US"
+            min_balance = self._to_float(self.cfg.get("hero_sms_max_price"), 2.0, 0.0, 200.0)
+            proxy = str(self.cfg.get("proxy") or "").strip() or ""
+
+        data: dict[str, Any] = {
+            "enabled": enabled,
+            "reuse_phone": reuse_phone,
+            "key_configured": bool(api_key),
+            "service": service_code,
+            "country": country,
+            "min_balance_usd": round(float(min_balance), 4),
+            "balance_usd": -1.0,
+            "balance_error": "",
+            "spent_usd": 0.0,
+            "updated_at": "",
+            "service_resolved": "",
+            "country_resolved": -1,
+        }
+
+        try:
+            import r_with_pwd  # type: ignore
+
+            stats_fn = getattr(r_with_pwd, "get_hero_sms_runtime_stats", None)
+            if callable(stats_fn):
+                stats = stats_fn() or {}
+                data["spent_usd"] = round(
+                    max(0.0, float(stats.get("spent_total_usd") or 0.0)),
+                    4,
+                )
+                bal_last = float(stats.get("balance_last_usd") or -1.0)
+                if bal_last >= 0:
+                    data["balance_usd"] = round(bal_last, 4)
+                ts = float(stats.get("updated_at") or 0.0)
+                if ts > 0:
+                    data["updated_at"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+            if refresh and enabled and api_key:
+                proxy_map = {"http": proxy, "https": proxy} if proxy else None
+                bal_fn = getattr(r_with_pwd, "hero_sms_get_balance", None)
+                if callable(bal_fn):
+                    bal, err = bal_fn(proxy_map)
+                    if float(bal) >= 0:
+                        data["balance_usd"] = round(float(bal), 4)
+                        data["balance_error"] = ""
+                    else:
+                        data["balance_error"] = str(err or "余额获取失败")[:220]
+
+                svc_fn = getattr(r_with_pwd, "_hero_sms_resolve_service_code", None)
+                ctry_fn = getattr(r_with_pwd, "_hero_sms_resolve_country_id", None)
+                if callable(svc_fn):
+                    try:
+                        data["service_resolved"] = str(svc_fn(proxy_map) or "").strip()
+                    except Exception:
+                        pass
+                if callable(ctry_fn):
+                    try:
+                        data["country_resolved"] = int(ctry_fn(proxy_map))
+                    except Exception:
+                        pass
+        except Exception as e:
+            data["balance_error"] = str(e)[:220]
+
+        return data
+
+    def sms_countries(self, refresh: bool = False) -> dict[str, Any]:
+        with self._lock:
+            enabled = bool(self.cfg.get("hero_sms_enabled", False))
+            api_key = str(self.cfg.get("hero_sms_api_key") or "").strip()
+            service_cfg = str(self.cfg.get("hero_sms_service") or "").strip()
+            country_cfg = str(self.cfg.get("hero_sms_country") or "US").strip() or "US"
+            proxy = str(self.cfg.get("proxy") or "").strip() or ""
+
+        out: dict[str, Any] = {
+            "enabled": enabled,
+            "key_configured": bool(api_key),
+            "service": service_cfg,
+            "service_resolved": "",
+            "country": country_cfg,
+            "country_resolved": -1,
+            "items": [],
+            "total": 0,
+            "filtered_out": 0,
+            "updated_at": "",
+            "error": "",
+        }
+
+        if not enabled:
+            out["error"] = "HeroSMS 未启用"
+            return out
+        if not api_key:
+            out["error"] = "HeroSMS API Key 未配置"
+            return out
+
+        try:
+            import r_with_pwd  # type: ignore
+
+            proxy_map = {"http": proxy, "https": proxy} if proxy else None
+            req_fn = getattr(r_with_pwd, "_hero_sms_request", None)
+            resolve_service_fn = getattr(r_with_pwd, "_hero_sms_resolve_service_code", None)
+            resolve_country_fn = getattr(r_with_pwd, "_hero_sms_resolve_country_id", None)
+            if not callable(req_fn):
+                out["error"] = "HeroSMS 请求函数不可用"
+                return out
+
+            service_resolved = ""
+            if callable(resolve_service_fn):
+                try:
+                    service_resolved = str(resolve_service_fn(proxy_map) or "").strip()
+                except Exception:
+                    service_resolved = str(service_cfg or "").strip()
+            if not service_resolved:
+                service_resolved = str(service_cfg or "").strip()
+            out["service_resolved"] = service_resolved
+
+            if callable(resolve_country_fn):
+                try:
+                    out["country_resolved"] = int(resolve_country_fn(proxy_map))
+                except Exception:
+                    pass
+
+            ok_c, text_c, countries_data = req_fn(
+                "getCountries",
+                proxies=proxy_map,
+                timeout=30,
+            )
+            if not ok_c:
+                out["error"] = str(text_c or "getCountries failed")[:220]
+                return out
+            countries_rows = [x for x in (countries_data or []) if isinstance(x, dict)]
+
+            prices_map: dict[str, dict[str, Any]] = {}
+            params: dict[str, Any] = {}
+            if service_resolved:
+                params["service"] = service_resolved
+            ok_p, text_p, prices_data = req_fn(
+                "getPrices",
+                proxies=proxy_map,
+                params=params,
+                timeout=30,
+            )
+            if ok_p and isinstance(prices_data, dict):
+                for country_id, raw_entry in prices_data.items():
+                    key = str(country_id or "").strip()
+                    if not key:
+                        continue
+                    entry = raw_entry
+                    if not isinstance(entry, dict):
+                        continue
+
+                    price_row: dict[str, Any] | None = None
+                    if service_resolved and isinstance(entry.get(service_resolved), dict):
+                        price_row = entry.get(service_resolved)
+                    elif "cost" in entry or "count" in entry or "physicalCount" in entry:
+                        price_row = entry
+                    else:
+                        for v in entry.values():
+                            if isinstance(v, dict) and (
+                                "cost" in v or "count" in v or "physicalCount" in v
+                            ):
+                                price_row = v
+                                break
+
+                    if not isinstance(price_row, dict):
+                        continue
+                    try:
+                        cost = float(price_row.get("cost") or -1)
+                    except Exception:
+                        cost = -1.0
+                    try:
+                        count = int(price_row.get("count") or 0)
+                    except Exception:
+                        count = 0
+                    try:
+                        physical_count = int(price_row.get("physicalCount") or 0)
+                    except Exception:
+                        physical_count = 0
+                    prices_map[key] = {
+                        "cost": cost,
+                        "count": max(0, count),
+                        "physical_count": max(0, physical_count),
+                    }
+            elif refresh:
+                out["error"] = str(text_p or "getPrices failed")[:220]
+
+            items: list[dict[str, Any]] = []
+            filtered_out = 0
+            for row in countries_rows:
+                try:
+                    cid = int(row.get("id"))
+                except Exception:
+                    continue
+                cid_s = str(cid)
+                eng = str(row.get("eng") or "").strip() or cid_s
+                chn = str(row.get("chn") or "").strip()
+                if not _is_openai_sms_country_allowed(cid, eng):
+                    filtered_out += 1
+                    continue
+                try:
+                    visible = int(row.get("visible") or 0)
+                except Exception:
+                    visible = 0
+                price_info = prices_map.get(cid_s, {})
+                cost = float(price_info.get("cost") or -1.0)
+                count = int(price_info.get("count") or 0)
+                physical_count = int(price_info.get("physical_count") or 0)
+
+                zh_name = _country_name_zh(eng, chn)
+                title = zh_name if zh_name == eng else f"{zh_name} ({eng})"
+                if cost >= 0:
+                    label = f"{title} [{cid_s}] | ${cost:.3f} | 库存 {count}"
+                else:
+                    label = f"{title} [{cid_s}] | 无报价 | 库存 {count}"
+
+                items.append(
+                    {
+                        "id": cid_s,
+                        "eng": eng,
+                        "chn": zh_name,
+                        "visible": visible,
+                        "cost": cost,
+                        "count": count,
+                        "physical_count": physical_count,
+                        "label": label,
+                    }
+                )
+
+            def _sort_key(x: dict[str, Any]) -> tuple[Any, ...]:
+                c = int(x.get("count") or 0)
+                v = int(x.get("visible") or 0)
+                cost_v = float(x.get("cost") or -1.0)
+                has_price = 0 if cost_v >= 0 else 1
+                return (
+                    0 if c > 0 else 1,
+                    0 if v > 0 else 1,
+                    has_price,
+                    cost_v if cost_v >= 0 else 999999.0,
+                    -c,
+                    str(x.get("eng") or x.get("id") or ""),
+                )
+
+            items.sort(key=_sort_key)
+            out["items"] = items
+            out["total"] = len(items)
+            out["filtered_out"] = int(filtered_out)
+            out["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return out
+        except Exception as e:
+            out["error"] = str(e)[:220]
+            return out
+
     def start(self, run_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             if self._running:
                 raise RuntimeError("任务正在运行中")
         if run_cfg:
             self.update_config(run_cfg, emit_log=False)
+
+        with self._lock:
+            blockers, _ = self._config_health_locked()
+        if blockers:
+            preview = "；".join(blockers[:3])
+            if len(blockers) > 3:
+                preview += f"；另有 {len(blockers) - 3} 项"
+            raise RuntimeError(f"配置未完成，无法启动：{preview}")
+
         self._apply_to_env()
         self._stop.clear()
         self._set_running(True)
@@ -875,6 +1853,7 @@ class RegisterService:
             if domain and not domain.startswith("http"):
                 domain = f"https://{domain}"
             mail_provider = normalize_mail_provider(self.cfg.get("mail_service_provider") or "mailfree")
+            r_with_pwd.STOP_EVENT = self._stop
             r_with_pwd.WORKER_DOMAIN = domain.rstrip("/")
             r_with_pwd.FREEMAIL_USERNAME = str(self.cfg.get("freemail_username") or "")
             r_with_pwd.FREEMAIL_PASSWORD = str(self.cfg.get("freemail_password") or "")
@@ -883,22 +1862,78 @@ class RegisterService:
                 self.cfg.get("mail_domain_allowlist") or []
             )
             r_with_pwd._freemail_session_cookie_reset()
+            try:
+                reset_sms_stats = getattr(r_with_pwd, "reset_hero_sms_runtime_stats", None)
+                if callable(reset_sms_stats):
+                    reset_sms_stats()
+            except Exception:
+                pass
 
             fp = str(self.cfg.get("freemail_password") or "")
             fp_mask = (fp[:3] + "***") if len(fp) >= 3 else ("***" if fp else "")
             random_domain_on = bool(self.cfg.get("mailfree_random_domain", True))
             allow_domains = list(r_with_pwd.MAIL_ALLOWED_DOMAINS or [])
-            self.log(
-                f"配置 -> mail={mail_provider}, domain={r_with_pwd.WORKER_DOMAIN}, "
-                f"user={r_with_pwd.FREEMAIL_USERNAME}, pass={fp_mask}, "
-                f"random_domain={'开启' if random_domain_on else '关闭'}"
-            )
-            if allow_domains:
-                self.log(f"配置 -> 指定注册域名 {len(allow_domains)} 个")
+            if mail_provider == "mailfree":
+                self.log(
+                    f"配置 -> mail={mail_provider}, domain={r_with_pwd.WORKER_DOMAIN}, "
+                    f"user={r_with_pwd.FREEMAIL_USERNAME}, pass={fp_mask}, "
+                    f"random_domain={'开启' if random_domain_on else '关闭'}"
+                )
+                if allow_domains:
+                    self.log(f"配置 -> 指定注册域名 {len(allow_domains)} 个")
+            else:
+                graph_file = str(self.cfg.get("graph_accounts_file") or "graph_accounts.txt").strip()
+                graph_tenant = str(self.cfg.get("graph_tenant") or "common").strip()
+                graph_pre_refresh = bool(self.cfg.get("graph_pre_refresh_before_run", True))
+                hero_sms_enabled = bool(self.cfg.get("hero_sms_enabled", False))
+                hero_sms_reuse = bool(self.cfg.get("hero_sms_reuse_phone", False))
+                hero_sms_service = str(self.cfg.get("hero_sms_service") or "").strip() or "(auto)"
+                hero_sms_country = str(self.cfg.get("hero_sms_country") or "US").strip() or "US"
+                hero_sms_auto_ctry = bool(self.cfg.get("hero_sms_auto_pick_country", False))
+                hero_sms_price = self._to_float(
+                    self.cfg.get("hero_sms_max_price"),
+                    2.0,
+                    0.0,
+                    200.0,
+                )
+                self.log(
+                    "配置 -> "
+                    f"mail={mail_provider}, graph_file={graph_file}, tenant={graph_tenant}, "
+                    f"pre_refresh={'开启' if graph_pre_refresh else '关闭'}"
+                )
+                self.log(
+                    "配置 -> "
+                    f"hero_sms={'开启' if hero_sms_enabled else '关闭'}, "
+                    f"service={hero_sms_service}, country={hero_sms_country}, "
+                    f"auto_country={'开' if hero_sms_auto_ctry else '关'}, "
+                    f"min_balance=${hero_sms_price:.2f}, "
+                    f"reuse_phone={'开启' if hero_sms_reuse else '关闭'}"
+                )
+                if hero_sms_enabled and not str(self.cfg.get("hero_sms_api_key") or "").strip():
+                    self.log("[提示] HeroSMS 已启用但 API Key 为空，add-phone 手机验证将无法执行")
+                if hero_sms_enabled and str(self.cfg.get("hero_sms_api_key") or "").strip():
+                    try:
+                        sms_data = self.sms_overview(refresh=True)
+                        bal_now = float(sms_data.get("balance_usd") or -1.0)
+                        min_now = float(sms_data.get("min_balance_usd") or hero_sms_price)
+                        if bal_now >= 0:
+                            self.log(
+                                f"HeroSMS 余额检查：当前 ${bal_now:.2f} · 下限 ${min_now:.2f}"
+                            )
+                        if bal_now >= 0 and bal_now < min_now:
+                            self.log(
+                                "HeroSMS 余额低于下限，停止注册："
+                                f"当前 ${bal_now:.2f} < 下限 ${min_now:.2f}"
+                            )
+                            self._stop.set()
+                            return
+                    except Exception as e:
+                        self.log(f"HeroSMS 余额预检查失败: {e}")
 
             per_file_num = self._to_int(self.cfg.get("num_accounts"), 1, 1)
             num_files = self._to_int(self.cfg.get("num_files"), 1, 1, 200)
             concurrency = self._to_int(self.cfg.get("concurrency"), 1, 1, 6)
+            random_fp_on = bool(self.cfg.get("register_random_fingerprint", True))
             smin = self._to_int(self.cfg.get("sleep_min"), 5, 1)
             smax = self._to_int(self.cfg.get("sleep_max"), 30, smin)
             if smax < smin:
@@ -909,6 +1944,112 @@ class RegisterService:
                 retry_403_wait = min(retry_403_wait, 6)
             proxy = str(self.cfg.get("proxy") or "").strip() or None
             outdir = os.getenv("TOKEN_OUTPUT_DIR", "").strip()
+            graph_pre_refresh_before_run = bool(
+                self.cfg.get("graph_pre_refresh_before_run", True)
+            )
+
+            if concurrency > 1 and not random_fp_on:
+                self.log(
+                    "[提示] 当前为多并发 + 固定浏览器指纹，可能提高 invalid_auth_step/400 概率；"
+                    "建议开启随机指纹或降低并发"
+                )
+            if mail_provider == "graph" and not graph_pre_refresh_before_run:
+                self.log(
+                    "[提示] 已关闭 Graph 注册前 token 预刷新：启动更快，但会更早命中坏号"
+                )
+
+            if mail_provider == "graph":
+                with self._lock:
+                    self._mail_client = None
+                    self._mail_client_sig = None
+                if graph_pre_refresh_before_run:
+                    proxy_map = {"http": proxy, "https": proxy} if proxy else None
+                    client = self._get_mail_client()
+                    refresh_fn = getattr(client, "refresh_mailbox_token", None)
+                    remove_fn = getattr(client, "remove_account", None)
+                    if not callable(refresh_fn):
+                        raise RuntimeError("当前邮箱服务不支持刷新 Microsoft 邮箱 token")
+
+                    account_rows = list(getattr(client, "_accounts", []) or [])
+                    account_emails: list[str] = []
+                    for acc in account_rows:
+                        email = str((acc or {}).get("email") or "").strip().lower()
+                        if email and "@" in email:
+                            account_emails.append(email)
+                    account_emails = list(dict.fromkeys(account_emails))
+
+                    if not account_emails:
+                        self.log("Microsoft 邮箱账号池为空，停止注册")
+                        self._stop.set()
+                        return
+
+                    self.log(f"[Microsoft 邮箱] 注册前 token 预刷新开始：共 {len(account_emails)} 个账号")
+                    pre_ok = 0
+                    pre_fail = 0
+                    for idx, email in enumerate(account_emails, start=1):
+                        if self._stop.is_set():
+                            break
+                        try:
+                            refresh_fn(email, proxies=proxy_map)
+                            pre_ok += 1
+                        except Exception as e:
+                            pre_fail += 1
+                            self.log(
+                                f"[Microsoft 邮箱] token 预刷新失败 {idx}/{len(account_emails)}: {email} -> {e}"
+                            )
+                            if callable(remove_fn):
+                                try:
+                                    removed = bool(remove_fn(email))
+                                except Exception:
+                                    removed = False
+                                if removed:
+                                    self.log(f"[Microsoft 邮箱] 已移除失效账号: {email}")
+
+                    remain_accounts = [
+                        str((acc or {}).get("email") or "").strip().lower()
+                        for acc in (getattr(client, "_accounts", []) or [])
+                        if str((acc or {}).get("email") or "").strip()
+                    ]
+                    remain_count = len([x for x in remain_accounts if "@" in x])
+                    self.log(
+                        f"[Microsoft 邮箱] token 预刷新结束：成功 {pre_ok}，失败 {pre_fail}，剩余可用 {remain_count}"
+                    )
+                    if remain_count <= 0:
+                        self.log("Microsoft 邮箱账号已耗尽，停止注册")
+                        self._stop.set()
+                        return
+                else:
+                    self.log("[Microsoft 邮箱] 已关闭注册前 token 预刷新")
+
+            graph_accounts_file = str(
+                self.cfg.get("graph_accounts_file") or "graph_accounts.txt"
+            ).strip() or "graph_accounts.txt"
+            graph_accounts_path = os.path.abspath(os.path.expanduser(graph_accounts_file))
+
+            def _graph_remaining_account_count() -> int:
+                if mail_provider != "graph":
+                    return -1
+                fp = str(graph_accounts_path or "").strip()
+                if not fp or not os.path.isfile(fp):
+                    return 0
+                count = 0
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        for raw in f:
+                            line = str(raw or "").strip().lstrip("\ufeff")
+                            if not line or line.startswith("#"):
+                                continue
+                            parts = line.split("----", 3)
+                            if len(parts) < 4:
+                                continue
+                            email = str(parts[0] or "").strip().lower()
+                            client_id = str(parts[2] or "").strip()
+                            token = str(parts[3] or "").strip()
+                            if email and "@" in email and client_id and token:
+                                count += 1
+                except Exception:
+                    return 0
+                return count
 
             flclash_enable = bool(self.cfg.get("flclash_enable_switch", False))
             flclash_controller = self._normalize_flclash_controller(
@@ -944,6 +2085,12 @@ class RegisterService:
 
             total_target = per_file_num * num_files
             self._reset_run_stats(planned_total=total_target)
+            if mail_provider == "graph" and bool(self.cfg.get("hero_sms_enabled", False)):
+                with self._lock:
+                    self._run_stats["sms_min_balance_usd"] = round(
+                        self._to_float(self.cfg.get("hero_sms_max_price"), 2.0, 0.0, 200.0),
+                        4,
+                    )
             worker_count = min(concurrency, per_file_num)
             if flclash_enable and worker_count > 1:
                 self.log(
@@ -1129,7 +2276,8 @@ class RegisterService:
                         self.log(
                             f"[{tag}] 节点 {node_name} 延迟测试失败，{wait}s 后重试 ({i + 1}/{retry})"
                         )
-                        time.sleep(wait)
+                        if self._wait_or_stop(wait):
+                            return False, -1, "用户停止"
 
                 return False, -1, last_msg or "延迟测试失败"
 
@@ -1213,7 +2361,8 @@ class RegisterService:
                         return False
 
                 if wait_sec > 0:
-                    time.sleep(wait_sec)
+                    if self._wait_or_stop(wait_sec):
+                        return False
                 return True
 
             if flclash_enable:
@@ -1289,8 +2438,10 @@ class RegisterService:
                         return True
 
                     with flc_batch_lock:
-                        while flc_switching:
-                            flc_batch_lock.wait()
+                        while flc_switching and not self._stop.is_set():
+                            flc_batch_lock.wait(timeout=0.2)
+                        if self._stop.is_set():
+                            return False
                         if flc_active_runs == 0:
                             flc_switching = True
                         else:
@@ -1346,11 +2497,15 @@ class RegisterService:
                                     return
 
                             try:
-                                idx = task_queue.get(timeout=0.6)
+                                idx = task_queue.get(timeout=0.1)
                             except Empty:
                                 if _can_exit():
                                     return
                                 continue
+
+                            if self._stop.is_set():
+                                task_queue.task_done()
+                                return
 
                             phase = (
                                 f"{idx}/{file_target}"
@@ -1372,9 +2527,16 @@ class RegisterService:
                             run_begin = time.time()
 
                             try:
+                                if self._stop.is_set():
+                                    continue
+
                                 if flclash_state["enabled"]:
                                     flc_acquired = _flclash_acquire_for_batch(f"F{file_no}W{worker_no}")
                                     if not flc_acquired:
+                                        if self._stop.is_set():
+                                            need_retry = False
+                                            retry_reason = ""
+                                            continue
                                         self.log(
                                             f"[F{file_no}W{worker_no}] 节点切换/延迟测试失败，跳过本次并补位重试"
                                         )
@@ -1390,6 +2552,7 @@ class RegisterService:
                                     acct = result[0]
                                     pwd = result[1] if len(result) > 1 else ""
                                     meta = result[2] if len(result) > 2 and isinstance(result[2], dict) else {}
+                                    self._record_run_sms_stats_from_meta(meta)
 
                                     err_code = str(meta.get("error_code") or "").strip().lower()
                                     err_domain = str(meta.get("email_domain") or "").strip().lower()
@@ -1399,17 +2562,43 @@ class RegisterService:
                                         self.log(
                                             f"[F{file_no}W{worker_no}] 域名风控计数: {err_domain} -> {now}"
                                         )
+                                    if err_code == "graph_pool_exhausted":
+                                        self.log(
+                                            f"[F{file_no}W{worker_no}] Graph 账号池已耗尽，立即停止本轮注册"
+                                        )
+                                        self._stop.set()
+                                        need_retry = False
+                                        retry_reason = ""
+                                        continue
+                                    if err_code == "stopped_by_user":
+                                        need_retry = False
+                                        retry_reason = ""
+                                        continue
+                                    if err_code == "phone_balance_insufficient":
+                                        self.log(
+                                            f"[F{file_no}W{worker_no}] HeroSMS 余额低于下限，立即停止本轮注册"
+                                        )
+                                        self._stop.set()
+                                        need_retry = False
+                                        retry_reason = ""
+                                        continue
+                                    if err_code == "phone_country_blocked":
+                                        self.log(
+                                            f"[F{file_no}W{worker_no}] HeroSMS 国家受限，立即停止本轮注册"
+                                        )
+                                        self._stop.set()
+                                        need_retry = False
+                                        retry_reason = ""
+                                        continue
 
                                     if acct == "retry_403":
                                         self.log(
                                             f"[F{file_no}W{worker_no}] 403，{retry_403_wait} 秒后继续..."
                                         )
-                                        for _ in range(retry_403_wait):
-                                            if self._stop.is_set():
-                                                break
-                                            time.sleep(1)
-                                        need_retry = True
-                                        retry_reason = "HTTP 403 限流"
+                                        stopped = self._wait_or_stop(float(retry_403_wait))
+                                        if not stopped:
+                                            need_retry = True
+                                            retry_reason = "HTTP 403 限流"
                                     elif acct and isinstance(acct, dict):
                                         email = str(acct.get("name") or "")
                                         written = False
@@ -1453,6 +2642,14 @@ class RegisterService:
                                             self.log(
                                                 f"[F{file_no}W{worker_no}] 成功 ({ok_now}/{file_target}): {email}"
                                             )
+                                            if mail_provider == "graph":
+                                                remain_now = _graph_remaining_account_count()
+                                                if remain_now <= 0 and ok_now < file_target:
+                                                    self.log(
+                                                        f"[F{file_no}W{worker_no}] "
+                                                        "Microsoft 邮箱账号已耗尽，立即停止本轮注册"
+                                                    )
+                                                    self._stop.set()
                                         else:
                                             self.log(
                                                 f"[F{file_no}W{worker_no}] 已达目标，忽略额外成功: {email}"
@@ -1513,10 +2710,7 @@ class RegisterService:
                             w = random.randint(smin, smax)
                             if w > 0:
                                 self.log(f"[F{file_no}W{worker_no}] 冷却 {w} 秒...")
-                                for _ in range(w):
-                                    if self._stop.is_set():
-                                        break
-                                    time.sleep(1)
+                                self._wait_or_stop(float(w))
                     finally:
                         self._log_ctx.prefix = ""
 
@@ -1585,7 +2779,16 @@ class RegisterService:
                 self._refresh_run_elapsed_locked()
                 elapsed_sec = float(self._run_stats.get("elapsed_sec") or 0.0)
                 avg_sec = float(self._run_stats.get("avg_success_sec") or 0.0)
+                sms_spent = float(self._run_stats.get("sms_spent_usd") or 0.0)
+                sms_balance = float(self._run_stats.get("sms_balance_usd") or -1.0)
+                sms_min = float(self._run_stats.get("sms_min_balance_usd") or 0.0)
             self.log(f"耗时统计：总耗时 {elapsed_sec:.2f}s · 平均耗时 {avg_sec:.2f}s/成功")
+            if sms_spent > 0 or sms_balance >= 0:
+                bal_text = f"${sms_balance:.2f}" if sms_balance >= 0 else "-"
+                self.log(
+                    "SMS统计："
+                    f"累计消耗 ${sms_spent:.2f} · 当前余额 {bal_text} · 余额下限 ${sms_min:.2f}"
+                )
 
             if self._stop.is_set() and global_ok < total_target:
                 tag = (
@@ -1606,6 +2809,11 @@ class RegisterService:
         except Exception as e:
             self.log(f"运行异常: {e}")
         finally:
+            try:
+                if "r_with_pwd" in locals():
+                    setattr(r_with_pwd, "STOP_EVENT", None)
+            except Exception:
+                pass
             self._mark_run_finished()
             cap.flush()
             sys.stdout = old_out
@@ -1649,6 +2857,9 @@ class RegisterService:
 
     def sync_selected_accounts(self, emails: list[str]) -> dict[str, Any]:
         return _data_sync_selected_accounts(self, emails)
+
+    def export_codex_accounts(self, emails: list[str]) -> dict[str, Any]:
+        return _data_export_codex_accounts(self, emails)
 
     @staticmethod
     def _remote_item_groups_label(it: dict[str, Any]) -> str:
@@ -2150,6 +3361,187 @@ class RegisterService:
             "total": len(ordered_ids),
             "deleted": sorted(deleted_ids),
             "results": results,
+        }
+
+    def remote_list_groups(self) -> dict[str, Any]:
+        """获取管理端分组列表。"""
+        tok = str(self.cfg.get("accounts_sync_bearer_token") or "").strip()
+        base = str(self.cfg.get("accounts_list_api_base") or "").strip()
+        tz = str(
+            self.cfg.get(
+                "accounts_list_timezone",
+                DEFAULT_CONFIG["accounts_list_timezone"],
+            )
+            or "Asia/Shanghai"
+        ).strip() or "Asia/Shanghai"
+        if not tok:
+            raise ValueError("请先填写 Bearer Token")
+        if not base:
+            raise ValueError("请先填写账号列表 API")
+
+        verify_ssl = bool(self.cfg.get("openai_ssl_verify", True))
+        proxy_arg = str(self.cfg.get("proxy") or "").strip() or None
+        auth = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
+
+        list_base = base.rstrip("/")
+        if list_base.endswith("/accounts"):
+            admin_base = list_base[: -len("/accounts")]
+        elif "/accounts/" in list_base:
+            admin_base = list_base.split("/accounts/", 1)[0]
+        elif "/accounts" in list_base:
+            admin_base = list_base.rsplit("/accounts", 1)[0]
+        else:
+            raise ValueError("账号列表 API 地址格式不正确，需包含 /accounts 路径")
+
+        qs = urllib.parse.urlencode(
+            {
+                "page": "1",
+                "page_size": "100",
+                "status": "",
+                "timezone": tz,
+            }
+        )
+        url = f"{admin_base.rstrip('/')}/groups?{qs}"
+        code, text = _http_get(
+            url,
+            {
+                "Accept": "application/json",
+                "Authorization": auth,
+            },
+            verify_ssl=verify_ssl,
+            timeout=60,
+            proxy=proxy_arg,
+        )
+        if not (200 <= code < 300):
+            raise RuntimeError(f"获取分组失败 HTTP {code}: {(text or '')[:300]}")
+        try:
+            j = json.loads(text)
+        except Exception as e:
+            raise RuntimeError(f"获取分组失败：响应解析异常 {e}") from e
+        if isinstance(j, dict) and ("code" in j):
+            try:
+                code_val = int(j.get("code") or 0)
+            except Exception:
+                code_val = -1
+            if code_val != 0:
+                raise RuntimeError(str(j.get("message") or "获取分组失败"))
+        elif isinstance(j, dict) and ("success" in j):
+            if not bool(j.get("success")):
+                raise RuntimeError(str(j.get("message") or "获取分组失败"))
+        data = j.get("data") if isinstance(j, dict) else {}
+        items = data.get("items") if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            items = []
+
+        out: list[dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            gid = it.get("id")
+            try:
+                gid_int = int(gid)
+            except Exception:
+                continue
+            name = str(it.get("name") or f"分组#{gid_int}").strip() or f"分组#{gid_int}"
+            out.append(
+                {
+                    "id": gid_int,
+                    "name": name,
+                    "status": str(it.get("status") or ""),
+                }
+            )
+        return {"items": out, "total": len(out)}
+
+    def remote_bulk_update_groups(self, account_ids: list[Any], group_ids: list[Any]) -> dict[str, Any]:
+        """批量给服务端账号分配分组。"""
+        ordered_account_ids: list[int] = []
+        seen_accounts: set[int] = set()
+        for raw in account_ids:
+            try:
+                aid = int(str(raw).strip())
+            except Exception:
+                continue
+            if aid <= 0 or aid in seen_accounts:
+                continue
+            seen_accounts.add(aid)
+            ordered_account_ids.append(aid)
+        if not ordered_account_ids:
+            raise ValueError("请先选择要操作的账号")
+
+        ordered_group_ids: list[int] = []
+        seen_groups: set[int] = set()
+        for raw in group_ids:
+            try:
+                gid = int(str(raw).strip())
+            except Exception:
+                continue
+            if gid <= 0 or gid in seen_groups:
+                continue
+            seen_groups.add(gid)
+            ordered_group_ids.append(gid)
+        if not ordered_group_ids:
+            raise ValueError("请先选择至少一个分组")
+
+        tok = str(self.cfg.get("accounts_sync_bearer_token") or "").strip()
+        base = str(self.cfg.get("accounts_list_api_base") or "").strip()
+        if not tok:
+            raise ValueError("请先填写 Bearer Token")
+        if not base:
+            raise ValueError("请先填写账号列表 API")
+
+        verify_ssl = bool(self.cfg.get("openai_ssl_verify", True))
+        proxy_arg = str(self.cfg.get("proxy") or "").strip() or None
+        auth = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
+
+        list_base = base.rstrip("/")
+        if list_base.endswith("/accounts"):
+            admin_base = list_base[: -len("/accounts")]
+        elif "/accounts/" in list_base:
+            admin_base = list_base.split("/accounts/", 1)[0]
+        elif "/accounts" in list_base:
+            admin_base = list_base.rsplit("/accounts", 1)[0]
+        else:
+            raise ValueError("账号列表 API 地址格式不正确，需包含 /accounts 路径")
+
+        url = f"{admin_base.rstrip('/')}/accounts/bulk-update"
+        body_obj = {
+            "account_ids": ordered_account_ids,
+            "group_ids": ordered_group_ids,
+        }
+        body = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+        code, text = _http_post_json(
+            url,
+            body,
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": auth,
+            },
+            verify_ssl=verify_ssl,
+            timeout=90,
+            proxy=proxy_arg,
+        )
+        if not (200 <= code < 300):
+            raise RuntimeError(f"批量分配分组失败 HTTP {code}: {(text or '')[:300]}")
+        try:
+            j = json.loads(text) if (text or "").strip() else {}
+        except Exception as e:
+            raise RuntimeError(f"批量分配分组失败：响应解析异常 {e}") from e
+        if isinstance(j, dict) and ("code" in j):
+            try:
+                code_val = int(j.get("code") or 0)
+            except Exception:
+                code_val = -1
+            if code_val != 0:
+                raise RuntimeError(str(j.get("message") or "批量分配分组失败"))
+        elif isinstance(j, dict) and ("success" in j):
+            if not bool(j.get("success")):
+                raise RuntimeError(str(j.get("message") or "批量分配分组失败"))
+        return {
+            "ok": len(ordered_account_ids),
+            "account_ids": ordered_account_ids,
+            "group_ids": ordered_group_ids,
+            "raw": j,
         }
 
 __all__ = ["StdoutCapture", "RegisterService"]

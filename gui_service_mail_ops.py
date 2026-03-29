@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -21,17 +22,23 @@ def mail_proxy(service) -> dict[str, str] | None:
     return {"http": raw, "https": raw}
 
 
-def mail_client_signature(service) -> tuple[str, str, str, str, bool]:
+def mail_client_signature(service) -> tuple[str, str, str, str, bool, str, str, str]:
     provider = normalize_mail_provider(service.cfg.get("mail_service_provider") or "mailfree")
     domain = str(service.cfg.get("worker_domain") or "").strip()
     if domain and not domain.startswith("http"):
         domain = f"https://{domain}"
+    graph_accounts_file = str(service.cfg.get("graph_accounts_file") or "").strip()
+    graph_tenant = str(service.cfg.get("graph_tenant") or "common").strip()
+    graph_fetch_mode = str(service.cfg.get("graph_fetch_mode") or "graph_api").strip()
     return (
         provider,
         domain.rstrip("/"),
         str(service.cfg.get("freemail_username") or "").strip(),
         str(service.cfg.get("freemail_password") or ""),
         bool(service.cfg.get("openai_ssl_verify", True)),
+        graph_accounts_file,
+        graph_tenant,
+        graph_fetch_mode,
     )
 
 
@@ -43,7 +50,10 @@ def get_mail_client(service):
     if cached is not None and cached_sig == sig:
         return cached
 
-    provider, base_url, username, password, verify_ssl = sig
+    provider, base_url, username, password, verify_ssl, graph_accounts_file, graph_tenant, graph_fetch_mode = sig
+    os.environ["GRAPH_ACCOUNTS_FILE"] = graph_accounts_file
+    os.environ["GRAPH_TENANT"] = graph_tenant
+    os.environ["GRAPH_FETCH_MODE"] = graph_fetch_mode
     try:
         client = build_mail_service(
             provider,
@@ -136,6 +146,95 @@ def mail_providers(service) -> dict[str, Any]:
     }
 
 
+def mail_graph_account_files(service) -> dict[str, Any]:
+    current = str(service.cfg.get("graph_accounts_file") or "").strip()
+    items = [{"label": current, "value": current}] if current else []
+    return {"items": items, "current": current}
+
+
+def mail_import_graph_account_file(service, filename: str, content: str) -> dict[str, Any]:
+    name = os.path.basename(str(filename or "").strip())
+    if not name:
+        raise ValueError("请选择 txt 文件")
+    if not name.lower().endswith(".txt"):
+        raise ValueError("仅支持 .txt 文件")
+    if len(name) > 128:
+        raise ValueError("文件名过长")
+
+    raw = str(content or "")
+    lines = [str(x).strip() for x in raw.replace("\r\n", "\n").split("\n")]
+    valid_rows: list[str] = []
+    for idx, line in enumerate(lines, start=1):
+        if not line or line.startswith("#"):
+            continue
+        line = line.lstrip("\ufeff")
+        parts = line.split("----", 3)
+        if len(parts) < 4:
+            raise ValueError(f"第 {idx} 行格式错误：必须是 邮箱----密码----client_id----令牌")
+        email = str(parts[0] or "").strip().lstrip("\ufeff").lower()
+        password = str(parts[1] or "").strip()
+        client_id = str(parts[2] or "").strip()
+        token = str(parts[3] or "").strip()
+        if not email or "@" not in email:
+            raise ValueError(f"第 {idx} 行邮箱无效")
+        if not password:
+            raise ValueError(f"第 {idx} 行密码不能为空")
+        if not client_id:
+            raise ValueError(f"第 {idx} 行 client_id 不能为空")
+        if not token:
+            raise ValueError(f"第 {idx} 行令牌不能为空")
+        valid_rows.append(f"{email}----{password}----{client_id}----{token}")
+
+    if not valid_rows:
+        raise ValueError("文件没有可用账号行")
+
+    target_path = os.path.abspath(name)
+    try:
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(valid_rows) + "\n")
+    except Exception as e:
+        raise RuntimeError(f"保存文件失败: {e}") from e
+
+    with service._lock:
+        service.cfg["graph_accounts_file"] = name
+        service._mail_client = None
+        service._mail_client_sig = None
+        save_config(service.cfg)
+
+    return {
+        "filename": name,
+        "path": target_path,
+        "count": len(valid_rows),
+    }
+
+
+def mail_delete_graph_account_file(service, filename: str) -> dict[str, Any]:
+    name = os.path.basename(str(filename or "").strip())
+    if not name:
+        raise ValueError("请先选择要删除的 Graph 账号文件")
+    if not name.lower().endswith(".txt"):
+        raise ValueError("仅支持删除 .txt 文件")
+
+    target_path = os.path.abspath(name)
+    if not os.path.isfile(target_path):
+        raise ValueError("文件不存在")
+
+    try:
+        os.remove(target_path)
+    except Exception as e:
+        raise RuntimeError(f"删除文件失败: {e}") from e
+
+    with service._lock:
+        current = str(service.cfg.get("graph_accounts_file") or "").strip()
+        if current == name:
+            service.cfg["graph_accounts_file"] = ""
+            service._mail_client = None
+            service._mail_client_sig = None
+            save_config(service.cfg)
+
+    return {"filename": name, "deleted": True}
+
+
 def mail_overview(service, limit: Any = 120, offset: Any = 0) -> dict[str, Any]:
     lim = service._to_int(limit, 120, 1, 500)
     off = service._to_int(offset, 0, 0, 100000)
@@ -146,12 +245,23 @@ def mail_overview(service, limit: Any = 120, offset: Any = 0) -> dict[str, Any]:
     registered_counts = service._normalize_domain_registered_counts(
         service.cfg.get("mail_domain_registered_counts") or {}
     )
-    client = get_mail_client(service)
     proxy = mail_proxy(service)
 
     try:
+        client = get_mail_client(service)
         domains = client.list_domains(proxies=proxy)
         mailboxes = client.list_mailboxes(limit=lim, offset=off, proxies=proxy)
+    except RuntimeError as e:
+        # Graph 模式下，账号文件为空或被删除时不阻断页面，返回空列表等待用户重新选择。
+        if current == "graph":
+            msg = str(e)
+            if ("Graph 账号文件不存在" in msg) or ("Graph 账号文件为空或格式无效" in msg):
+                domains = []
+                mailboxes = []
+            else:
+                raise
+        else:
+            raise
     except MailServiceError as e:
         raise RuntimeError(str(e)) from e
 
@@ -179,6 +289,33 @@ def mail_overview(service, limit: Any = 120, offset: Any = 0) -> dict[str, Any]:
         )
 
     domains_out = [str(x).strip().lower() for x in domains if str(x).strip()]
+    domains_out = list(dict.fromkeys(domains_out))
+
+    # 与邮件服务返回的最新域名集合对齐，清理 gui_config.json 中的历史脏域名与统计。
+    if domains_out:
+        domain_set = set(domains_out)
+        selected_clean = [d for d in selected if d in domain_set]
+        if not selected_clean:
+            selected_clean = list(domains_out)
+        err_counts_clean = {k: int(v) for k, v in err_counts.items() if k in domain_set and int(v) > 0}
+        registered_counts_clean = {
+            k: int(v) for k, v in registered_counts.items() if k in domain_set and int(v) > 0
+        }
+
+        changed = (
+            selected_clean != selected
+            or err_counts_clean != err_counts
+            or registered_counts_clean != registered_counts
+        )
+        if changed:
+            with service._lock:
+                service.cfg["mail_domain_allowlist"] = selected_clean
+                service.cfg["mail_domain_error_counts"] = err_counts_clean
+                service.cfg["mail_domain_registered_counts"] = registered_counts_clean
+                save_config(service.cfg)
+            selected = selected_clean
+            err_counts = err_counts_clean
+            registered_counts = registered_counts_clean
     domain_stats = {
         dm: {
             "selected": (dm in selected) if selected else True,
@@ -206,16 +343,31 @@ def mail_generate_mailbox(service) -> dict[str, Any]:
     proxy = mail_proxy(service)
     random_domain = bool(service.cfg.get("mailfree_random_domain", True))
     selected_domains = service._normalize_domain_list(service.cfg.get("mail_domain_allowlist") or [])
+    mailbox_custom_enabled = bool(service.cfg.get("mailbox_custom_enabled", False))
+    mailbox_prefix = str(service.cfg.get("mailbox_prefix") or "").strip() if mailbox_custom_enabled else ""
+    mailbox_random_len = (
+        service._to_int(service.cfg.get("mailbox_random_len"), 0, 0, 32)
+        if mailbox_custom_enabled
+        else 0
+    )
     try:
         email = client.generate_mailbox(
             random_domain=random_domain,
             allowed_domains=selected_domains,
+            local_prefix=mailbox_prefix,
+            random_length=mailbox_random_len,
             proxies=proxy,
         )
     except MailServiceError as e:
         raise RuntimeError(str(e)) from e
     service.log(f"[邮箱] 已生成临时邮箱: {email}")
-    return {"email": email, "random_domain": random_domain}
+    return {
+        "email": email,
+        "mailbox_custom_enabled": mailbox_custom_enabled,
+        "random_domain": random_domain,
+        "mailbox_prefix": mailbox_prefix,
+        "mailbox_random_len": mailbox_random_len,
+    }
 
 
 def mail_list_emails(service, mailbox: str) -> dict[str, Any]:
@@ -473,6 +625,9 @@ def mail_delete_mailboxes(service, addresses: list[Any]) -> dict[str, Any]:
 
 __all__ = [
     "get_mail_client",
+    "mail_graph_account_files",
+    "mail_import_graph_account_file",
+    "mail_delete_graph_account_file",
     "mail_clear_emails",
     "mail_client_signature",
     "mail_content_preview",

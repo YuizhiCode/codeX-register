@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -13,11 +14,17 @@ from typing import Any
 
 from gui_http_utils import (
     _hint_connect_error,
+    _http_delete,
     _http_get,
     _http_post_json,
     _merge_http_headers,
     _urlopen_request,
 )
+
+
+_OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
+_OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_OPENAI_REDIRECT_URI = "http://localhost:1455/auth/callback"
 
 
 def consume_test_event_stream(resp) -> tuple[bool, str, str]:
@@ -148,6 +155,30 @@ def is_rate_limited_error(msg: str) -> bool:
     return any(k in low for k in keys)
 
 
+def is_transient_test_error(msg: str) -> bool:
+    """判断是否属于可重试的服务端临时错误。"""
+    low = str(msg or "").strip().lower()
+    if not low:
+        return False
+    keys = [
+        "an error occurred while processing your request",
+        "you can retry your request",
+        "please include the request id",
+        "temporarily unavailable",
+        "internal server error",
+        "service unavailable",
+        "failed to perform, curl: (28)",
+        "connection timed out",
+        "timed out after",
+        "operation timed out",
+        "timeout was reached",
+        "服务器繁忙",
+        "服务暂时不可用",
+        "稍后重试",
+    ]
+    return any(k in low for k in keys)
+
+
 def refresh_api_success(code: int, text: str) -> tuple[bool, str]:
     """解析 token 刷新接口响应。"""
     raw = str(text or "")
@@ -217,6 +248,275 @@ def refresh_api_success(code: int, text: str) -> tuple[bool, str]:
             return False, msg
 
     return False, snippet or f"HTTP {code}"
+
+
+def _refresh_openai_oauth_token_by_refresh_token(
+    refresh_token: str,
+    *,
+    verify_ssl: bool,
+    proxy_arg: str | None,
+) -> tuple[bool, dict[str, Any], str]:
+    """使用 refresh_token 向 OpenAI 官方 OAuth 接口换取新凭证。"""
+    rt = str(refresh_token or "").strip()
+    if not rt:
+        return False, {}, "缺少 refresh_token"
+
+    form = urllib.parse.urlencode(
+        {
+            "client_id": _OPENAI_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "redirect_uri": _OPENAI_REDIRECT_URI,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        _OPENAI_TOKEN_URL,
+        data=form,
+        method="POST",
+        headers=_merge_http_headers(
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            }
+        ),
+    )
+
+    code = -1
+    text = ""
+    try:
+        with _urlopen_request(
+            req,
+            verify_ssl=verify_ssl,
+            timeout=60,
+            proxy=proxy_arg,
+        ) as resp:
+            code = int(resp.getcode() or 0)
+            text = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        code = int(getattr(e, "code", -1) or -1)
+        text = e.read().decode("utf-8", "replace")
+    except Exception as e:
+        return False, {}, str(e)
+
+    if not (200 <= code < 300):
+        snippet = (text or "").replace("\n", " ")[:220]
+        return False, {}, f"OpenAI OAuth 刷新失败 HTTP {code}: {snippet}"
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return False, {}, "OpenAI OAuth 刷新返回非 JSON"
+
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        return False, {}, "OpenAI OAuth 刷新响应缺少 access_token"
+
+    refresh_new = str(payload.get("refresh_token") or rt).strip() or rt
+    id_token = str(payload.get("id_token") or "").strip()
+    try:
+        expires_in = int(payload.get("expires_in") or 3600)
+    except Exception:
+        expires_in = 3600
+    expires_in = max(300, expires_in)
+
+    now_ts = int(time.time())
+    out = {
+        "access_token": access_token,
+        "refresh_token": refresh_new,
+        "id_token": id_token,
+        "expires_in": expires_in,
+        "last_refresh": datetime.utcfromtimestamp(now_ts).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": datetime.utcfromtimestamp(now_ts + expires_in).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    return True, out, "ok"
+
+
+def _apply_tokens_to_local_account(local_acc: dict[str, Any], tokens: dict[str, Any]) -> dict[str, Any]:
+    """把刷新后的 token 写入本地账号结构（用于重新导入服务端）。"""
+    acc = json.loads(json.dumps(local_acc, ensure_ascii=False))
+    creds = acc.get("credentials")
+    if not isinstance(creds, dict):
+        creds = {}
+        acc["credentials"] = creds
+
+    creds["access_token"] = str(tokens.get("access_token") or creds.get("access_token") or "")
+    creds["refresh_token"] = str(tokens.get("refresh_token") or creds.get("refresh_token") or "")
+    if str(tokens.get("id_token") or "").strip():
+        creds["id_token"] = str(tokens.get("id_token") or "")
+    creds["last_refresh"] = str(tokens.get("last_refresh") or "")
+    creds["expires_at"] = str(tokens.get("expires_at") or creds.get("expires_at") or "")
+    try:
+        creds["expires_in"] = int(tokens.get("expires_in") or creds.get("expires_in") or 0)
+    except Exception:
+        pass
+
+    email = str(
+        acc.get("name")
+        or creds.get("email")
+        or (acc.get("extra") or {}).get("email")
+        or ""
+    ).strip()
+    if email:
+        acc["name"] = email
+        if not str(creds.get("email") or "").strip():
+            creds["email"] = email
+        extra = acc.get("extra")
+        if not isinstance(extra, dict):
+            extra = {}
+            acc["extra"] = extra
+        extra["email"] = email
+
+    return acc
+
+
+def _sync_one_account_to_remote(
+    account: dict[str, Any],
+    *,
+    sync_url: str,
+    auth: str,
+    verify_ssl: bool,
+    proxy_arg: str | None,
+) -> tuple[bool, str]:
+    payload = {
+        "data": {"accounts": [account], "proxies": []},
+        "skip_default_group_bind": True,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    code, text = _http_post_json(
+        sync_url,
+        body,
+        {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": auth,
+        },
+        verify_ssl=verify_ssl,
+        proxy=proxy_arg,
+        timeout=120,
+    )
+    if not (200 <= code < 300):
+        snippet = (text or "").replace("\n", " ")[:220]
+        return False, f"导入失败 HTTP {code}: {snippet}"
+
+    if (text or "").strip():
+        try:
+            j = json.loads(text)
+        except Exception:
+            return True, f"导入成功 HTTP {code}"
+        if isinstance(j, dict) and "code" in j:
+            try:
+                cval = int(j.get("code") or 0)
+            except Exception:
+                cval = 0
+            if cval != 0:
+                return False, str(j.get("message") or f"导入失败 code={cval}")
+
+    return True, f"导入成功 HTTP {code}"
+
+
+def _delete_one_remote_account(
+    account_id: str,
+    *,
+    base: str,
+    auth: str,
+    verify_ssl: bool,
+    proxy_arg: str | None,
+) -> tuple[bool, str]:
+    aid = str(account_id or "").strip()
+    if not aid:
+        return False, "账号 ID 为空"
+
+    url = f"{base.rstrip('/')}/{urllib.parse.quote(aid)}"
+    code, text = _http_delete(
+        url,
+        {
+            "Accept": "application/json",
+            "Authorization": auth,
+        },
+        verify_ssl=verify_ssl,
+        proxy=proxy_arg,
+        timeout=90,
+    )
+    if 200 <= code < 300:
+        return True, "已删除旧账号"
+
+    snippet = (text or "").replace("\n", " ")[:220]
+    return False, f"删除旧账号失败 HTTP {code}: {snippet}"
+
+
+def _load_local_password_map(service) -> dict[str, str]:
+    """从 accounts.txt 读取邮箱->密码映射。"""
+    out: dict[str, str] = {}
+    path = str(service._accounts_txt_path() or "").strip()
+    if not path or not os.path.isfile(path):
+        return out
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = str(raw or "").strip()
+                if not line or "----" not in line:
+                    continue
+                email, pwd = line.split("----", 1)
+                em = str(email or "").strip().lower()
+                pw = str(pwd or "").strip()
+                if not em or not pw:
+                    continue
+                if em not in out:
+                    out[em] = pw
+    except Exception:
+        return {}
+    return out
+
+
+def _relogin_openai_account_by_password(
+    *,
+    email: str,
+    password: str,
+    proxy_arg: str | None,
+) -> tuple[bool, dict[str, Any], str]:
+    """使用邮箱+密码走 OAuth 登录链，重新换取 token。"""
+    em = str(email or "").strip()
+    pw = str(password or "").strip()
+    if not em:
+        return False, {}, "邮箱为空"
+    if not pw:
+        return False, {}, "密码为空"
+
+    try:
+        from r_with_pwd import _login_via_password_and_finish_oauth  # 延迟导入，避免启动期开销
+    except Exception as e:
+        return False, {}, f"加载登录模块失败: {e}"
+
+    proxies = {"http": proxy_arg, "https": proxy_arg} if proxy_arg else None
+    try:
+        # dev_token 参数在当前实现中仅用于日志/兼容，传邮箱即可。
+        account = _login_via_password_and_finish_oauth(em, pw, em, proxies)
+    except Exception as e:
+        return False, {}, f"密码登录异常: {e}"
+
+    if not isinstance(account, dict):
+        return False, {}, "密码登录未返回可用账号数据"
+
+    creds = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
+    access_token = str(creds.get("access_token") or "").strip()
+    refresh_token = str(creds.get("refresh_token") or "").strip()
+    if not access_token or not refresh_token:
+        return False, {}, "密码登录后缺少 access_token/refresh_token"
+
+    if not str(account.get("name") or "").strip():
+        account["name"] = em
+    extra = account.get("extra")
+    if not isinstance(extra, dict):
+        extra = {}
+        account["extra"] = extra
+    if not str(extra.get("email") or "").strip():
+        extra["email"] = em
+    if not str(creds.get("email") or "").strip():
+        creds["email"] = em
+        account["credentials"] = creds
+
+    return True, account, "ok"
 
 
 def try_refresh_remote_token(
@@ -379,10 +679,11 @@ def batch_test_remote_accounts(service, ids: list[Any]) -> dict[str, Any]:
             service._to_int(service.cfg.get("remote_test_concurrency"), 4, 1, 12),
         )
         ssl_retry_limit = service._to_int(service.cfg.get("remote_test_ssl_retry"), 2, 0, 5)
+        transient_retry_limit = 2
 
         service.log(
             f"[批量测试] 启动：总数 {total}，并发 {worker_count}，"
-            f"SSL 重试 {ssl_retry_limit}"
+            f"SSL 重试 {ssl_retry_limit}，临时错误重试 {transient_retry_limit}"
         )
 
         q: Queue[str] = Queue()
@@ -398,6 +699,7 @@ def batch_test_remote_accounts(service, ids: list[Any]) -> dict[str, Any]:
             status_text = "失败"
 
             ssl_retry_done = 0
+            transient_retry_done = 0
 
             while True:
                 success = False
@@ -463,6 +765,18 @@ def batch_test_remote_accounts(service, ids: list[Any]) -> dict[str, Any]:
                     status_text = "Token过期"
                     summary = "Token 过期/失效"
                     break
+
+                if is_transient_test_error(summary):
+                    if transient_retry_done >= transient_retry_limit:
+                        break
+                    transient_retry_done += 1
+                    wait = round(0.7 * transient_retry_done, 2)
+                    service.log(
+                        f"[批量测试] id={aid} 命中临时错误，"
+                        f"{wait}s 后重试 ({transient_retry_done}/{transient_retry_limit})"
+                    )
+                    time.sleep(wait)
+                    continue
 
                 if ssl_retry_done >= ssl_retry_limit:
                     break
@@ -584,14 +898,26 @@ def revive_remote_tokens(service, ids: list[Any]) -> dict[str, Any]:
 
     tok = str(service.cfg.get("accounts_sync_bearer_token") or "").strip()
     base = str(service.cfg.get("accounts_list_api_base") or "").strip()
+    sync_url = str(service.cfg.get("accounts_sync_api_url") or "").strip()
     if not tok:
         raise ValueError("请先填写 Bearer Token")
     if not base:
         raise ValueError("请先填写账号列表 API")
+    if not sync_url:
+        raise ValueError("请先填写同步 API 地址")
 
     verify_ssl = bool(service.cfg.get("openai_ssl_verify", True))
     proxy_arg = str(service.cfg.get("proxy") or "").strip() or None
     auth = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
+
+    with service._lock:
+        row_by_id = {
+            str(r.get("id") or "").strip(): dict(r)
+            for r in service._remote_rows
+        }
+    local_map = service._build_local_account_index()
+    pwd_map = _load_local_password_map(service)
+
     worker_count = min(
         len(candidates),
         service._to_int(service.cfg.get("remote_revive_concurrency"), 4, 1, 12),
@@ -601,6 +927,10 @@ def revive_remote_tokens(service, ids: list[Any]) -> dict[str, Any]:
         f"[复活] 启动：候选 {len(candidates)}，并发 {worker_count}"
         + (f"，跳过 {len(skipped)}" if skipped else "")
     )
+    service.log(
+        "[复活] 策略：账号密码重新登录换 token -> 重新导入 -> 删除旧 Token 过期账号"
+        "（失败时兜底 refresh_token）"
+    )
 
     ok = 0
     fail = 0
@@ -609,6 +939,103 @@ def revive_remote_tokens(service, ids: list[Any]) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
 
     def _run_one(aid: str) -> dict[str, Any]:
+        row = row_by_id.get(aid) or {}
+        email = str(row.get("name") or "").strip().lower()
+        local_acc = local_map.get(email) if email else None
+        password = str(pwd_map.get(email) or "").strip() if email else ""
+
+        local_fail_detail = ""
+        if not email:
+            local_fail_detail = "远端账号缺少邮箱(name)"
+        elif not password:
+            local_fail_detail = "本地 accounts.txt 未找到该邮箱密码"
+        else:
+            relogin_ok, relogin_account, relogin_detail = _relogin_openai_account_by_password(
+                email=email,
+                password=password,
+                proxy_arg=proxy_arg,
+            )
+            if not relogin_ok:
+                local_fail_detail = f"密码换 token 失败: {relogin_detail}"
+            else:
+                refreshed_acc = relogin_account
+                # 兜底：若密码登录返回结构异常，尝试用本地结构套入 token 字段。
+                if (
+                    not isinstance(refreshed_acc, dict)
+                    or not isinstance(refreshed_acc.get("credentials"), dict)
+                    or not str((refreshed_acc.get("credentials") or {}).get("access_token") or "").strip()
+                ) and isinstance(local_acc, dict):
+                    creds_new = (
+                        relogin_account.get("credentials")
+                        if isinstance(relogin_account, dict)
+                        else {}
+                    )
+                    token_pack = {
+                        "access_token": str((creds_new or {}).get("access_token") or ""),
+                        "refresh_token": str((creds_new or {}).get("refresh_token") or ""),
+                        "id_token": str((creds_new or {}).get("id_token") or ""),
+                        "expires_in": int((creds_new or {}).get("expires_in") or 3600),
+                        "expires_at": str((creds_new or {}).get("expires_at") or ""),
+                        "last_refresh": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }
+                    refreshed_acc = _apply_tokens_to_local_account(local_acc, token_pack)
+
+                sync_ok, sync_detail = _sync_one_account_to_remote(
+                    refreshed_acc,
+                    sync_url=sync_url,
+                    auth=auth,
+                    verify_ssl=verify_ssl,
+                    proxy_arg=proxy_arg,
+                )
+                if not sync_ok:
+                    detail = f"密码换 token 成功但导入失败: {sync_detail}"
+                    service.log(f"[复活] id={aid} 失败: {detail}")
+                    return {
+                        "id": aid,
+                        "success": False,
+                        "detail": detail,
+                        "api": "PASSWORD_RELOGIN_REIMPORT",
+                    }
+
+                del_ok, del_detail = _delete_one_remote_account(
+                    aid,
+                    base=base,
+                    auth=auth,
+                    verify_ssl=verify_ssl,
+                    proxy_arg=proxy_arg,
+                )
+                if not del_ok:
+                    detail = f"密码换 token 并导入成功，但删除旧账号失败: {del_detail}"
+                    service.log(f"[复活] id={aid} 失败: {detail}")
+                    return {
+                        "id": aid,
+                        "success": False,
+                        "detail": detail,
+                        "api": "PASSWORD_RELOGIN_REIMPORT",
+                    }
+
+                with service._lock:
+                    service._remote_rows = [
+                        r
+                        for r in service._remote_rows
+                        if str(r.get("id") or "").strip() != aid
+                    ]
+                    service._remote_test_state.pop(aid, None)
+                    service._refresh_remote_rows_derived_locked()
+                    service._remote_total = max(0, int(service._remote_total) - 1)
+
+                service.log(
+                    f"[复活] id={aid} 成功 · 密码重登换 token -> 导入 -> 删除旧号"
+                    f" · {sync_detail}"
+                )
+                return {
+                    "id": aid,
+                    "success": True,
+                    "detail": "密码重登换 token 成功并已替换旧账号",
+                    "api": "PASSWORD_RELOGIN_REIMPORT",
+                }
+
+        # 兜底：若本地流程不可用，尝试管理端 refresh 接口
         refreshed, detail, api = try_refresh_remote_token(
             service,
             aid,
@@ -626,14 +1053,19 @@ def revive_remote_tokens(service, ids: list[Any]) -> dict[str, Any]:
                 duration_ms=0,
             )
             service.log(
-                f"[复活] id={aid} 成功"
+                f"[复活] id={aid} 成功(兜底接口)"
                 + (f" · 接口 {api}" if api else "")
                 + (f" · {detail}" if detail else "")
             )
-            return {"id": aid, "success": True, "detail": detail, "api": api}
+            return {"id": aid, "success": True, "detail": detail, "api": api or "REMOTE_REFRESH_API"}
 
-        service.log(f"[复活] id={aid} 失败: {detail}")
-        return {"id": aid, "success": False, "detail": detail, "api": api}
+        merged = local_fail_detail
+        if detail:
+            merged = f"{merged}；远端刷新失败: {detail}" if merged else detail
+        if not merged:
+            merged = "复活失败"
+        service.log(f"[复活] id={aid} 失败: {merged}")
+        return {"id": aid, "success": False, "detail": merged, "api": api or ""}
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {executor.submit(_run_one, aid): aid for aid in candidates}

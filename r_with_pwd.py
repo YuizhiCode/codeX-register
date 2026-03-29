@@ -7,6 +7,8 @@ OpenAI 账号自动注册（密码注册 + OAuth 换 token）。
 依赖环境变量（可由 gui 写入进程环境）：MAIL_SERVICE_PROVIDER、WORKER_DOMAIN、
 FREEMAIL_USERNAME、FREEMAIL_PASSWORD；
 可选 TOKEN_OUTPUT_DIR、OPENAI_SSL_VERIFY、SKIP_NET_CHECK、MAILFREE_RANDOM_DOMAIN。
+可选 MAILBOX_PREFIX、MAILBOX_RANDOM_LENGTH（控制邮箱本地名前缀与随机长度）。
+可选 REGISTER_RANDOM_FINGERPRINT（1=随机指纹，0=固定）。
 可选 MAIL_ALLOWED_DOMAINS（JSON 数组或逗号分隔域名）。
 支持 --proxy 与命令行循环参数。
 """
@@ -22,6 +24,7 @@ import secrets
 import ssl
 import string
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -87,7 +90,53 @@ MAIL_ALLOWED_DOMAINS: List[str] = []
 TOKEN_OUTPUT_DIR = os.getenv("TOKEN_OUTPUT_DIR", "").strip()
 
 _mail_service_client: Any = None
-_mail_service_sig: tuple[str, str, str, str, bool] | None = None
+_mail_service_sig: tuple[str, str, str, str, bool, str, str, str] | None = None
+STOP_EVENT: Any = None
+
+
+class UserStoppedError(RuntimeError):
+    """用户在 GUI 中点击停止时触发的中断异常。"""
+
+
+class HeroSmsBalanceLowError(RuntimeError):
+    """HeroSMS 余额低于阈值时触发的中断异常。"""
+
+
+class HeroSmsCodeTimeoutError(RuntimeError):
+    """HeroSMS 长时间未收到验证码时触发的中断异常。"""
+
+
+class HeroSmsCountryBlockedError(RuntimeError):
+    """HeroSMS 国家被策略过滤时触发的中断异常。"""
+
+
+def _stop_requested() -> bool:
+    evt = STOP_EVENT
+    if evt is None:
+        return False
+    try:
+        return bool(evt.is_set())
+    except Exception:
+        return False
+
+
+def _sleep_interruptible(seconds: float) -> bool:
+    wait_sec = max(0.0, float(seconds or 0.0))
+    if wait_sec <= 0:
+        return _stop_requested()
+    evt = STOP_EVENT
+    if evt is not None:
+        try:
+            return bool(evt.wait(wait_sec))
+        except Exception:
+            pass
+    time.sleep(wait_sec)
+    return _stop_requested()
+
+
+def _raise_if_stopped() -> None:
+    if _stop_requested():
+        raise UserStoppedError("stopped_by_user")
 
 
 def _ssl_verify() -> bool:
@@ -140,6 +189,1348 @@ def _env_list(name: str) -> List[str]:
 
 
 MAIL_ALLOWED_DOMAINS = _env_list("MAIL_ALLOWED_DOMAINS")
+_GRAPH_BAD_EMAILS: set[str] = set()
+_MAILBOX_INIT_LAST_ERROR_CODE = ""
+_MAILBOX_INIT_LAST_ERROR_MSG = ""
+
+
+def _set_mailbox_init_error(code: str = "", message: str = "") -> None:
+    global _MAILBOX_INIT_LAST_ERROR_CODE, _MAILBOX_INIT_LAST_ERROR_MSG
+    _MAILBOX_INIT_LAST_ERROR_CODE = str(code or "").strip().lower()
+    _MAILBOX_INIT_LAST_ERROR_MSG = str(message or "").strip()
+
+
+def _consume_mailbox_init_error() -> tuple[str, str]:
+    global _MAILBOX_INIT_LAST_ERROR_CODE, _MAILBOX_INIT_LAST_ERROR_MSG
+    code = _MAILBOX_INIT_LAST_ERROR_CODE
+    msg = _MAILBOX_INIT_LAST_ERROR_MSG
+    _MAILBOX_INIT_LAST_ERROR_CODE = ""
+    _MAILBOX_INIT_LAST_ERROR_MSG = ""
+    return code, msg
+
+
+def _graph_password_for_email(email: str) -> str:
+    target = str(email or "").strip().lower()
+    if not target or "@" not in target:
+        return ""
+    path = str(os.getenv("GRAPH_ACCOUNTS_FILE", "") or "").strip() or "graph_accounts.txt"
+    fp = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(fp):
+        return ""
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = str(raw or "").strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("----", 3)
+                if len(parts) < 2:
+                    continue
+                em = str(parts[0] or "").strip().lower()
+                pwd = str(parts[1] or "").strip()
+                if em == target:
+                    return pwd
+    except Exception:
+        return ""
+    return ""
+
+
+def _mark_graph_bad_email(email: str, reason: str = "") -> None:
+    target = str(email or "").strip().lower()
+    if not target or "@" not in target:
+        return
+    _GRAPH_BAD_EMAILS.add(target)
+    removed = False
+    try:
+        client = _get_mail_service_client()
+        remove_fn = getattr(client, "remove_account", None)
+        if callable(remove_fn):
+            removed = bool(remove_fn(target))
+    except Exception:
+        removed = False
+    if reason:
+        if removed:
+            _warn(f"Graph 账号已删除: {target} ({reason})")
+        else:
+            _warn(f"Graph 账号已标记不可用: {target} ({reason})")
+    else:
+        if removed:
+            _warn(f"Graph 账号已删除: {target}")
+        else:
+            _warn(f"Graph 账号已标记不可用: {target}")
+
+
+_HERO_SMS_SERVICE_CACHE: str = ""
+_HERO_SMS_COUNTRY_CACHE: dict[str, int] = {}
+_HERO_SMS_VERIFY_LOCK = threading.Lock()
+_HERO_SMS_STATS_LOCK = threading.Lock()
+_HERO_SMS_RUNTIME: dict[str, float] = {
+    "spent_total_usd": 0.0,
+    "balance_last_usd": -1.0,
+    "balance_start_usd": -1.0,
+    "updated_at": 0.0,
+}
+_HERO_SMS_REUSE_LOCK = threading.Lock()
+_HERO_SMS_REUSE_STATE: dict[str, Any] = {
+    "activation_id": "",
+    "phone": "",
+    "service": "",
+    "country": -1,
+    "uses": 0,
+    "updated_at": 0.0,
+}
+_HERO_SMS_COUNTRY_LOCK = threading.Lock()
+_HERO_SMS_COUNTRY_TIMEOUTS: dict[int, int] = {}
+_HERO_SMS_COUNTRY_COOLDOWN_UNTIL: dict[int, float] = {}
+_HERO_SMS_COUNTRY_METRICS: dict[int, dict[str, float]] = {}
+_HERO_SMS_PRICE_CACHE_LOCK = threading.Lock()
+_HERO_SMS_PRICE_CACHE: dict[str, Any] = {
+    "service": "",
+    "updated_at": 0.0,
+    "items": [],
+}
+
+_OPENAI_SMS_BLOCKED_COUNTRY_IDS = {
+    0,    # Russia
+    3,    # China
+    14,   # Hong Kong
+    20,   # Macao
+    51,   # Belarus
+    57,   # Iran
+    110,  # Syria
+    113,  # Cuba
+    191,  # North Korea
+}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _hero_sms_min_balance_limit() -> float:
+    raw_min = str(os.getenv("HERO_SMS_MIN_BALANCE", "") or "").strip()
+    if raw_min:
+        return _env_float("HERO_SMS_MIN_BALANCE", 2.0, 0.0, 100000.0)
+    return _env_float("HERO_SMS_MAX_PRICE", 2.0, 0.0, 100000.0)
+
+
+def _hero_sms_reuse_enabled() -> bool:
+    return _env_bool("HERO_SMS_REUSE_PHONE", False)
+
+
+def _hero_sms_reuse_ttl_sec() -> int:
+    return _env_int("HERO_SMS_REUSE_TTL_SEC", 1200, 60, 86400)
+
+
+def _hero_sms_reuse_max_uses() -> int:
+    return _env_int("HERO_SMS_REUSE_MAX_USES", 2, 1, 100)
+
+
+def _hero_sms_country_timeout_limit() -> int:
+    return _env_int("HERO_SMS_COUNTRY_TIMEOUT_LIMIT", 2, 1, 20)
+
+
+def _hero_sms_country_cooldown_sec() -> int:
+    return _env_int("HERO_SMS_COUNTRY_COOLDOWN_SEC", 900, 60, 86400)
+
+
+def _hero_sms_price_cache_ttl_sec() -> int:
+    return _env_int("HERO_SMS_PRICE_CACHE_TTL_SEC", 90, 10, 1800)
+
+
+def _hero_sms_reuse_get(service: str, country: int) -> tuple[str, str, int]:
+    now = time.time()
+    ttl = _hero_sms_reuse_ttl_sec()
+    max_uses = _hero_sms_reuse_max_uses()
+    svc = str(service or "").strip()
+    ctry = int(country)
+    with _HERO_SMS_REUSE_LOCK:
+        aid = str(_HERO_SMS_REUSE_STATE.get("activation_id") or "").strip()
+        phone = str(_HERO_SMS_REUSE_STATE.get("phone") or "").strip()
+        state_svc = str(_HERO_SMS_REUSE_STATE.get("service") or "").strip()
+        try:
+            state_country = int(_HERO_SMS_REUSE_STATE.get("country") or -1)
+        except Exception:
+            state_country = -1
+        uses = int(_HERO_SMS_REUSE_STATE.get("uses") or 0)
+        updated = float(_HERO_SMS_REUSE_STATE.get("updated_at") or 0.0)
+
+        valid = bool(aid and phone)
+        valid = valid and (state_svc == svc)
+        valid = valid and (state_country == ctry)
+        valid = valid and (uses < max_uses)
+        valid = valid and (updated > 0 and (now - updated) <= ttl)
+        if not valid:
+            return "", "", 0
+        return aid, phone, uses
+
+
+def _hero_sms_reuse_set(activation_id: str, phone: str, service: str, country: int) -> None:
+    aid = str(activation_id or "").strip()
+    ph = str(phone or "").strip()
+    if not aid or not ph:
+        return
+    with _HERO_SMS_REUSE_LOCK:
+        _HERO_SMS_REUSE_STATE["activation_id"] = aid
+        _HERO_SMS_REUSE_STATE["phone"] = ph
+        _HERO_SMS_REUSE_STATE["service"] = str(service or "").strip()
+        _HERO_SMS_REUSE_STATE["country"] = int(country)
+        _HERO_SMS_REUSE_STATE["uses"] = 0
+        _HERO_SMS_REUSE_STATE["updated_at"] = time.time()
+
+
+def _hero_sms_reuse_touch(increase: bool = False) -> None:
+    with _HERO_SMS_REUSE_LOCK:
+        if increase:
+            _HERO_SMS_REUSE_STATE["uses"] = int(_HERO_SMS_REUSE_STATE.get("uses") or 0) + 1
+        _HERO_SMS_REUSE_STATE["updated_at"] = time.time()
+
+
+def _hero_sms_reuse_clear() -> None:
+    with _HERO_SMS_REUSE_LOCK:
+        _HERO_SMS_REUSE_STATE["activation_id"] = ""
+        _HERO_SMS_REUSE_STATE["phone"] = ""
+        _HERO_SMS_REUSE_STATE["service"] = ""
+        _HERO_SMS_REUSE_STATE["country"] = -1
+        _HERO_SMS_REUSE_STATE["uses"] = 0
+        _HERO_SMS_REUSE_STATE["updated_at"] = 0.0
+
+
+def _hero_sms_country_is_on_cooldown(country_id: int) -> bool:
+    cid = int(country_id)
+    now = time.time()
+    with _HERO_SMS_COUNTRY_LOCK:
+        until = float(_HERO_SMS_COUNTRY_COOLDOWN_UNTIL.get(cid) or 0.0)
+        if until <= 0:
+            return False
+        if until <= now:
+            _HERO_SMS_COUNTRY_COOLDOWN_UNTIL.pop(cid, None)
+            _HERO_SMS_COUNTRY_TIMEOUTS.pop(cid, None)
+            return False
+        return True
+
+
+def _hero_sms_country_mark_success(country_id: int) -> None:
+    cid = int(country_id)
+    with _HERO_SMS_COUNTRY_LOCK:
+        _HERO_SMS_COUNTRY_TIMEOUTS.pop(cid, None)
+
+
+def _hero_sms_country_mark_timeout(country_id: int) -> bool:
+    cid = int(country_id)
+    limit = _hero_sms_country_timeout_limit()
+    cooldown_sec = _hero_sms_country_cooldown_sec()
+    now = time.time()
+    with _HERO_SMS_COUNTRY_LOCK:
+        current = int(_HERO_SMS_COUNTRY_TIMEOUTS.get(cid) or 0) + 1
+        _HERO_SMS_COUNTRY_TIMEOUTS[cid] = current
+        if current < limit:
+            return False
+        _HERO_SMS_COUNTRY_TIMEOUTS[cid] = 0
+        _HERO_SMS_COUNTRY_COOLDOWN_UNTIL[cid] = now + float(cooldown_sec)
+        return True
+
+
+def _hero_sms_country_record_result(country_id: int, success: bool, reason: str = "") -> None:
+    cid = int(country_id)
+    now = time.time()
+    low = str(reason or "").strip().lower()
+    with _HERO_SMS_COUNTRY_LOCK:
+        row = _HERO_SMS_COUNTRY_METRICS.get(cid)
+        if not isinstance(row, dict):
+            row = {
+                "attempts": 0.0,
+                "success": 0.0,
+                "timeout": 0.0,
+                "send_fail": 0.0,
+                "verify_fail": 0.0,
+                "other_fail": 0.0,
+                "last_used_at": 0.0,
+                "last_success_at": 0.0,
+            }
+            _HERO_SMS_COUNTRY_METRICS[cid] = row
+
+        row["attempts"] = float(row.get("attempts") or 0.0) + 1.0
+        row["last_used_at"] = now
+
+        if success:
+            row["success"] = float(row.get("success") or 0.0) + 1.0
+            row["last_success_at"] = now
+            return
+
+        if "接码超时" in low or "status_wait_code" in low or "timeout" in low:
+            row["timeout"] = float(row.get("timeout") or 0.0) + 1.0
+        elif "发送手机验证码失败" in low:
+            row["send_fail"] = float(row.get("send_fail") or 0.0) + 1.0
+        elif "手机验证码校验失败" in low:
+            row["verify_fail"] = float(row.get("verify_fail") or 0.0) + 1.0
+        else:
+            row["other_fail"] = float(row.get("other_fail") or 0.0) + 1.0
+
+
+def _hero_sms_country_score(
+    country_id: int,
+    *,
+    cost: float,
+    count: int,
+    preferred_country: int,
+) -> float:
+    cid = int(country_id)
+    preferred = int(preferred_country)
+    if cid in _OPENAI_SMS_BLOCKED_COUNTRY_IDS:
+        return -1e9
+    if count <= 0:
+        return -1e9
+    if _hero_sms_country_is_on_cooldown(cid):
+        return -1e9
+
+    now = time.time()
+    with _HERO_SMS_COUNTRY_LOCK:
+        stats = dict(_HERO_SMS_COUNTRY_METRICS.get(cid) or {})
+        timeout_streak = int(_HERO_SMS_COUNTRY_TIMEOUTS.get(cid) or 0)
+
+    attempts = max(0.0, float(stats.get("attempts") or 0.0))
+    success_num = max(0.0, float(stats.get("success") or 0.0))
+    timeout_num = max(0.0, float(stats.get("timeout") or 0.0))
+    send_fail_num = max(0.0, float(stats.get("send_fail") or 0.0))
+    verify_fail_num = max(0.0, float(stats.get("verify_fail") or 0.0))
+    other_fail_num = max(0.0, float(stats.get("other_fail") or 0.0))
+    last_success_at = float(stats.get("last_success_at") or 0.0)
+
+    if attempts <= 0:
+        success_rate = 0.55
+        timeout_rate = 0.0
+        send_fail_rate = 0.0
+        verify_fail_rate = 0.0
+        other_fail_rate = 0.0
+        explore_bonus = 9.0
+    else:
+        success_rate = success_num / attempts
+        timeout_rate = timeout_num / attempts
+        send_fail_rate = send_fail_num / attempts
+        verify_fail_rate = verify_fail_num / attempts
+        other_fail_rate = other_fail_num / attempts
+        explore_bonus = max(0.0, 6.0 - min(6.0, attempts))
+
+    score = 0.0
+    score += success_rate * 80.0
+    score -= timeout_rate * 70.0
+    score -= send_fail_rate * 45.0
+    score -= verify_fail_rate * 30.0
+    score -= other_fail_rate * 20.0
+    score -= float(timeout_streak) * 8.0
+    score += explore_bonus
+
+    if cost >= 0:
+        score -= min(5.0, float(cost)) * 10.0
+    score += min(20000, max(0, int(count))) / 2000.0
+
+    if cid == preferred:
+        score += 3.0
+
+    if last_success_at > 0:
+        age = max(0.0, now - last_success_at)
+        if age < 900:
+            score += 4.0
+        elif age < 3600:
+            score += 2.0
+
+    return float(score)
+
+
+def _hero_sms_prices_by_service(service_code: str, proxies: Any) -> list[dict[str, Any]]:
+    svc = str(service_code or "").strip()
+    if not svc:
+        return []
+    ttl = _hero_sms_price_cache_ttl_sec()
+    now = time.time()
+    with _HERO_SMS_PRICE_CACHE_LOCK:
+        cache_svc = str(_HERO_SMS_PRICE_CACHE.get("service") or "")
+        cache_at = float(_HERO_SMS_PRICE_CACHE.get("updated_at") or 0.0)
+        cache_items = list(_HERO_SMS_PRICE_CACHE.get("items") or [])
+        if cache_svc == svc and cache_items and (now - cache_at) <= float(ttl):
+            return [dict(x) for x in cache_items if isinstance(x, dict)]
+
+    ok, text, data = _hero_sms_request(
+        "getPrices",
+        proxies=proxies,
+        params={"service": svc},
+        timeout=25,
+    )
+    if not ok or not isinstance(data, dict):
+        if text:
+            _warn(f"HeroSMS 拉取国家价格失败: {text}")
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for country_key, entry in data.items():
+        try:
+            cid = int(country_key)
+        except Exception:
+            continue
+        if cid in _OPENAI_SMS_BLOCKED_COUNTRY_IDS:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        row = entry.get(svc) if isinstance(entry.get(svc), dict) else entry
+        if not isinstance(row, dict):
+            continue
+        try:
+            count = int(row.get("count") or 0)
+        except Exception:
+            count = 0
+        if count <= 0:
+            continue
+        try:
+            cost = float(row.get("cost") or -1.0)
+        except Exception:
+            cost = -1.0
+        rows.append(
+            {
+                "country": cid,
+                "cost": cost,
+                "count": count,
+            }
+        )
+
+    rows.sort(
+        key=lambda x: (
+            float(x.get("cost")) if float(x.get("cost") or -1.0) >= 0 else 999999.0,
+            -int(x.get("count") or 0),
+            int(x.get("country") or 0),
+        )
+    )
+
+    with _HERO_SMS_PRICE_CACHE_LOCK:
+        _HERO_SMS_PRICE_CACHE["service"] = svc
+        _HERO_SMS_PRICE_CACHE["updated_at"] = now
+        _HERO_SMS_PRICE_CACHE["items"] = [dict(x) for x in rows]
+    return rows
+
+
+def _hero_sms_auto_pick_country() -> bool:
+    """为 True 时按库存/价格/历史评分自动选国；False 时严格使用配置里的国家（解析后的 ID）。"""
+    return _env_bool("HERO_SMS_AUTO_PICK_COUNTRY", False)
+
+
+def _hero_sms_pick_country_id(
+    proxies: Any,
+    *,
+    service_code: str,
+    preferred_country: int,
+) -> int:
+    preferred = int(preferred_country)
+    if not _hero_sms_auto_pick_country():
+        if preferred in _OPENAI_SMS_BLOCKED_COUNTRY_IDS:
+            _warn(
+                f"HeroSMS 已关闭自动选国：首选国家 ID {preferred} 在 OpenAI 短信黑名单内，仍将尝试使用该 ID"
+            )
+            return preferred
+        if _hero_sms_country_is_on_cooldown(preferred):
+            _warn(
+                "HeroSMS 已关闭自动选国：首选国家仍在失败冷却中，仍按配置使用 "
+                f"{preferred}（可设 HERO_SMS_AUTO_PICK_COUNTRY=1 恢复自动选国）"
+            )
+        return preferred
+
+    rows = _hero_sms_prices_by_service(service_code, proxies)
+    if not rows:
+        if preferred not in _OPENAI_SMS_BLOCKED_COUNTRY_IDS and not _hero_sms_country_is_on_cooldown(preferred):
+            return preferred
+        return preferred
+
+    scored: list[tuple[float, int, float, int]] = []
+    for row in rows:
+        cid = int(row.get("country") or -1)
+        if cid < 0:
+            continue
+        try:
+            cost = float(row.get("cost") or -1.0)
+        except Exception:
+            cost = -1.0
+        try:
+            count = int(row.get("count") or 0)
+        except Exception:
+            count = 0
+        score = _hero_sms_country_score(
+            cid,
+            cost=cost,
+            count=count,
+            preferred_country=preferred,
+        )
+        if score <= -1e8:
+            continue
+        scored.append((score, cid, cost, count))
+
+    if not scored:
+        if preferred not in _OPENAI_SMS_BLOCKED_COUNTRY_IDS and not _hero_sms_country_is_on_cooldown(preferred):
+            return preferred
+        return preferred
+
+    scored.sort(key=lambda x: (-float(x[0]), float(x[2]) if float(x[2]) >= 0 else 999999.0, -int(x[3]), int(x[1])))
+    top_score, top_country, top_cost, top_count = scored[0]
+
+    if top_country != preferred:
+        _info(
+            "HeroSMS 国家评分选优: "
+            f"{preferred} -> {top_country} (score={top_score:.2f}, cost={top_cost:.3f}, stock={top_count})"
+        )
+    return int(top_country)
+
+
+def _hero_sms_update_runtime(
+    *,
+    spent_delta: float = 0.0,
+    balance: float | None = None,
+    init_start: bool = False,
+) -> None:
+    delta = max(0.0, float(spent_delta or 0.0))
+    bal = None
+    if balance is not None:
+        try:
+            bal = float(balance)
+        except Exception:
+            bal = None
+
+    with _HERO_SMS_STATS_LOCK:
+        if delta > 0:
+            _HERO_SMS_RUNTIME["spent_total_usd"] = round(
+                max(0.0, float(_HERO_SMS_RUNTIME.get("spent_total_usd") or 0.0)) + delta,
+                4,
+            )
+        if bal is not None and bal >= 0:
+            _HERO_SMS_RUNTIME["balance_last_usd"] = round(bal, 4)
+            current_start = float(_HERO_SMS_RUNTIME.get("balance_start_usd") or -1.0)
+            if init_start and current_start < 0:
+                _HERO_SMS_RUNTIME["balance_start_usd"] = round(bal, 4)
+        _HERO_SMS_RUNTIME["updated_at"] = time.time()
+
+
+def reset_hero_sms_runtime_stats() -> None:
+    with _HERO_SMS_STATS_LOCK:
+        _HERO_SMS_RUNTIME["spent_total_usd"] = 0.0
+        _HERO_SMS_RUNTIME["balance_last_usd"] = -1.0
+        _HERO_SMS_RUNTIME["balance_start_usd"] = -1.0
+        _HERO_SMS_RUNTIME["updated_at"] = time.time()
+    _hero_sms_reuse_clear()
+    with _HERO_SMS_COUNTRY_LOCK:
+        _HERO_SMS_COUNTRY_TIMEOUTS.clear()
+        _HERO_SMS_COUNTRY_COOLDOWN_UNTIL.clear()
+    with _HERO_SMS_PRICE_CACHE_LOCK:
+        _HERO_SMS_PRICE_CACHE["service"] = ""
+        _HERO_SMS_PRICE_CACHE["updated_at"] = 0.0
+        _HERO_SMS_PRICE_CACHE["items"] = []
+
+
+def get_hero_sms_runtime_stats() -> dict[str, float]:
+    with _HERO_SMS_STATS_LOCK:
+        return {
+            "spent_total_usd": round(
+                max(0.0, float(_HERO_SMS_RUNTIME.get("spent_total_usd") or 0.0)),
+                4,
+            ),
+            "balance_last_usd": round(
+                float(_HERO_SMS_RUNTIME.get("balance_last_usd") or -1.0),
+                4,
+            ),
+            "balance_start_usd": round(
+                float(_HERO_SMS_RUNTIME.get("balance_start_usd") or -1.0),
+                4,
+            ),
+            "updated_at": float(_HERO_SMS_RUNTIME.get("updated_at") or 0.0),
+        }
+
+
+def _hero_sms_api_key() -> str:
+    return str(os.getenv("HERO_SMS_API_KEY", "") or "").strip()
+
+
+def _hero_sms_enabled() -> bool:
+    if not _env_bool("HERO_SMS_ENABLED", False):
+        return False
+    return bool(_hero_sms_api_key())
+
+
+def _hero_sms_base_url() -> str:
+    raw = str(
+        os.getenv("HERO_SMS_BASE_URL", "https://hero-sms.com/stubs/handler_api.php")
+        or "https://hero-sms.com/stubs/handler_api.php"
+    ).strip()
+    return raw or "https://hero-sms.com/stubs/handler_api.php"
+
+
+def _hero_sms_request(
+    action: str,
+    *,
+    proxies: Any,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 25,
+) -> tuple[bool, str, Any]:
+    key = _hero_sms_api_key()
+    if not key:
+        return False, "NO_KEY", None
+
+    query: Dict[str, Any] = {
+        "action": str(action or "").strip(),
+        "api_key": key,
+    }
+    if isinstance(params, dict):
+        for k, v in params.items():
+            if v is None:
+                continue
+            sv = str(v).strip() if isinstance(v, str) else v
+            if sv == "":
+                continue
+            query[str(k)] = sv
+
+    try:
+        resp = requests.get(
+            _hero_sms_base_url(),
+            params=query,
+            proxies=proxies,
+            verify=_ssl_verify(),
+            timeout=timeout,
+            impersonate="chrome131",
+        )
+    except Exception as e:
+        return False, f"REQUEST_ERROR:{e}", None
+
+    code = int(getattr(resp, "status_code", 0) or 0)
+    text = str(getattr(resp, "text", "") or "").strip()
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+    if not (200 <= code < 300):
+        if text:
+            return False, text, data
+        return False, f"HTTP {code}", data
+    return True, text, data
+
+
+def hero_sms_get_balance(proxies: Any = None) -> tuple[float, str]:
+    ok, text, data = _hero_sms_request("getBalance", proxies=proxies, timeout=20)
+    if not ok:
+        return -1.0, str(text or "getBalance failed")
+
+    line = str(text or "").strip()
+    if line.upper().startswith("ACCESS_BALANCE:"):
+        raw = line.split(":", 1)[1].strip()
+        try:
+            value = float(raw)
+            _hero_sms_update_runtime(balance=value, init_start=True)
+            return value, ""
+        except Exception:
+            pass
+
+    if isinstance(data, dict):
+        candidates = [
+            data.get("balance"),
+            data.get("amount"),
+            data.get("data"),
+        ]
+        for val in candidates:
+            try:
+                if isinstance(val, dict):
+                    num = float(val.get("balance") or val.get("amount") or -1)
+                else:
+                    num = float(val)
+            except Exception:
+                continue
+            if num >= 0:
+                _hero_sms_update_runtime(balance=num, init_start=True)
+                return num, ""
+
+    return -1.0, line or "无法解析余额"
+
+
+def _hero_sms_resolve_service_code(proxies: Any) -> str:
+    global _HERO_SMS_SERVICE_CACHE
+
+    raw = str(os.getenv("HERO_SMS_SERVICE", "") or "").strip()
+    if raw and raw.lower() not in {"auto", "openai", "chatgpt", "gpt", "codex"}:
+        return raw
+    if _HERO_SMS_SERVICE_CACHE:
+        return _HERO_SMS_SERVICE_CACHE
+
+    ok, _, data = _hero_sms_request(
+        "getServicesList",
+        proxies=proxies,
+        params={"lang": "en"},
+        timeout=30,
+    )
+    services: List[Dict[str, Any]] = []
+    if ok and isinstance(data, dict):
+        if isinstance(data.get("services"), list):
+            services = [x for x in data.get("services") if isinstance(x, dict)]
+        elif isinstance(data.get("data"), list):
+            services = [x for x in data.get("data") if isinstance(x, dict)]
+
+    selected = ""
+    for item in services:
+        code = str(item.get("code") or item.get("id") or "").strip()
+        name = str(item.get("name") or item.get("title") or item.get("eng") or "").strip()
+        low = f"{code} {name}".lower()
+        if "openai" in low:
+            selected = code
+            break
+    if not selected:
+        for item in services:
+            code = str(item.get("code") or item.get("id") or "").strip()
+            name = str(item.get("name") or item.get("title") or item.get("eng") or "").strip()
+            low = f"{code} {name}".lower()
+            if any(k in low for k in ("chatgpt", "codex", "gpt")):
+                selected = code
+                break
+
+    if not selected:
+        selected = "dr"
+
+    _HERO_SMS_SERVICE_CACHE = selected
+    _info(f"HeroSMS 服务代码: {selected}")
+    return selected
+
+
+def _hero_sms_resolve_country_id(proxies: Any) -> int:
+    raw = str(os.getenv("HERO_SMS_COUNTRY", "US") or "US").strip()
+    if not raw:
+        raw = "US"
+    if raw.isdigit():
+        return max(0, int(raw))
+
+    key = raw.upper()
+    if key in _HERO_SMS_COUNTRY_CACHE:
+        return int(_HERO_SMS_COUNTRY_CACHE[key])
+
+    wanted_tokens = {
+        key,
+        key.replace(" ", ""),
+    }
+    if key in {"US", "USA", "UNITEDSTATES", "UNITED STATES", "AMERICA"}:
+        wanted_tokens.update({"US", "USA", "UNITEDSTATES", "UNITED STATES"})
+
+    ok, _, data = _hero_sms_request("getCountries", proxies=proxies, timeout=30)
+    countries: List[Dict[str, Any]] = []
+    if ok and isinstance(data, list):
+        countries = [x for x in data if isinstance(x, dict)]
+
+    matched = -1
+    for item in countries:
+        cid = item.get("id")
+        try:
+            cid_i = int(cid)
+        except Exception:
+            continue
+        names = [
+            str(item.get("eng") or "").strip().upper(),
+            str(item.get("rus") or "").strip().upper(),
+            str(item.get("chn") or "").strip().upper(),
+            str(item.get("iso") or "").strip().upper(),
+            str(item.get("iso2") or "").strip().upper(),
+        ]
+        compact = {x.replace(" ", "") for x in names if x}
+        exact = {x for x in names if x}
+        if wanted_tokens & exact or wanted_tokens & compact:
+            matched = cid_i
+            break
+
+    if matched < 0 and key in {"US", "USA", "UNITEDSTATES", "UNITED STATES", "AMERICA"}:
+        matched = 187
+    if matched < 0:
+        matched = 0
+
+    _HERO_SMS_COUNTRY_CACHE[key] = matched
+    _info(f"HeroSMS 国家ID: {matched} ({raw})")
+    return matched
+
+
+def _hero_sms_set_status(activation_id: str, status: int, proxies: Any) -> str:
+    if not activation_id:
+        return ""
+    _, text, _ = _hero_sms_request(
+        "setStatus",
+        proxies=proxies,
+        params={"id": activation_id, "status": int(status)},
+        timeout=20,
+    )
+    return str(text or "")
+
+
+def _hero_sms_mark_ready_enabled() -> bool:
+    """与 hero-sms 官方 SDK 一致：取号后 setStatus(1) 表示就绪、开始接收短信。"""
+    return _env_bool("HERO_SMS_MARK_READY", True)
+
+
+def _hero_sms_order_max_price() -> float:
+    """getNumber 可选参数 maxPrice（美元）；0 表示不传，由平台按默认价格取号。"""
+    return _env_float("HERO_SMS_ORDER_MAX_PRICE", 0.0, 0.0, 500.0)
+
+
+def _hero_sms_mark_ready(activation_id: str, proxies: Any) -> None:
+    if not activation_id or not _hero_sms_mark_ready_enabled():
+        return
+    resp = _hero_sms_set_status(activation_id, 1, proxies)
+    if resp:
+        low = str(resp).strip().upper()
+        if low.startswith("ACCESS_") or "OK" in low:
+            _info(f"HeroSMS 标记就绪 setStatus(1): {resp}")
+        else:
+            _warn(f"HeroSMS setStatus(1) 返回异常（仍将尝试发码）: {resp}")
+    else:
+        _info("HeroSMS setStatus(1) 已调用（无文本响应）")
+
+
+def _is_hero_sms_balance_issue(reason: str) -> bool:
+    low = str(reason or "").strip().lower()
+    if not low:
+        return False
+    return "no_balance" in low or "余额不足" in low
+
+
+def _is_hero_sms_timeout_issue(reason: str) -> bool:
+    low = str(reason or "").strip().lower()
+    if not low:
+        return False
+    return "接码超时" in low or "status_wait_code" in low or "timeout" in low
+
+
+def _is_hero_sms_country_blocked_issue(reason: str) -> bool:
+    low = str(reason or "").strip().lower()
+    if not low:
+        return False
+    return "country_blocked" in low or "国家受限" in low
+
+
+def _hero_sms_get_number(
+    proxies: Any,
+    *,
+    service_code: str = "",
+    country_id: int | None = None,
+) -> tuple[str, str, str]:
+    svc = str(service_code or "").strip() or _hero_sms_resolve_service_code(proxies)
+    ctry = int(country_id) if country_id is not None else _hero_sms_resolve_country_id(proxies)
+    if int(ctry) in _OPENAI_SMS_BLOCKED_COUNTRY_IDS:
+        return "", "", f"COUNTRY_BLOCKED: 国家ID {ctry} 不支持 OpenAI 注册"
+    min_balance = _hero_sms_min_balance_limit()
+    _info(f"HeroSMS 取号参数: service={svc}, country={ctry}")
+
+    balance_now, balance_err = hero_sms_get_balance(proxies)
+    if balance_now >= 0:
+        _info(
+            "HeroSMS 当前余额: "
+            f"${balance_now:.2f}（下限 ${min_balance:.2f}）"
+        )
+        if balance_now < min_balance:
+            return "", "", f"NO_BALANCE: 当前余额 ${balance_now:.2f} < 下限 ${min_balance:.2f}"
+    elif balance_err:
+        _warn(f"HeroSMS 余额查询失败: {balance_err}")
+
+    params: Dict[str, Any] = {
+        "service": svc,
+        "country": ctry,
+    }
+    max_px = _hero_sms_order_max_price()
+    if max_px > 0:
+        params["maxPrice"] = max_px
+        _info(f"HeroSMS getNumber maxPrice={max_px}")
+
+    ok, text, data = _hero_sms_request("getNumber", proxies=proxies, params=params, timeout=30)
+    if not ok:
+        return "", "", str(text or "getNumber failed")
+
+    line = str(text or "").strip()
+    if line.upper().startswith("ACCESS_NUMBER:"):
+        parts = line.split(":", 2)
+        if len(parts) >= 3:
+            activation_id = str(parts[1] or "").strip()
+            phone_raw = str(parts[2] or "").strip()
+            if activation_id and phone_raw:
+                phone = phone_raw if phone_raw.startswith("+") else f"+{phone_raw}"
+                return activation_id, phone, ""
+
+    if isinstance(data, dict):
+        activation_id = str(
+            data.get("activationId")
+            or data.get("activation_id")
+            or data.get("id")
+            or ""
+        ).strip()
+        phone_raw = str(
+            data.get("phoneNumber")
+            or data.get("phone")
+            or data.get("number")
+            or ""
+        ).strip()
+        if activation_id and phone_raw:
+            phone = phone_raw if phone_raw.startswith("+") else f"+{phone_raw}"
+            return activation_id, phone, ""
+
+    return "", "", line or "NO_NUMBERS"
+
+
+def _hero_sms_poll_code(activation_id: str, proxies: Any) -> str:
+    if not activation_id:
+        return ""
+    timeout_sec = _env_int("HERO_SMS_POLL_TIMEOUT_SEC", 120, 20, 900)
+    interval_sec = _env_float("HERO_SMS_POLL_INTERVAL_SEC", 3.0, 1.0, 30.0)
+    progress_sec = _env_int("HERO_SMS_POLL_PROGRESS_SEC", 8, 3, 120)
+    resend_after_sec = _env_int("HERO_SMS_RESEND_AFTER_SEC", 24, 0, 300)
+
+    started_at = time.time()
+    next_progress_at = float(progress_sec)
+    resent_once = False
+    last_status = ""
+
+    _info(
+        "HeroSMS 等待短信验证码: "
+        f"activation_id={activation_id}, timeout={timeout_sec}s"
+    )
+
+    def _try_resend(reason: str) -> None:
+        nonlocal resent_once
+        if resent_once:
+            return
+        if resend_after_sec <= 0:
+            return
+        resend_resp = _hero_sms_set_status(activation_id, 3, proxies)
+        resent_once = True
+        if resend_resp:
+            _info(f"HeroSMS 请求重发验证码({reason}): {resend_resp}")
+        else:
+            _info(f"HeroSMS 请求重发验证码({reason})")
+
+    while time.time() - started_at < timeout_sec:
+        _raise_if_stopped()
+        ok, text, data = _hero_sms_request(
+            "getStatus",
+            proxies=proxies,
+            params={"id": activation_id},
+            timeout=20,
+        )
+        line = str(text or "").strip()
+        upper = line.upper()
+
+        status_tag = ""
+        if upper:
+            if ":" in upper:
+                status_tag = upper.split(":", 1)[0].strip()
+            else:
+                status_tag = upper
+        if not status_tag and isinstance(data, dict):
+            status_tag = str(
+                data.get("status")
+                or data.get("title")
+                or data.get("message")
+                or ""
+            ).strip().upper()
+        if status_tag and status_tag != last_status:
+            last_status = status_tag
+            _info(f"HeroSMS 状态: {status_tag}")
+
+        if ok and upper.startswith("STATUS_OK"):
+            if ":" in line:
+                code = line.split(":", 1)[1].strip()
+            else:
+                code = ""
+            if not code and isinstance(data, dict):
+                sms_obj = data.get("sms") if isinstance(data.get("sms"), dict) else {}
+                code = str(sms_obj.get("code") or data.get("code") or "").strip()
+            if code:
+                return code
+
+        if status_tag in {"STATUS_WAIT_RETRY", "STATUS_WAIT_RESEND"}:
+            _try_resend(status_tag)
+
+        if status_tag in {"STATUS_CANCEL", "NO_ACTIVATION", "BAD_STATUS"}:
+            return ""
+        if isinstance(data, dict):
+            title = str(data.get("title") or "").strip().upper()
+            if title in {"STATUS_CANCEL", "NO_ACTIVATION", "BAD_STATUS"}:
+                return ""
+
+        elapsed = time.time() - started_at
+        if (not resent_once) and resend_after_sec > 0 and elapsed >= float(resend_after_sec):
+            _try_resend("timeout")
+
+        if elapsed >= next_progress_at:
+            left = max(0, int(timeout_sec - elapsed))
+            _info(f"HeroSMS 等码中... 已等待 {int(elapsed)}s，剩余约 {left}s")
+            next_progress_at += float(progress_sec)
+
+        if _sleep_interruptible(interval_sec):
+            raise UserStoppedError("stopped_by_user")
+    _warn(f"HeroSMS 等码超时: {timeout_sec}s")
+    return ""
+
+
+def _try_verify_phone_via_hero_sms(
+    session: requests.Session,
+    *,
+    proxies: Any,
+    hint_url: str = "",
+) -> tuple[bool, str]:
+    if not _hero_sms_enabled():
+        if not _env_bool("HERO_SMS_ENABLED", False):
+            return False, "HeroSMS 未启用"
+        return False, "HeroSMS API Key 未配置"
+
+    max_tries = _env_int("HERO_SMS_MAX_TRIES", 3, 1, 6)
+    last_reason = "HeroSMS 手机验证失败"
+    lock_acquired = False
+    serial_on = _env_bool("HERO_SMS_SERIAL_VERIFY", True)
+    wait_sec = _env_int("HERO_SMS_SERIAL_WAIT_SEC", 180, 10, 3600)
+    verify_balance_start = -1.0
+
+    if serial_on:
+        _info("等待 HeroSMS 手机验证锁...")
+        started = time.time()
+        while True:
+            _raise_if_stopped()
+            if _HERO_SMS_VERIFY_LOCK.acquire(timeout=0.5):
+                lock_acquired = True
+                break
+            if time.time() - started >= wait_sec:
+                return False, "HeroSMS 手机验证排队超时"
+
+    def _verify_once(
+        activation_id: str,
+        phone_number: str,
+        *,
+        source: str,
+        close_on_success: bool,
+        cancel_on_fail: bool,
+    ) -> tuple[bool, str, str]:
+        finished = False
+        fail_reason = ""
+        try:
+            send_headers: Dict[str, str] = {
+                "referer": "https://auth.openai.com/add-phone",
+                "accept": "application/json",
+                "content-type": "application/json",
+            }
+            send_sentinel = _build_sentinel_for_session(session, "authorize_continue", proxies)
+            if send_sentinel:
+                send_headers["openai-sentinel-token"] = send_sentinel
+
+            _hero_sms_mark_ready(activation_id, proxies)
+
+            send_resp = _post_with_retry(
+                session,
+                "https://auth.openai.com/api/accounts/add-phone/send",
+                headers=send_headers,
+                json_body={"phone_number": phone_number},
+                proxies=proxies,
+                timeout=30,
+                retries=1,
+            )
+            _info(f"{source} add-phone/send HTTP {send_resp.status_code}")
+            if send_resp.status_code == 200:
+                try:
+                    sj = send_resp.json()
+                except Exception:
+                    sj = None
+                if isinstance(sj, dict):
+                    if sj.get("success") is False:
+                        _warn(
+                            f"{source} add-phone/send 业务失败: "
+                            f"{str(sj.get('message') or sj.get('error') or sj)[:280]}"
+                        )
+                    err_v = sj.get("error")
+                    if err_v and sj.get("success") is not False:
+                        _warn(f"{source} add-phone/send 返回含 error 字段: {str(err_v)[:240]}")
+            if send_resp.status_code != 200:
+                fail_reason = f"发送手机验证码失败: HTTP {send_resp.status_code}"
+                _warn(f"{source} {fail_reason} | {str(send_resp.text or '')[:240]}")
+                return False, "", fail_reason
+
+            sms_code = _hero_sms_poll_code(activation_id, proxies)
+            if not sms_code:
+                fail_reason = "接码超时，未收到手机验证码"
+                _warn(f"{source} {fail_reason}")
+                return False, "", fail_reason
+            _info(f"{source} HeroSMS 收到手机验证码: {sms_code}")
+
+            verify_headers: Dict[str, str] = {
+                "referer": "https://auth.openai.com/phone-verification",
+                "accept": "application/json",
+                "content-type": "application/json",
+            }
+            verify_sentinel = _build_sentinel_for_session(session, "authorize_continue", proxies)
+            if verify_sentinel:
+                verify_headers["openai-sentinel-token"] = verify_sentinel
+
+            verify_resp = _post_with_retry(
+                session,
+                "https://auth.openai.com/api/accounts/phone-otp/validate",
+                headers=verify_headers,
+                json_body={"code": sms_code},
+                proxies=proxies,
+                timeout=30,
+                retries=1,
+            )
+            _info(f"{source} phone-otp/validate HTTP {verify_resp.status_code}")
+            if verify_resp.status_code != 200:
+                fail_reason = f"手机验证码校验失败: HTTP {verify_resp.status_code}"
+                _warn(f"{source} {fail_reason} | {str(verify_resp.text or '')[:240]}")
+                return False, "", fail_reason
+
+            if close_on_success:
+                _hero_sms_set_status(activation_id, 6, proxies)
+            else:
+                keep_resp = _hero_sms_set_status(activation_id, 3, proxies)
+                if keep_resp:
+                    _info(f"{source} 复用保持激活: {keep_resp}")
+            finished = True
+
+            try:
+                vj = verify_resp.json() or {}
+            except Exception:
+                vj = {}
+            next_url = _extract_next_url(vj).strip() or str(vj.get("continue_url") or "").strip()
+            if next_url and not next_url.startswith("http"):
+                next_url = (
+                    f"https://auth.openai.com{next_url}"
+                    if next_url.startswith("/")
+                    else next_url
+                )
+            if next_url:
+                try:
+                    _, follow_url = _follow_redirect_chain(session, next_url, proxies)
+                    if follow_url:
+                        next_url = follow_url
+                except UserStoppedError:
+                    raise
+                except Exception:
+                    pass
+            if not next_url:
+                next_url = str(hint_url or "").strip()
+            return True, next_url, ""
+        except UserStoppedError:
+            raise
+        except Exception as e:
+            fail_reason = f"手机验证异常: {e}"
+            _warn(f"{source} {fail_reason}")
+            return False, "", fail_reason
+        finally:
+            if (not finished) and cancel_on_fail:
+                _hero_sms_set_status(activation_id, 8, proxies)
+
+    try:
+        verify_balance_start, _ = hero_sms_get_balance(proxies)
+        if verify_balance_start >= 0:
+            _hero_sms_update_runtime(balance=verify_balance_start, init_start=True)
+
+        service_code = _hero_sms_resolve_service_code(proxies)
+        preferred_country_id = _hero_sms_resolve_country_id(proxies)
+        _info(
+            "HeroSMS 国家策略: "
+            f"超时阈值={_hero_sms_country_timeout_limit()}次, "
+            f"冷却={_hero_sms_country_cooldown_sec()}s"
+        )
+        country_id = _hero_sms_pick_country_id(
+            proxies,
+            service_code=service_code,
+            preferred_country=preferred_country_id,
+        )
+        if country_id != preferred_country_id:
+            _warn(
+                f"HeroSMS 国家自动切换: {preferred_country_id} -> {country_id}"
+            )
+        reuse_on = _hero_sms_reuse_enabled()
+
+        if reuse_on:
+            reuse_id, reuse_phone, reuse_used = _hero_sms_reuse_get(service_code, country_id)
+            if reuse_id and reuse_phone:
+                _info(
+                    "HeroSMS 尝试复用手机号: "
+                    f"activation_id={reuse_id}, phone={reuse_phone}, used={reuse_used}"
+                )
+                ok_reuse, next_reuse, reason_reuse = _verify_once(
+                    reuse_id,
+                    reuse_phone,
+                    source="复用号码",
+                    close_on_success=False,
+                    cancel_on_fail=False,
+                )
+                if ok_reuse:
+                    _hero_sms_country_mark_success(country_id)
+                    _hero_sms_reuse_touch(increase=True)
+                    return True, next_reuse
+                last_reason = reason_reuse or "复用手机号失败"
+                if _is_hero_sms_timeout_issue(last_reason):
+                    switched = _hero_sms_country_mark_timeout(country_id)
+                    if switched:
+                        _hero_sms_set_status(reuse_id, 8, proxies)
+                        _hero_sms_reuse_clear()
+                        next_country = _hero_sms_pick_country_id(
+                            proxies,
+                            service_code=service_code,
+                            preferred_country=preferred_country_id,
+                        )
+                        if next_country != country_id:
+                            _warn(
+                                "当前国家接码超时达到阈值，自动切换国家: "
+                                f"{country_id} -> {next_country}"
+                            )
+                            country_id = next_country
+                        else:
+                            _hero_sms_reuse_touch(increase=True)
+                            _hero_sms_set_status(reuse_id, 3, proxies)
+                            _warn(f"复用手机号未收到短信，保留号码待下次继续: {last_reason}")
+                            return False, "接码超时，已保留复用号码"
+                    else:
+                        _hero_sms_reuse_touch(increase=True)
+                        _hero_sms_set_status(reuse_id, 3, proxies)
+                        _warn(f"复用手机号未收到短信，保留号码待下次继续: {last_reason}")
+                        return False, "接码超时，已保留复用号码"
+                _warn(f"复用手机号失败，改为新购号码: {last_reason}")
+                _hero_sms_set_status(reuse_id, 8, proxies)
+                _hero_sms_reuse_clear()
+
+        for attempt in range(1, max_tries + 1):
+            _raise_if_stopped()
+            activation_id, phone_number, get_err = _hero_sms_get_number(
+                proxies,
+                service_code=service_code,
+                country_id=country_id,
+            )
+            if not activation_id or not phone_number:
+                last_reason = f"取号失败: {get_err or 'NO_NUMBERS'}"
+                _warn(f"HeroSMS 第 {attempt}/{max_tries} 次取号失败: {get_err or 'NO_NUMBERS'}")
+                if _is_hero_sms_balance_issue(get_err):
+                    break
+                if _is_hero_sms_country_blocked_issue(get_err):
+                    break
+                if _sleep_interruptible(1.2):
+                    raise UserStoppedError("stopped_by_user")
+                continue
+
+            _info(
+                "HeroSMS 取号成功: "
+                f"第 {attempt}/{max_tries} 次, activation_id={activation_id}, phone={phone_number}"
+            )
+            ok_new, next_new, reason_new = _verify_once(
+                activation_id,
+                phone_number,
+                source=f"新购号码#{attempt}",
+                close_on_success=(not reuse_on),
+                cancel_on_fail=(not reuse_on),
+            )
+            if ok_new:
+                _hero_sms_country_mark_success(country_id)
+                if reuse_on:
+                    _hero_sms_reuse_set(activation_id, phone_number, service_code, country_id)
+                    _hero_sms_reuse_touch(increase=True)
+                return True, next_new
+            last_reason = reason_new or "手机验证失败"
+            if reuse_on and _is_hero_sms_timeout_issue(last_reason):
+                switched = _hero_sms_country_mark_timeout(country_id)
+                if switched:
+                    _hero_sms_set_status(activation_id, 8, proxies)
+                    _hero_sms_reuse_clear()
+                    next_country = _hero_sms_pick_country_id(
+                        proxies,
+                        service_code=service_code,
+                        preferred_country=preferred_country_id,
+                    )
+                    if next_country != country_id:
+                        _warn(
+                            "当前国家接码超时达到阈值，自动切换国家: "
+                            f"{country_id} -> {next_country}"
+                        )
+                        country_id = next_country
+                        continue
+                _hero_sms_reuse_set(activation_id, phone_number, service_code, country_id)
+                _hero_sms_reuse_touch(increase=True)
+                _hero_sms_set_status(activation_id, 3, proxies)
+                _warn("新购号码接码超时，已保留号码供后续复用，停止继续购号")
+                return False, "接码超时，已保留复用号码"
+            if reuse_on:
+                _hero_sms_set_status(activation_id, 8, proxies)
+
+        return False, last_reason
+    finally:
+        try:
+            verify_balance_end, _ = hero_sms_get_balance(proxies)
+            if verify_balance_end >= 0:
+                spent_delta = 0.0
+                if verify_balance_start >= 0:
+                    spent_delta = max(0.0, verify_balance_start - verify_balance_end)
+                _hero_sms_update_runtime(
+                    spent_delta=spent_delta,
+                    balance=verify_balance_end,
+                    init_start=True,
+                )
+        except Exception:
+            pass
+        if lock_acquired:
+            try:
+                _HERO_SMS_VERIFY_LOCK.release()
+            except Exception:
+                pass
+
+
+_BROWSER_FINGERPRINT_POOL: List[Dict[str, str]] = [
+    {
+        "label": "chrome131_win",
+        "impersonate": "chrome131",
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": "Windows",
+    },
+    {
+        "label": "chrome120_win",
+        "impersonate": "chrome120",
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="120", "Chromium";v="120", "Not_A Brand";v="24"',
+        "platform": "Windows",
+    },
+    {
+        "label": "safari17_macos",
+        "impersonate": "safari",
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "sec_ch_ua": '"Not_A Brand";v="99", "Safari";v="17"',
+        "platform": "macOS",
+    },
+]
+
+_ACCEPT_LANGUAGE_POOL = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "zh-CN,zh;q=0.9,en;q=0.8",
+]
+
+
+def _choose_browser_fingerprint() -> Dict[str, str]:
+    random_on = os.getenv("REGISTER_RANDOM_FINGERPRINT", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if not random_on:
+        fp = dict(_BROWSER_FINGERPRINT_POOL[0])
+    else:
+        fp = dict(random.choice(_BROWSER_FINGERPRINT_POOL))
+    fp["accept_language"] = random.choice(_ACCEPT_LANGUAGE_POOL)
+    return fp
+
+
+def _apply_session_fingerprint(session: requests.Session, fp: Dict[str, str]) -> None:
+    setattr(session, "_fp_impersonate", str(fp.get("impersonate") or "safari"))
+    session.headers.update(
+        {
+            "User-Agent": str(fp.get("ua") or ""),
+            "Accept-Language": str(fp.get("accept_language") or "en-US,en;q=0.9"),
+            "sec-ch-ua": str(fp.get("sec_ch_ua") or ""),
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": f'"{str(fp.get("platform") or "Windows")}"',
+        }
+    )
 
 
 def _email_domain(email: str) -> str:
@@ -151,14 +1542,20 @@ def _email_domain(email: str) -> str:
         return ""
 
 
-def _mail_service_signature() -> tuple[str, str, str, str, bool]:
+def _mail_service_signature() -> tuple[str, str, str, str, bool, str, str, str]:
     provider = normalize_mail_provider(MAIL_SERVICE_PROVIDER)
+    graph_accounts_file = str(os.getenv("GRAPH_ACCOUNTS_FILE", "") or "").strip()
+    graph_tenant = str(os.getenv("GRAPH_TENANT", "common") or "common").strip()
+    graph_fetch_mode = str(os.getenv("GRAPH_FETCH_MODE", "graph_api") or "graph_api").strip()
     return (
         provider,
         str(WORKER_DOMAIN or "").strip().rstrip("/"),
         str(FREEMAIL_USERNAME or "").strip(),
         str(FREEMAIL_PASSWORD or ""),
         _ssl_verify(),
+        graph_accounts_file,
+        graph_tenant,
+        graph_fetch_mode,
     )
 
 
@@ -179,7 +1576,10 @@ def _get_mail_service_client():
     if _mail_service_client is not None and _mail_service_sig == sig:
         return _mail_service_client
 
-    provider, base_url, username, password, verify_ssl = sig
+    provider, base_url, username, password, verify_ssl, graph_accounts_file, graph_tenant, graph_fetch_mode = sig
+    os.environ["GRAPH_ACCOUNTS_FILE"] = graph_accounts_file
+    os.environ["GRAPH_TENANT"] = graph_tenant
+    os.environ["GRAPH_FETCH_MODE"] = graph_fetch_mode
     try:
         client = build_mail_service(
             provider,
@@ -198,87 +1598,158 @@ def _get_mail_service_client():
 
 def get_email_and_token(proxies: Any = None) -> tuple:
     """创建临时邮箱并获取 Token 以兼容原流程"""
+    _set_mailbox_init_error()
+    _raise_if_stopped()
     try:
         client = _get_mail_service_client()
-        allow_domains = [str(x).strip() for x in (MAIL_ALLOWED_DOMAINS or []) if str(x).strip()]
-        if allow_domains:
-            _info(f"已指定注册域名 {len(allow_domains)} 个")
-        random_domain = os.getenv("MAILFREE_RANDOM_DOMAIN", "1").strip().lower() not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
-        try:
-            domains = client.list_domains(proxies=proxies)
-        except Exception:
-            domains = []
+        provider = normalize_mail_provider(MAIL_SERVICE_PROVIDER)
+        allow_domains: List[str] = []
+        random_domain = True
+        mailbox_prefix = ""
+        mailbox_random_len = 0
 
-        effective_domains: List[str] = []
-        if domains:
+        if provider == "mailfree":
+            allow_domains = [str(x).strip() for x in (MAIL_ALLOWED_DOMAINS or []) if str(x).strip()]
             if allow_domains:
-                allow_set = {str(x).strip().lower() for x in allow_domains if str(x).strip()}
-                effective_domains = [
-                    str(d).strip()
-                    for d in domains
-                    if str(d).strip() and str(d).strip().lower() in allow_set
-                ]
-                missing = [
-                    str(x).strip()
-                    for x in allow_domains
-                    if str(x).strip()
-                    and str(x).strip().lower() not in {str(d).strip().lower() for d in domains}
-                ]
-                if missing:
-                    show = ", ".join(missing[:4])
-                    suffix = "..." if len(missing) > 4 else ""
-                    _warn(f"指定域名不可用 {len(missing)} 个: {show}{suffix}")
-            else:
-                effective_domains = [str(d).strip() for d in domains if str(d).strip()]
+                _info(f"已指定注册域名 {len(allow_domains)} 个")
+            random_domain = os.getenv("MAILFREE_RANDOM_DOMAIN", "1").strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+            mailbox_custom_enabled = os.getenv("MAILBOX_CUSTOM_ENABLED", "0").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            mailbox_prefix = (
+                str(os.getenv("MAILBOX_PREFIX", "") or "").strip()
+                if mailbox_custom_enabled
+                else ""
+            )
+            mailbox_random_len = (
+                _env_int("MAILBOX_RANDOM_LENGTH", 0, 0, 32)
+                if mailbox_custom_enabled
+                else 0
+            )
+            if mailbox_prefix or mailbox_random_len > 0:
+                _info(
+                    "邮箱本地名规则: "
+                    f"prefix={mailbox_prefix or '-'}"
+                    f", random_len={mailbox_random_len}"
+                )
+            try:
+                domains = client.list_domains(proxies=proxies)
+            except Exception:
+                domains = []
 
-        if effective_domains:
-            if random_domain:
+            effective_domains: List[str] = []
+            if domains:
                 if allow_domains:
-                    _info(f"mailfree 将在已选域名 {len(effective_domains)} 个中随机切换")
+                    allow_set = {str(x).strip().lower() for x in allow_domains if str(x).strip()}
+                    effective_domains = [
+                        str(d).strip()
+                        for d in domains
+                        if str(d).strip() and str(d).strip().lower() in allow_set
+                    ]
+                    missing = [
+                        str(x).strip()
+                        for x in allow_domains
+                        if str(x).strip()
+                        and str(x).strip().lower() not in {str(d).strip().lower() for d in domains}
+                    ]
+                    if missing:
+                        show = ", ".join(missing[:4])
+                        suffix = "..." if len(missing) > 4 else ""
+                        _warn(f"指定域名不可用 {len(missing)} 个: {show}{suffix}")
                 else:
-                    _info(f"mailfree 可用域名 {len(effective_domains)} 个，注册时随机切换")
+                    effective_domains = [str(d).strip() for d in domains if str(d).strip()]
+
+            if effective_domains:
+                if random_domain:
+                    if allow_domains:
+                        _info(f"mailfree 将在已选域名 {len(effective_domains)} 个中随机切换")
+                    else:
+                        _info(f"mailfree 可用域名 {len(effective_domains)} 个，注册时随机切换")
+                else:
+                    fixed_domain = str(effective_domains[0]).strip()
+                    if allow_domains:
+                        _info(
+                            f"mailfree 已选域名 {len(effective_domains)} 个，"
+                            f"当前固定使用 {fixed_domain}"
+                        )
+                    else:
+                        _info(f"mailfree 可用域名 {len(effective_domains)} 个，当前固定使用 {fixed_domain}")
+            elif domains:
+                _warn("指定域名均不可用，将由服务端默认域名策略兜底")
             else:
-                fixed_domain = str(effective_domains[0]).strip()
-                if allow_domains:
-                    _info(
-                        f"mailfree 已选域名 {len(effective_domains)} 个，"
-                        f"当前固定使用 {fixed_domain}"
-                    )
-                else:
-                    _info(f"mailfree 可用域名 {len(effective_domains)} 个，当前固定使用 {fixed_domain}")
-        elif domains:
-            _warn("指定域名均不可用，将由服务端默认域名策略兜底")
+                _warn("mailfree 未返回可用域名列表，将由服务端默认域名策略兜底")
         else:
-            _warn("mailfree 未返回可用域名列表，将由服务端默认域名策略兜底")
+            _info("Graph 模式：忽略 MailFree 域名/前缀规则，直接从账号池取邮箱")
 
-        for _ in range(5):
+        pick_rounds = 5
+        if provider == "graph":
+            pick_rounds = 30
+        for _ in range(pick_rounds):
+            _raise_if_stopped()
             try:
                 email = client.generate_mailbox(
                     random_domain=random_domain,
                     allowed_domains=allow_domains,
+                    local_prefix=mailbox_prefix,
+                    random_length=mailbox_random_len,
                     proxies=proxies,
                 )
             except MailServiceError as e:
-                _warn(f"临时邮箱生成失败，准备重试: {e}")
+                err_text = str(e)
+                _warn(f"临时邮箱生成失败，准备重试: {err_text}")
+                if provider == "graph" and (
+                    "graph 账号池为空" in err_text.lower()
+                    or "graph 账号文件为空" in err_text.lower()
+                    or "graph 账号文件不存在" in err_text.lower()
+                ):
+                    _set_mailbox_init_error("graph_pool_exhausted", err_text)
+                    _err("Graph 账号池已耗尽，停止本轮注册")
+                    return "", ""
                 email = ""
             if email:
+                _raise_if_stopped()
+                if provider == "graph" and str(email).strip().lower() in _GRAPH_BAD_EMAILS:
+                    _warn(f"跳过已标记不可用 Graph 邮箱: {email}")
+                    continue
+                if provider == "graph":
+                    try:
+                        refresh_res = client.refresh_mailbox_token(email, proxies=proxies)
+                        token_hint = str((refresh_res or {}).get("token_prefix") or "").strip()
+                        if token_hint:
+                            _info(f"Graph 邮箱令牌已刷新: {email} · {token_hint}")
+                        else:
+                            _info(f"Graph 邮箱令牌已刷新: {email}")
+                    except Exception as e:
+                        _warn(f"Graph 邮箱令牌刷新失败，剔除后重试: {email} -> {e}")
+                        _mark_graph_bad_email(email, "token_refresh_failed")
+                        continue
                 return email, email
 
         _err("临时邮箱创建失败")
+        if provider == "graph":
+            _set_mailbox_init_error("graph_pool_exhausted", "Graph 账号池无可用邮箱")
         return "", ""
+    except UserStoppedError:
+        raise
     except Exception as e:
         _err(f"请求临时邮箱 API 出错: {e}")
+        if normalize_mail_provider(MAIL_SERVICE_PROVIDER) == "graph":
+            _set_mailbox_init_error("graph_pool_exhausted", str(e))
         return "", ""
 
 
 def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
     """轮询 Worker 邮箱取 OpenAI 6 位码；邮件按 id 降序优先看较新。"""
     _ = token
+    _raise_if_stopped()
     try:
         client = _get_mail_service_client()
     except Exception as e:
@@ -289,12 +1760,16 @@ def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
     poll_rounds = _env_int("OTP_POLL_MAX_ROUNDS", 40, 5, 300)
     poll_interval = _env_float("OTP_POLL_INTERVAL_SEC", 3.0, 0.2, 15.0)
 
+    def _progress_tick() -> None:
+        _raise_if_stopped()
+        _out(".", end="", flush=True)
+
     code = client.poll_otp_code(
         email,
         poll_rounds=poll_rounds,
         poll_interval=poll_interval,
         proxies=proxies,
-        progress_cb=lambda: _out(".", end="", flush=True),
+        progress_cb=_progress_tick,
     )
     if code:
         _out(f"\n[*] 已收到验证码: {code}")
@@ -414,6 +1889,140 @@ def _oai_auth_session_claims(cookie_val: str) -> Dict[str, Any]:
     return {}
 
 
+def _extract_workspaces_from_claims(claims: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    raw = claims.get("workspaces")
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            wid = str(item.get("id") or item.get("workspace_id") or "").strip()
+            if not wid:
+                continue
+            normalized = dict(item)
+            normalized["id"] = wid
+            rows.append(normalized)
+    if rows:
+        return rows
+
+    single = claims.get("workspace")
+    if isinstance(single, dict):
+        wid = str(single.get("id") or single.get("workspace_id") or "").strip()
+        if wid:
+            return [{"id": wid}]
+
+    wid = str(claims.get("workspace_id") or claims.get("default_workspace_id") or "").strip()
+    if wid:
+        return [{"id": wid}]
+    return []
+
+
+def _session_workspaces(session: requests.Session) -> tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
+    auth_cookie = str(session.cookies.get("oai-client-auth-session") or "").strip()
+    if not auth_cookie:
+        return "", {}, []
+    claims = _oai_auth_session_claims(auth_cookie)
+    return auth_cookie, claims, _extract_workspaces_from_claims(claims)
+
+
+def _extract_workspaces_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, dict):
+        rows = _extract_workspaces_from_claims(payload)
+        if rows:
+            return rows
+        for key in ("data", "session", "account", "user", "result"):
+            sub = payload.get(key)
+            if isinstance(sub, dict):
+                rows = _extract_workspaces_from_claims(sub)
+                if rows:
+                    return rows
+    return []
+
+
+def _fetch_workspaces_from_api(session: requests.Session, proxies: Any) -> tuple[List[Dict[str, Any]], str]:
+    endpoints = (
+        "https://auth.openai.com/api/accounts/me",
+        "https://auth.openai.com/api/accounts/session",
+        "https://auth.openai.com/api/accounts/workspaces",
+    )
+    for ep in endpoints:
+        try:
+            resp = _session_get_with_tls_retry(
+                session,
+                ep,
+                proxies=proxies,
+                allow_redirects=False,
+                timeout=15,
+                max_attempts=2,
+            )
+        except UserStoppedError:
+            raise
+        except Exception:
+            continue
+
+        code = int(getattr(resp, "status_code", 0) or 0)
+        if code in {401, 403, 404}:
+            continue
+        try:
+            data = resp.json() or {}
+        except Exception:
+            continue
+
+        rows = _extract_workspaces_from_payload(data)
+        if rows:
+            return rows, ep
+    return [], ""
+
+
+def _refresh_workspace_candidates(
+    session: requests.Session,
+    proxies: Any,
+    *,
+    hint_url: str = "",
+    base_referer: str = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+) -> tuple[List[Dict[str, Any]], str]:
+    referer = str(base_referer or "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+    wait_workspace = _env_float("REGISTER_WORKSPACE_WAIT_SEC", 0.5, 0.0, 3.0)
+    rounds = _env_int("REGISTER_WORKSPACE_REFRESH_ROUNDS", 3, 1, 8)
+
+    urls: List[str] = ["https://auth.openai.com/workspace"]
+    hint = str(hint_url or "").strip()
+    if hint.startswith("http") and hint not in urls:
+        urls.append(hint)
+
+    for _ in range(rounds):
+        for url in urls:
+            _raise_if_stopped()
+            try:
+                resp = _session_get_with_tls_retry(
+                    session,
+                    url,
+                    proxies=proxies,
+                    allow_redirects=True,
+                    timeout=20,
+                    max_attempts=3,
+                )
+                final_url = str(getattr(resp, "url", "") or "").strip()
+                if final_url:
+                    referer = final_url
+            except UserStoppedError:
+                raise
+            except Exception as e:
+                _warn(f"刷新 workspace 会话失败({url}): {e}")
+            if wait_workspace > 0 and _sleep_interruptible(wait_workspace):
+                raise UserStoppedError("stopped_by_user")
+            _, _, workspaces = _session_workspaces(session)
+            if workspaces:
+                return workspaces, referer
+            api_workspaces, api_from = _fetch_workspaces_from_api(session, proxies)
+            if api_workspaces:
+                if api_from:
+                    _info(f"通过 API 获取到 workspace: {api_from}")
+                return api_workspaces, referer
+
+    return [], referer
+
+
 def _extract_next_url(data: Dict[str, Any]) -> str:
     """解析 JSON 响应中的下一跳 URL：优先 continue_url，否则按 page.type 映射。"""
     continue_url = str(data.get("continue_url") or "").strip()
@@ -426,6 +2035,13 @@ def _extract_next_url(data: Dict[str, Any]) -> str:
         "workspace": "https://auth.openai.com/workspace",
     }
     return mapping.get(page_type, "")
+
+
+def _is_add_phone_url(url: str) -> bool:
+    u = str(url or "").strip().lower()
+    if not u:
+        return False
+    return ("/add-phone" in u) or ("add_phone" in u)
 
 
 def _to_int(v: Any) -> int:
@@ -478,6 +2094,7 @@ def _post_with_retry(
     last_error: Optional[Exception] = None
     backoff_base = _env_float("HTTP_RETRY_BACKOFF_BASE_SEC", 2.0, 0.2, 10.0)
     for attempt in range(retries + 1):
+        _raise_if_stopped()
         try:
             if json_body is not None:
                 return session.post(
@@ -500,7 +2117,8 @@ def _post_with_retry(
             last_error = e
             if attempt >= retries:
                 break
-            time.sleep(backoff_base * (attempt + 1))
+            if _sleep_interruptible(backoff_base * (attempt + 1)):
+                raise UserStoppedError("stopped_by_user")
     if last_error:
         raise last_error
     raise RuntimeError("Request failed without exception")
@@ -679,6 +2297,7 @@ def _session_get_with_tls_retry(
     delay_base = _env_float("TLS_RETRY_BASE_SEC", 1.0, 0.2, 5.0)
     delay_step = _env_float("TLS_RETRY_STEP_SEC", 0.85, 0.1, 3.0)
     for attempt in range(max_attempts):
+        _raise_if_stopped()
         try:
             return session.get(
                 url,
@@ -707,10 +2326,26 @@ def _session_get_with_tls_retry(
             if not transient or attempt >= max_attempts - 1:
                 raise
             delay = delay_base + attempt * delay_step
+            reason_tag = "网络"
+            if "timed out" in es or "timeout" in es:
+                reason_tag = "超时"
+            elif "connection reset" in es or "connection aborted" in es or "eof" in es:
+                reason_tag = "连接中断"
+            elif (
+                "tls" in es
+                or "ssl" in es
+                or "openssl" in es
+                or "error:00000000" in es
+            ):
+                reason_tag = "TLS/SSL"
+            detail = " ".join(str(e).split())
+            if len(detail) > 180:
+                detail = detail[:180] + "..."
             _warn(
-                f"TLS/连接异常，{delay:.1f}s 后重试 ({attempt + 1}/{max_attempts})…"
+                f"{reason_tag}异常，{delay:.1f}s 后重试 ({attempt + 1}/{max_attempts})：{detail}"
             )
-            time.sleep(delay)
+            if _sleep_interruptible(delay):
+                raise UserStoppedError("stopped_by_user")
     raise last_err  # pragma: no cover
 
 
@@ -743,6 +2378,7 @@ def _follow_redirect_chain(
     current_url = start_url
     response = None
     for _ in range(max_redirects):
+        _raise_if_stopped()
         response = _session_get_with_tls_retry(
             session,
             current_url,
@@ -766,14 +2402,23 @@ def _build_sentinel_for_session(
     session: requests.Session, flow: str, proxies: Any
 ) -> Optional[str]:
     """向 Sentinel 换取 token；对 TLS/连接抖动做有限次重试（与 GET 重试策略一致）。"""
+    if _stop_requested():
+        return None
     did = session.cookies.get("oai-did")
     if not did:
         return None
     payload = json.dumps({"p": "", "id": did, "flow": flow}, separators=(",", ":"))
+    imp = str(getattr(session, "_fp_impersonate", "safari") or "safari")
+    ua = str(
+        session.headers.get("User-Agent")
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
     max_attempts = 5
     delay_base = _env_float("SENTINEL_RETRY_BASE_SEC", 1.0, 0.2, 5.0)
     delay_step = _env_float("SENTINEL_RETRY_STEP_SEC", 0.85, 0.1, 3.0)
     for attempt in range(max_attempts):
+        if _stop_requested():
+            return None
         try:
             sen_resp = requests.post(
                 "https://sentinel.openai.com/backend-api/sentinel/req",
@@ -781,10 +2426,11 @@ def _build_sentinel_for_session(
                     "origin": "https://sentinel.openai.com",
                     "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
                     "content-type": "text/plain;charset=UTF-8",
+                    "user-agent": ua,
                 },
                 data=payload,
                 proxies=proxies,
-                impersonate="safari",
+                impersonate=imp,
                 verify=_ssl_verify(),
                 timeout=15,
             )
@@ -796,7 +2442,8 @@ def _build_sentinel_for_session(
             _warn(
                 f"Sentinel({flow}) 网络异常，{delay:.1f}s 后重试 ({attempt + 1}/{max_attempts})…"
             )
-            time.sleep(delay)
+            if _sleep_interruptible(delay):
+                return None
             continue
         if sen_resp.status_code != 200:
             if attempt >= max_attempts - 1:
@@ -806,7 +2453,8 @@ def _build_sentinel_for_session(
             _warn(
                 f"Sentinel({flow}) HTTP {sen_resp.status_code}，{delay:.1f}s 后重试…"
             )
-            time.sleep(delay)
+            if _sleep_interruptible(delay):
+                return None
             continue
         tok = str((sen_resp.json() or {}).get("token") or "").strip()
         if not tok:
@@ -831,16 +2479,15 @@ def _login_via_password_and_finish_oauth(
     须使用全新 Session 与全新 OAuth（PKCE/state），先跟随授权 URL，再 authorize/continue、
     password/verify；不可在注册未完成 OAuth 的旧 Session 里直接交密码（会 invalid_username_or_password）。
     """
+    _raise_if_stopped()
     _info("补救登录：独立 Session + OAuth + password/verify")
     _info(f"邮箱: {email}")
 
     oauth = generate_oauth_url()
-    s = requests.Session(proxies=proxies, impersonate="safari")
-    s.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-    )
+    fp = _choose_browser_fingerprint()
+    s = requests.Session(proxies=proxies, impersonate=str(fp.get("impersonate") or "safari"))
+    _apply_session_fingerprint(s, fp)
+    _info(f"登录指纹: {fp.get('label', '-')}")
 
     _, current_url = _follow_redirect_chain(s, oauth.auth_url, proxies)
     if "code=" in current_url and "state=" in current_url:
@@ -923,6 +2570,8 @@ def _login_via_password_and_finish_oauth(
         fu = (getattr(pre_pwd, "url", "") or "").strip()
         if fu:
             current_url = fu
+    except UserStoppedError:
+        raise
     except Exception as e:
         _warn(f"GET 密码页失败，仍尝试提交密码: {e}")
 
@@ -949,28 +2598,10 @@ def _login_via_password_and_finish_oauth(
             timeout=20,
         )
 
-    def _post_authorize_continue_password(
-        referer: str, token: Optional[str], body: str
-    ) -> Any:
-        hdrs: Dict[str, str] = {
-            "content-type": "application/json",
-            "accept": "application/json",
-            "referer": referer,
-        }
-        if token:
-            hdrs["openai-sentinel-token"] = token
-        return s.post(
-            "https://auth.openai.com/api/accounts/authorize/continue",
-            headers=hdrs,
-            data=body,
-            proxies=proxies,
-            verify=_ssl_verify(),
-            timeout=20,
-        )
-
     password_resp: Any = None
 
     for ref in _PWD_REFERS:
+        _raise_if_stopped()
         st_pwd = _build_sentinel_for_session(s, "password_verify", proxies)
         if not st_pwd:
             break
@@ -980,38 +2611,14 @@ def _login_via_password_and_finish_oauth(
             break
 
     if not password_resp or password_resp.status_code != 200:
-        _warn("改用 authorize/continue 提交密码（兼容部分登录链）")
-        st_ac = _build_sentinel_for_session(s, "authorize_continue", proxies)
-        body_obj = json.dumps({"password": password})
-        for ref in (
-            "https://auth.openai.com/log-in/password",
-            "https://auth.openai.com/login/password",
-            current_url,
-        ):
-            password_resp = _post_authorize_continue_password(ref, st_ac, body_obj)
-            _info(
-                f"authorize/continue(密码) HTTP {password_resp.status_code} "
-                f"(Referer …{ref[-28:]})"
-            )
-            if password_resp.status_code == 200:
-                break
-            if password_resp.status_code == 400 and "Unknown parameter" in (
-                password_resp.text or ""
-            ):
-                password_resp = _post_authorize_continue_password(
-                    ref, st_ac, json.dumps(password)
-                )
-                _info(
-                    f"authorize/continue(密码字符串) HTTP {password_resp.status_code}"
-                )
-                if password_resp.status_code == 200:
-                    break
-
-    if not password_resp or password_resp.status_code != 200:
+        # 该登录链路下 authorize/continue 不接受 password 参数，继续重试只会产生 unknown_parameter 噪音。
+        # 因此直接按密码登录失败返回，由上层决定换号补位。
         snippet = (
             (password_resp.text[:500] if password_resp is not None else "")
             or "无响应"
         )
+        if "invalid_username_or_password" in snippet.lower():
+            _mark_graph_bad_email(email, "invalid_username_or_password")
         _err(f"登录密码步骤失败: {snippet}")
         return None
 
@@ -1034,6 +2641,27 @@ def _login_via_password_and_finish_oauth(
         )
 
     _, current_url = _follow_redirect_chain(s, next_url, proxies)
+    if _is_add_phone_url(current_url):
+        _info("登录流程命中 add-phone，尝试 HeroSMS 手机验证")
+        phone_ok, phone_next = _try_verify_phone_via_hero_sms(
+            s,
+            proxies=proxies,
+            hint_url=current_url,
+        )
+        if not phone_ok:
+            _warn(f"HeroSMS 手机验证失败: {phone_next}")
+            if _is_hero_sms_balance_issue(phone_next):
+                _warn("HeroSMS 余额不足，保留当前账号，等待充值后重试")
+                raise HeroSmsBalanceLowError(str(phone_next or "NO_BALANCE"))
+            if _is_hero_sms_country_blocked_issue(phone_next):
+                raise HeroSmsCountryBlockedError(str(phone_next or "国家受限"))
+            if _is_hero_sms_timeout_issue(phone_next):
+                _warn("HeroSMS 接码超时，保留复用号码并结束当前尝试")
+                raise HeroSmsCodeTimeoutError(str(phone_next or "接码超时"))
+            _mark_graph_bad_email(email, "add_phone_required")
+            return None
+        if phone_next:
+            current_url = phone_next
     if "code=" in current_url and "state=" in current_url:
         try:
             account = submit_callback_url(
@@ -1109,6 +2737,27 @@ def _login_via_password_and_finish_oauth(
         if otp_next:
             _info(f"OTP 后继续: {otp_next[:80]}…")
             _, current_url = _follow_redirect_chain(s, otp_next, proxies)
+        if _is_add_phone_url(current_url):
+            _info("登录 OTP 后进入 add-phone，尝试 HeroSMS 手机验证")
+            phone_ok, phone_next = _try_verify_phone_via_hero_sms(
+                s,
+                proxies=proxies,
+                hint_url=current_url,
+            )
+            if not phone_ok:
+                _warn(f"HeroSMS 手机验证失败: {phone_next}")
+                if _is_hero_sms_balance_issue(phone_next):
+                    _warn("HeroSMS 余额不足，保留当前账号，等待充值后重试")
+                    raise HeroSmsBalanceLowError(str(phone_next or "NO_BALANCE"))
+                if _is_hero_sms_country_blocked_issue(phone_next):
+                    raise HeroSmsCountryBlockedError(str(phone_next or "国家受限"))
+                if _is_hero_sms_timeout_issue(phone_next):
+                    _warn("HeroSMS 接码超时，保留复用号码并结束当前尝试")
+                    raise HeroSmsCodeTimeoutError(str(phone_next or "接码超时"))
+                _mark_graph_bad_email(email, "add_phone_required")
+                return None
+            if phone_next:
+                current_url = phone_next
         if "code=" in current_url and "state=" in current_url:
             try:
                 account = submit_callback_url(
@@ -1123,35 +2772,58 @@ def _login_via_password_and_finish_oauth(
                 _err(f"交换 token 失败: {e}")
                 return None
 
+    if _is_add_phone_url(current_url):
+        _info("登录流程停留在 add-phone，尝试 HeroSMS 手机验证")
+        phone_ok, phone_next = _try_verify_phone_via_hero_sms(
+            s,
+            proxies=proxies,
+            hint_url=current_url,
+        )
+        if not phone_ok:
+            _warn(f"HeroSMS 手机验证失败: {phone_next}")
+            if _is_hero_sms_balance_issue(phone_next):
+                _warn("HeroSMS 余额不足，保留当前账号，等待充值后重试")
+                raise HeroSmsBalanceLowError(str(phone_next or "NO_BALANCE"))
+            if _is_hero_sms_country_blocked_issue(phone_next):
+                raise HeroSmsCountryBlockedError(str(phone_next or "国家受限"))
+            if _is_hero_sms_timeout_issue(phone_next):
+                _warn("HeroSMS 接码超时，保留复用号码并结束当前尝试")
+                raise HeroSmsCodeTimeoutError(str(phone_next or "接码超时"))
+            _mark_graph_bad_email(email, "add_phone_required")
+            return None
+        if phone_next:
+            current_url = phone_next
+
     _info("workspace 选择与最终换 token")
-    auth_cookie = s.cookies.get("oai-client-auth-session")
+    auth_cookie, auth_claims, workspaces = _session_workspaces(s)
     if not auth_cookie:
         _err("登录后未获取 oai-client-auth-session")
         return None
 
-    auth_json = _oai_auth_session_claims(auth_cookie)
-    workspaces = auth_json.get("workspaces") or []
     workspace_referer = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
     if not workspaces:
-        _info("会话无 workspace，GET /workspace 刷新")
+        _info("会话无 workspace，尝试刷新会话")
         try:
-            s.get(
-                "https://auth.openai.com/workspace",
-                proxies=proxies,
-                verify=_ssl_verify(),
-                timeout=15,
+            workspaces, workspace_referer = _refresh_workspace_candidates(
+                s,
+                proxies,
+                hint_url=current_url,
+                base_referer=workspace_referer,
             )
-            wait_workspace = _env_float("REGISTER_WORKSPACE_WAIT_SEC", 0.5, 0.0, 3.0)
-            if wait_workspace > 0:
-                time.sleep(wait_workspace)
-            workspace_referer = "https://auth.openai.com/workspace"
+        except UserStoppedError:
+            raise
         except Exception as e:
-            _warn(f"GET /workspace: {e}")
-        auth_cookie = s.cookies.get("oai-client-auth-session") or auth_cookie
-        auth_json = _oai_auth_session_claims(auth_cookie)
-        workspaces = auth_json.get("workspaces") or []
+            _warn(f"刷新 workspace 会话失败: {e}")
 
     if not workspaces:
+        _, auth_claims, _ = _session_workspaces(s)
+        hint = str(current_url or "").strip()
+        keys = sorted([str(k) for k in (auth_claims or {}).keys()])
+        key_preview = ",".join(keys[:8])
+        _warn(
+            "workspace 仍为空："
+            f"url={hint[:80]}，claims_keys=[{key_preview}]"
+        )
         _err("登录流程仍无 workspace")
         return None
 
@@ -1192,6 +2864,7 @@ def _login_via_password_and_finish_oauth(
 
     current_url = continue_url
     for _ in range(8):
+        _raise_if_stopped()
         final_resp = s.get(
             current_url,
             allow_redirects=False,
@@ -1248,11 +2921,40 @@ def run(proxy: Optional[str]):
     proxies: Any = None
     if proxy:
         proxies = {"http": proxy, "https": proxy}
+    _raise_if_stopped()
 
-    s = requests.Session(proxies=proxies, impersonate="safari")
+    fp = _choose_browser_fingerprint()
+    s = requests.Session(proxies=proxies, impersonate=str(fp.get("impersonate") or "safari"))
+    _apply_session_fingerprint(s, fp)
+    _info(
+        "浏览器指纹: "
+        f"{fp.get('label', '-')}"
+        f" · imp={fp.get('impersonate', '-')}"
+        f" · lang={fp.get('accept_language', '-')}"
+    )
+
+    def _runtime_meta() -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        try:
+            stats = get_hero_sms_runtime_stats()
+            spent = float(stats.get("spent_total_usd") or 0.0)
+            bal_last = float(stats.get("balance_last_usd") or -1.0)
+            out["sms_spent_usd"] = round(max(0.0, spent), 4)
+            if bal_last >= 0:
+                out["sms_balance_usd"] = round(bal_last, 4)
+            out["sms_min_balance_usd"] = round(_hero_sms_min_balance_limit(), 4)
+        except Exception:
+            pass
+        return out
+
+    def _ok(account_obj: Dict[str, Any], password: str = ""):
+        meta = _runtime_meta()
+        if meta:
+            return account_obj, password, meta
+        return account_obj, password
 
     def _fail(password: str = "", code: str = "", message: str = "", extra: Dict[str, Any] | None = None):
-        meta: Dict[str, Any] = {}
+        meta: Dict[str, Any] = _runtime_meta()
         if code:
             meta["error_code"] = str(code).strip().lower()
         if message:
@@ -1271,6 +2973,7 @@ def run(proxy: Optional[str]):
 
     if not _skip_net_check():
         try:
+            _raise_if_stopped()
             trace = _session_get_with_tls_retry(
                 s,
                 "https://cloudflare.com/cdn-cgi/trace",
@@ -1283,13 +2986,19 @@ def run(proxy: Optional[str]):
             _info(f"当前 IP 地区: {loc}")
             if loc in ("CN", "HK"):
                 raise RuntimeError("当前出口地区不可用，请更换代理")
+        except UserStoppedError:
+            raise
         except Exception as e:
             _err(f"网络/地区检测失败: {e}")
             return _fail("", "net_check_failed", str(e))
 
     email, dev_token = get_email_and_token(proxies)
     if not email or not dev_token:
+        mb_code, mb_msg = _consume_mailbox_init_error()
+        if mb_code:
+            return _fail("", mb_code, mb_msg or "临时邮箱或会话获取失败")
         return _fail("", "mailbox_init_failed", "临时邮箱或会话获取失败")
+    _raise_if_stopped()
     email_domain = _email_domain(email)
     _info(f"临时邮箱: {email}")
     masked = (dev_token[:8] + "…") if dev_token else ""
@@ -1299,56 +3008,75 @@ def run(proxy: Optional[str]):
     url = oauth.auth_url
 
     try:
-        resp = _session_get_with_tls_retry(
-            s, url, proxies=proxies, allow_redirects=True, timeout=25
-        )
-        did = s.cookies.get("oai-did")
-        _info(f"Device ID: {did}")
-
         signup_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"signup"}}'
-        sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
 
-        sen_resp = requests.post(
-            "https://sentinel.openai.com/backend-api/sentinel/req",
-            headers={
-                "origin": "https://sentinel.openai.com",
-                "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-                "content-type": "text/plain;charset=UTF-8",
-            },
-            data=sen_req_body,
-            proxies=proxies,
-            impersonate="safari",
-            verify=_ssl_verify(),
-            timeout=15,
-        )
+        def _signup_authorize_continue_once() -> tuple[Any, str, str]:
+            seed_resp = _session_get_with_tls_retry(
+                s,
+                url,
+                proxies=proxies,
+                allow_redirects=True,
+                timeout=25,
+            )
+            did = s.cookies.get("oai-did")
+            _info(f"Device ID: {did}")
+            sentinel = _build_sentinel_for_session(s, "authorize_continue", proxies)
+            if not sentinel:
+                raise RuntimeError("Sentinel token 获取失败")
+            seed_url = str(getattr(seed_resp, "url", "") or "").strip()
+            referer = (
+                seed_url
+                if seed_url.startswith("https://auth.openai.com")
+                else "https://auth.openai.com/create-account"
+            )
+            signup_resp_local = s.post(
+                "https://auth.openai.com/api/accounts/authorize/continue",
+                headers={
+                    "referer": referer,
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "openai-sentinel-token": sentinel,
+                },
+                data=signup_body,
+                proxies=proxies,
+                verify=_ssl_verify(),
+                timeout=30,
+            )
+            return signup_resp_local, str(did or "").strip(), str(sentinel or "")
 
-        if sen_resp.status_code != 200:
-            _err(f"Sentinel 拒绝，HTTP {sen_resp.status_code}")
-            return None, ""
-
-        sen_token = sen_resp.json()["token"]
-        sentinel = f'{{"p": "", "t": "", "c": "{sen_token}", "id": "{did}", "flow": "authorize_continue"}}'
-
-        signup_resp = s.post(
-            "https://auth.openai.com/api/accounts/authorize/continue",
-            headers={
-                "referer": "https://auth.openai.com/create-account",
-                "accept": "application/json",
-                "content-type": "application/json",
-                "openai-sentinel-token": sentinel,
-            },
-            data=signup_body,
-            proxies=proxies,
-            verify=_ssl_verify(),
-        )
-        signup_status = signup_resp.status_code
-        _info(f"注册表单 authorize/continue HTTP {signup_status}")
+        signup_resp: Any = None
+        signup_status = 0
+        sentinel = ""
+        for auth_try in range(2):
+            signup_resp, _, sentinel = _signup_authorize_continue_once()
+            signup_status = int(getattr(signup_resp, "status_code", 0) or 0)
+            _info(f"注册表单 authorize/continue HTTP {signup_status}")
+            low = str(getattr(signup_resp, "text", "") or "").lower()
+            can_retry_invalid_step = (
+                auth_try == 0
+                and signup_status == 400
+                and (
+                    "invalid_auth_step" in low
+                    or "invalid authorization step" in low
+                )
+            )
+            if can_retry_invalid_step:
+                _warn("注册前置步骤无效，重建授权链后重试一次")
+                continue
+            break
 
         if signup_status == 403:
             _err("注册表单 403，请稍后重试")
             return "retry_403", ""
         if signup_status != 200:
             _err(f"注册表单失败 HTTP {signup_status}: {signup_resp.text[:400]}")
+            provider = normalize_mail_provider(MAIL_SERVICE_PROVIDER)
+            low = str(signup_resp.text or "").lower()
+            if provider == "graph" and (
+                "invalid_auth_step" in low
+                or "invalid authorization step" in low
+            ):
+                _warn("invalid_auth_step 可能为链路/风控抖动，当前账号暂不删除")
             return _fail("", "auth_continue_failed", f"HTTP {signup_status}")
 
         password = _generate_password()
@@ -1370,6 +3098,14 @@ def run(proxy: Optional[str]):
         _info(f"user/register HTTP {pwd_resp.status_code}")
         if pwd_resp.status_code != 200:
             _err(f"user/register 失败: {pwd_resp.text[:400]}")
+            provider = normalize_mail_provider(MAIL_SERVICE_PROVIDER)
+            fail_text = str(pwd_resp.text or "")
+            if (
+                provider == "graph"
+                and pwd_resp.status_code == 400
+                and "Failed to register username" in fail_text
+            ):
+                _mark_graph_bad_email(email, "疑似已使用/不可注册")
             return _fail("", "register_password_failed", f"HTTP {pwd_resp.status_code}")
 
         try:
@@ -1410,6 +3146,8 @@ def run(proxy: Optional[str]):
                 _info(f"OTP 发送 HTTP {send_resp.status_code}")
                 if send_resp.status_code != 200:
                     _warn(f"OTP 发送异常: {send_resp.text[:300]}")
+            except UserStoppedError:
+                raise
             except Exception as e:
                 _warn(f"OTP 发送请求异常: {e}")
 
@@ -1448,7 +3186,8 @@ def run(proxy: Optional[str]):
 
         post_wait = _env_float("REGISTER_POST_WAIT_SEC", 1.5, 0.0, 6.0)
         if post_wait > 0:
-            time.sleep(post_wait)
+            if _sleep_interruptible(post_wait):
+                raise UserStoppedError("stopped_by_user")
         if register_continue:
             state_url = (
                 register_continue
@@ -1457,6 +3196,7 @@ def run(proxy: Optional[str]):
             )
             _info("GET continue_url，同步会话状态")
             try:
+                _raise_if_stopped()
                 s.get(
                     state_url,
                     proxies=proxies,
@@ -1465,7 +3205,10 @@ def run(proxy: Optional[str]):
                 )
                 continue_wait = _env_float("REGISTER_CONTINUE_WAIT_SEC", 1.0, 0.0, 5.0)
                 if continue_wait > 0:
-                    time.sleep(continue_wait)
+                    if _sleep_interruptible(continue_wait):
+                        raise UserStoppedError("stopped_by_user")
+            except UserStoppedError:
+                raise
             except Exception as e:
                 _warn(f"访问 continue_url: {e}")
 
@@ -1515,48 +3258,152 @@ def run(proxy: Optional[str]):
             create_page = ""
 
         if create_page == "add_phone" or "phone" in create_continue.lower():
-            _info("进入手机号页：改走邮箱密码登录完成 OAuth")
-            account = _login_via_password_and_finish_oauth(
-                email, password, dev_token, proxies
+            _info("进入手机号页：优先尝试 HeroSMS 手机验证")
+            phone_ok, phone_next = _try_verify_phone_via_hero_sms(
+                s,
+                proxies=proxies,
+                hint_url=create_continue,
             )
-            if account:
-                return account, password
-            _err("手机号分支下补救登录失败")
-            return None, password
+            if phone_ok:
+                create_continue = str(phone_next or create_continue or "").strip()
+                create_page = ""
+                _info("HeroSMS 手机验证通过，继续当前会话")
+            else:
+                _warn(f"HeroSMS 手机验证失败: {phone_next}")
+                if _is_hero_sms_balance_issue(phone_next):
+                    return _fail(
+                        password,
+                        "phone_balance_insufficient",
+                        str(phone_next or "HeroSMS 余额不足")[:220],
+                    )
+                if _is_hero_sms_country_blocked_issue(phone_next):
+                    return _fail(
+                        password,
+                        "phone_country_blocked",
+                        str(phone_next or "国家受限")[:220],
+                    )
+                if _is_hero_sms_timeout_issue(phone_next):
+                    return _fail(
+                        password,
+                        "phone_sms_timeout",
+                        str(phone_next or "接码超时")[:220],
+                    )
+                _info("改走邮箱密码登录完成 OAuth")
+                try:
+                    account = _login_via_password_and_finish_oauth(
+                        email, password, dev_token, proxies
+                    )
+                except HeroSmsBalanceLowError as e:
+                    return _fail(
+                        password,
+                        "phone_balance_insufficient",
+                        str(e or "HeroSMS 余额不足")[:220],
+                    )
+                except HeroSmsCountryBlockedError as e:
+                    return _fail(
+                        password,
+                        "phone_country_blocked",
+                        str(e or "国家受限")[:220],
+                    )
+                except HeroSmsCodeTimeoutError as e:
+                    return _fail(
+                        password,
+                        "phone_sms_timeout",
+                        str(e or "接码超时")[:220],
+                    )
+                if account:
+                    _mark_graph_bad_email(email, "注册成功后已消费")
+                    return _ok(account, password)
+                _err("手机号分支下补救登录失败")
+                if _is_add_phone_url(create_continue) or create_page == "add_phone":
+                    _mark_graph_bad_email(email, "add_phone_required")
+                    return _fail(
+                        password,
+                        "phone_gate",
+                        str(phone_next or "进入 add-phone，需手机号验证")[:220],
+                    )
+                return None, password
 
-        auth_cookie = s.cookies.get("oai-client-auth-session")
+        workspace_hint_url = ""
+        if create_continue:
+            workspace_hint_url = (
+                create_continue
+                if create_continue.startswith("http")
+                else f"https://auth.openai.com{create_continue}"
+            )
+            _info("GET create_account continue_url，同步会话状态")
+            try:
+                _, follow_url = _follow_redirect_chain(s, workspace_hint_url, proxies)
+                if follow_url:
+                    workspace_hint_url = follow_url
+                if "code=" in follow_url and "state=" in follow_url:
+                    account = submit_callback_url(
+                        callback_url=follow_url,
+                        code_verifier=oauth.code_verifier,
+                        redirect_uri=oauth.redirect_uri,
+                        expected_state=oauth.state,
+                    )
+                    _mark_graph_bad_email(email, "注册成功后已消费")
+                    return _ok(account, password)
+            except UserStoppedError:
+                raise
+            except Exception as e:
+                _warn(f"访问 create_account continue_url: {e}")
+
+        auth_cookie, auth_claims, workspaces = _session_workspaces(s)
         if not auth_cookie:
             _err("未获取 oai-client-auth-session")
             return None, password
 
-        auth_json = _oai_auth_session_claims(auth_cookie)
-        workspaces = auth_json.get("workspaces") or []
         workspace_referer = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
         if not workspaces:
-            _info("Cookie 无 workspace，GET /workspace")
+            _info("Cookie 无 workspace，尝试刷新会话")
             try:
-                s.get(
-                    "https://auth.openai.com/workspace",
-                    proxies=proxies,
-                    verify=_ssl_verify(),
-                    timeout=15,
+                workspaces, workspace_referer = _refresh_workspace_candidates(
+                    s,
+                    proxies,
+                    hint_url=workspace_hint_url,
+                    base_referer=workspace_referer,
                 )
-                wait_workspace = _env_float("REGISTER_WORKSPACE_WAIT_SEC", 0.5, 0.0, 3.0)
-                if wait_workspace > 0:
-                    time.sleep(wait_workspace)
-                workspace_referer = "https://auth.openai.com/workspace"
+            except UserStoppedError:
+                raise
             except Exception as e:
-                _warn(f"GET /workspace: {e}")
-            auth_cookie = s.cookies.get("oai-client-auth-session") or auth_cookie
-            auth_json = _oai_auth_session_claims(auth_cookie)
-            workspaces = auth_json.get("workspaces") or []
+                _warn(f"刷新 workspace 会话失败: {e}")
         if not workspaces:
-            _info("仍无 workspace，补救登录")
-            account = _login_via_password_and_finish_oauth(
-                email, password, dev_token, proxies
+            _, auth_claims, _ = _session_workspaces(s)
+            keys = sorted([str(k) for k in (auth_claims or {}).keys()])
+            key_preview = ",".join(keys[:8])
+            _warn(
+                "注册流程 workspace 仍为空："
+                f"url={str(workspace_hint_url or '').strip()[:80]}，"
+                f"claims_keys=[{key_preview}]"
             )
+            _info("仍无 workspace，补救登录")
+            try:
+                account = _login_via_password_and_finish_oauth(
+                    email, password, dev_token, proxies
+                )
+            except HeroSmsBalanceLowError as e:
+                return _fail(
+                    password,
+                    "phone_balance_insufficient",
+                    str(e or "HeroSMS 余额不足")[:220],
+                )
+            except HeroSmsCountryBlockedError as e:
+                return _fail(
+                    password,
+                    "phone_country_blocked",
+                    str(e or "国家受限")[:220],
+                )
+            except HeroSmsCodeTimeoutError as e:
+                return _fail(
+                    password,
+                    "phone_sms_timeout",
+                    str(e or "接码超时")[:220],
+                )
             if account:
-                return account, password
+                _mark_graph_bad_email(email, "注册成功后已消费")
+                return _ok(account, password)
             _err("无 workspace 且补救登录失败")
             return None, password
         workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
@@ -1597,6 +3444,7 @@ def run(proxy: Optional[str]):
 
         current_url = continue_url
         for _ in range(6):
+            _raise_if_stopped()
             final_resp = s.get(
                 current_url,
                 allow_redirects=False,
@@ -1619,12 +3467,22 @@ def run(proxy: Optional[str]):
                     redirect_uri=oauth.redirect_uri,
                     expected_state=oauth.state,
                 )
-                return account, password
+                _mark_graph_bad_email(email, "注册成功后已消费")
+                return _ok(account, password)
             current_url = next_url
 
         _err("重定向链未出现 OAuth callback")
         return None, password
 
+    except UserStoppedError:
+        _warn("检测到停止指令，终止当前注册流程")
+        return _fail("", "stopped_by_user", "用户停止任务")
+    except HeroSmsBalanceLowError as e:
+        return _fail("", "phone_balance_insufficient", str(e)[:220])
+    except HeroSmsCountryBlockedError as e:
+        return _fail("", "phone_country_blocked", str(e)[:220])
+    except HeroSmsCodeTimeoutError as e:
+        return _fail("", "phone_sms_timeout", str(e)[:220])
     except Exception as e:
         _err(f"运行异常: {e}")
         emsg = str(e)
@@ -1669,12 +3527,32 @@ def main() -> None:
         )
 
         try:
-            account_data, password = run(args.proxy)
+            result = run(args.proxy)
+            account_data = None
+            password = ""
+            meta: Dict[str, Any] = {}
+            if isinstance(result, (tuple, list)):
+                if len(result) > 0:
+                    account_data = result[0]
+                if len(result) > 1:
+                    password = str(result[1] or "")
+                if len(result) > 2 and isinstance(result[2], dict):
+                    meta = dict(result[2])
 
             if account_data == "retry_403":
                 _info("注册表单 403，10 秒后重试")
                 time.sleep(10)
                 continue
+
+            if str(meta.get("error_code") or "").strip().lower() == "graph_pool_exhausted":
+                _err("Graph 账号池已耗尽，停止后续注册")
+                break
+            if str(meta.get("error_code") or "").strip().lower() == "phone_balance_insufficient":
+                _err("HeroSMS 余额低于下限，停止后续注册")
+                break
+            if str(meta.get("error_code") or "").strip().lower() == "phone_country_blocked":
+                _err("HeroSMS 国家受限，停止后续注册")
+                break
 
             if account_data and isinstance(account_data, dict):
                 account_email = account_data.get("name", "")

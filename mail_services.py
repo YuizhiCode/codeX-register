@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
+import string
 import time
 import urllib.parse
+import imaplib
+import email
+import email.header
 from typing import Any, Callable
 
 from curl_cffi import requests
@@ -19,12 +24,17 @@ def normalize_mail_provider(raw: Any) -> str:
     val = str(raw or "").strip().lower()
     if val in {"mailfree", "freemail", "worker"}:
         return "mailfree"
+    if val in {"graph", "microsoft_graph", "msgraph", "microsoft"}:
+        return "graph"
     return "mailfree"
 
 
 def available_mail_providers() -> list[dict[str, str]]:
     """返回当前可选邮箱服务列表。"""
-    return [{"label": "MailFree", "value": "mailfree"}]
+    return [
+        {"label": "MailFree", "value": "mailfree"},
+        {"label": "Microsoft Graph", "value": "graph"},
+    ]
 
 
 def _extract_cookie_value(set_cookie: str, key: str) -> str:
@@ -51,6 +61,8 @@ class MailServiceBase:
         *,
         random_domain: bool = True,
         allowed_domains: list[str] | None = None,
+        local_prefix: str = "",
+        random_length: int = 0,
         proxies: Any = None,
     ) -> str:
         raise NotImplementedError
@@ -72,6 +84,11 @@ class MailServiceBase:
 
     def clear_emails(self, mailbox: str, *, proxies: Any = None) -> dict[str, Any]:
         raise NotImplementedError
+
+    def refresh_mailbox_token(self, mailbox: str, *, proxies: Any = None) -> dict[str, Any]:
+        """刷新指定邮箱账号令牌（默认实现：无需刷新）。"""
+        _ = (mailbox, proxies)
+        return {"ok": True, "message": "not_required"}
 
     @staticmethod
     def merge_mail_content(mail_data: dict[str, Any]) -> str:
@@ -299,14 +316,53 @@ class MailFreeService(MailServiceBase):
         self._domains_cache = list(dict.fromkeys(domains))
         return list(self._domains_cache)
 
+    @staticmethod
+    def _normalize_local_prefix(raw: Any) -> str:
+        prefix = str(raw or "").strip()
+        if not prefix:
+            return ""
+        prefix = re.sub(r"[^a-zA-Z0-9._-]+", "", prefix)
+        return prefix[:40]
+
+    @staticmethod
+    def _build_local_part(prefix: str, random_length: int) -> str:
+        base = MailFreeService._normalize_local_prefix(prefix)
+        try:
+            rlen = int(random_length)
+        except Exception:
+            rlen = 0
+        rlen = max(0, min(32, rlen))
+        if rlen > 0:
+            suffix = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(rlen))
+            base = f"{base}{suffix}"
+        return base[:64]
+
+    @staticmethod
+    def _extract_email(payload: Any) -> str:
+        if isinstance(payload, dict):
+            for key in ("email", "address", "mailbox"):
+                val = str(payload.get(key) or "").strip()
+                if val:
+                    return val
+            data = payload.get("data")
+            if isinstance(data, dict):
+                for key in ("email", "address", "mailbox"):
+                    val = str(data.get(key) or "").strip()
+                    if val:
+                        return val
+        return ""
+
     def generate_mailbox(
         self,
         *,
         random_domain: bool = True,
         allowed_domains: list[str] | None = None,
+        local_prefix: str = "",
+        random_length: int = 0,
         proxies: Any = None,
     ) -> str:
-        params: dict[str, Any] | None = None
+        base_params: dict[str, Any] = {}
+        chosen_domain = ""
         domains = self.list_domains(proxies=proxies)
         selected_domains: list[str] = []
         if isinstance(allowed_domains, list):
@@ -322,33 +378,109 @@ class MailFreeService(MailServiceBase):
                 chosen = random.choice(domain_pool)
             else:
                 chosen = domain_pool[0]
+            chosen_domain = str(chosen or "").strip().lower()
             try:
                 idx = domains.index(chosen)
             except ValueError:
                 idx = 0
-            params = {"domainIndex": idx}
+            base_params["domainIndex"] = idx
 
-        resp = self._request(
-            "GET",
-            "/api/generate",
-            params=params,
-            need_auth=True,
-            timeout=20,
-            proxies=proxies,
-        )
-        if not (200 <= int(resp.status_code or 0) < 300):
-            raise MailServiceError(
-                f"生成邮箱失败 HTTP {resp.status_code}: {_safe_text(resp.text)}"
+        def _request_generate(extra_params: dict[str, Any] | None = None) -> str:
+            req_params = dict(base_params)
+            if isinstance(extra_params, dict):
+                req_params.update(extra_params)
+            resp = self._request(
+                "GET",
+                "/api/generate",
+                params=req_params or None,
+                need_auth=True,
+                timeout=20,
+                proxies=proxies,
             )
+            if not (200 <= int(resp.status_code or 0) < 300):
+                raise MailServiceError(
+                    f"生成邮箱失败 HTTP {resp.status_code}: {_safe_text(resp.text)}"
+                )
+            payload = self._json_or_none(resp)
+            email = self._extract_email(payload)
+            if not email:
+                raise MailServiceError("生成邮箱失败：响应缺少 email 字段")
+            return email
 
-        payload = self._json_or_none(resp)
-        if not isinstance(payload, dict):
-            raise MailServiceError("生成邮箱返回格式异常")
+        raw_prefix = str(local_prefix or "").strip()
+        normalized_prefix = self._normalize_local_prefix(raw_prefix)
+        if raw_prefix and not normalized_prefix:
+            raise MailServiceError("邮箱前缀仅支持字母、数字、点、下划线和中划线")
+        try:
+            normalized_random_len = int(random_length)
+        except Exception:
+            normalized_random_len = 0
+        normalized_random_len = max(0, min(32, normalized_random_len))
 
-        email = str(payload.get("email") or "").strip()
-        if not email:
-            raise MailServiceError("生成邮箱失败：响应缺少 email 字段")
-        return email
+        desired_local = self._build_local_part(normalized_prefix, normalized_random_len)
+        custom_requested = bool(normalized_prefix or normalized_random_len > 0)
+        if not custom_requested or not desired_local:
+            return _request_generate()
+
+        desired_email = f"{desired_local}@{chosen_domain}" if chosen_domain else ""
+        candidates: list[dict[str, Any]] = []
+        if desired_email:
+            candidates.append({"email": desired_email})
+            candidates.append({"address": desired_email})
+            candidates.append({"mailbox": desired_email})
+        candidates.extend(
+            [
+                {"localPart": desired_local},
+                {"localpart": desired_local},
+                {"local": desired_local},
+                {"name": desired_local},
+                {"prefix": normalized_prefix, "randomLength": normalized_random_len},
+                {"prefix": normalized_prefix, "random_length": normalized_random_len},
+                {"localPrefix": normalized_prefix, "randomLength": normalized_random_len},
+            ]
+        )
+
+        seen: set[str] = set()
+        last_email = ""
+        last_error = ""
+
+        def _local_matches_expectation(local_name: str) -> bool:
+            local_low = str(local_name or "").strip().lower()
+            if not local_low:
+                return False
+            if local_low == desired_local.lower():
+                return True
+            prefix_low = normalized_prefix.lower()
+            if prefix_low and not local_low.startswith(prefix_low):
+                return False
+            if normalized_random_len > 0:
+                min_len = len(prefix_low) + normalized_random_len
+                return len(local_low) >= min_len
+            return bool(prefix_low)
+
+        for params in candidates:
+            key = json.dumps(params, sort_keys=True, ensure_ascii=False)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                email = _request_generate(params)
+            except MailServiceError as e:
+                last_error = str(e)
+                continue
+
+            last_email = email
+            local = str(email.split("@", 1)[0] if "@" in email else email).strip()
+            if _local_matches_expectation(local):
+                return email
+
+        if last_email:
+            raise MailServiceError(
+                f"邮箱服务未返回指定前缀邮箱（期望本地名 {desired_local}，实际 {last_email}）"
+            )
+        if last_error:
+            raise MailServiceError(last_error)
+        raise MailServiceError("生成自定义前缀邮箱失败")
 
     def list_mailboxes(self, *, limit: int = 100, offset: int = 0, proxies: Any = None) -> list[dict[str, Any]]:
         lim = max(1, min(500, int(limit)))
@@ -661,6 +793,649 @@ class MailFreeService(MailServiceBase):
         return {"success": True, "mailbox": target, "deleted": max(0, deleted_count)}
 
 
+class MicrosoftGraphService(MailServiceBase):
+    provider_id = "graph"
+    provider_label = "Microsoft Graph"
+
+    def __init__(
+        self,
+        *,
+        accounts_file: str,
+        tenant: str,
+        fetch_mode: str,
+        verify_ssl: bool,
+        logger: Callable[[str], None] | None = None,
+    ) -> None:
+        self.accounts_file = str(accounts_file or "").strip() or "graph_accounts.txt"
+        self.tenant = str(tenant or "").strip() or "common"
+        mode = str(fetch_mode or "").strip().lower()
+        if mode not in {"graph_api", "imap_xoauth2"}:
+            mode = "graph_api"
+        self.fetch_mode = mode
+        self.verify_ssl = bool(verify_ssl)
+        self._logger = logger
+        self._accounts: list[dict[str, Any]] = []
+        self._next_idx = 0
+        self._load_accounts()
+        self._accounts_lock = None
+
+    def _log(self, msg: str) -> None:
+        if self._logger:
+            self._logger(msg)
+
+    def _load_accounts(self) -> None:
+        path = os.path.abspath(os.path.expanduser(self.accounts_file))
+        self._accounts_file_path = path
+        if not os.path.isfile(path):
+            raise MailServiceError(f"Graph 账号文件不存在: {path}")
+        rows: list[dict[str, Any]] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = str(raw or "").strip().lstrip("\ufeff")
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split("----", 3)
+                    if len(parts) < 4:
+                        continue
+                    email = str(parts[0] or "").strip().lstrip("\ufeff").lower()
+                    password = str(parts[1] or "").strip()
+                    client_id = str(parts[2] or "").strip()
+                    refresh_token = str(parts[3] or "").strip()
+                    if not email or "@" not in email:
+                        continue
+                    if not client_id or not refresh_token:
+                        continue
+                    rows.append(
+                        {
+                            "email": email,
+                            "password": password,
+                            "client_id": client_id,
+                            "refresh_token": refresh_token,
+                            "access_token": "",
+                            "access_expire_at": 0.0,
+                        }
+                    )
+        except Exception as e:
+            raise MailServiceError(f"读取 Graph 账号文件失败: {e}") from e
+        if not rows:
+            raise MailServiceError("Graph 账号文件为空或格式无效")
+        self._accounts = rows
+
+    def _save_accounts_refresh_tokens(self) -> None:
+        fp = str(getattr(self, "_accounts_file_path", "") or "").strip()
+        if not fp:
+            return
+        lines: list[str] = []
+        for acc in self._accounts:
+            email_val = str(acc.get("email") or "").strip().lower()
+            password_val = str(acc.get("password") or "").strip()
+            client_id_val = str(acc.get("client_id") or "").strip()
+            refresh_val = str(acc.get("refresh_token") or "").strip()
+            if not email_val or "@" not in email_val:
+                continue
+            if not password_val or not client_id_val or not refresh_val:
+                continue
+            lines.append(f"{email_val}----{password_val}----{client_id_val}----{refresh_val}")
+        if not lines:
+            return
+        try:
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            return
+
+    def remove_account(self, email_addr: str) -> bool:
+        target = str(email_addr or "").strip().lower()
+        if not target or "@" not in target:
+            return False
+        before = len(self._accounts)
+        self._accounts = [
+            x for x in self._accounts
+            if str((x or {}).get("email") or "").strip().lower() != target
+        ]
+        if len(self._accounts) == before:
+            return False
+        if self._next_idx >= len(self._accounts):
+            self._next_idx = 0
+        self._save_accounts_refresh_tokens()
+        return True
+
+    def _find_account(self, mailbox: str) -> dict[str, Any]:
+        target = str(mailbox or "").strip().lower()
+        if not target:
+            raise MailServiceError("邮箱地址不能为空")
+        for acc in self._accounts:
+            if str(acc.get("email") or "").strip().lower() == target:
+                return acc
+        raise MailServiceError(f"Graph 账号文件中不存在该邮箱: {target}")
+
+    def _token_url(self) -> str:
+        return f"https://login.microsoftonline.com/{urllib.parse.quote(self.tenant, safe='')}/oauth2/v2.0/token"
+
+    def _refresh_access_token(
+        self,
+        acc: dict[str, Any],
+        *,
+        proxies: Any = None,
+        force_refresh: bool = False,
+    ) -> str:
+        now = time.time()
+        cached = str(acc.get("access_token") or "").strip()
+        exp = float(acc.get("access_expire_at") or 0.0)
+        if (not force_refresh) and cached and exp - now > 45:
+            return cached
+
+        body = {
+            "client_id": str(acc.get("client_id") or ""),
+            "grant_type": "refresh_token",
+            "refresh_token": str(acc.get("refresh_token") or ""),
+            "scope": (
+                "https://graph.microsoft.com/.default"
+                if self.fetch_mode == "graph_api"
+                else "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+            ),
+        }
+        try:
+            resp = requests.post(
+                self._token_url(),
+                data=body,
+                proxies=proxies,
+                impersonate="chrome",
+                verify=self.verify_ssl,
+                timeout=25,
+            )
+        except Exception as e:
+            raise MailServiceError(f"Graph 换 token 失败: {e}") from e
+        if not (200 <= int(resp.status_code or 0) < 300):
+            raise MailServiceError(
+                f"Graph 换 token 失败 HTTP {resp.status_code}: {_safe_text(resp.text)}"
+            )
+        try:
+            payload = resp.json() or {}
+        except Exception:
+            payload = {}
+        token = str(payload.get("access_token") or "").strip()
+        if not token:
+            raise MailServiceError("Graph 换 token 成功但未返回 access_token")
+        expires_in = 3600
+        try:
+            expires_in = int(payload.get("expires_in") or 3600)
+        except Exception:
+            expires_in = 3600
+        acc["access_token"] = token
+        acc["access_expire_at"] = now + max(120, expires_in)
+        new_refresh = str(payload.get("refresh_token") or "").strip()
+        if new_refresh and new_refresh != str(acc.get("refresh_token") or "").strip():
+            acc["refresh_token"] = new_refresh
+            self._save_accounts_refresh_tokens()
+        return token
+
+    def _graph_request(
+        self,
+        acc: dict[str, Any],
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        proxies: Any = None,
+    ):
+        token = self._refresh_access_token(acc, proxies=proxies)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+        url = f"https://graph.microsoft.com/v1.0{path}"
+        try:
+            resp = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                proxies=proxies,
+                impersonate="chrome",
+                verify=self.verify_ssl,
+                timeout=25,
+            )
+        except Exception as e:
+            raise MailServiceError(f"Graph 请求失败: {e}") from e
+        if resp.status_code == 401:
+            acc["access_token"] = ""
+            acc["access_expire_at"] = 0.0
+            token = self._refresh_access_token(acc, proxies=proxies)
+            headers["Authorization"] = f"Bearer {token}"
+            resp = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                proxies=proxies,
+                impersonate="chrome",
+                verify=self.verify_ssl,
+                timeout=25,
+            )
+        return resp
+
+    @staticmethod
+    def _decode_subject(raw_subject: Any) -> str:
+        try:
+            chunks = email.header.decode_header(str(raw_subject or ""))
+            out: list[str] = []
+            for val, enc in chunks:
+                if isinstance(val, bytes):
+                    out.append(val.decode(enc or "utf-8", errors="replace"))
+                else:
+                    out.append(str(val))
+            text = "".join(out).strip()
+            return text or "(无主题)"
+        except Exception:
+            return str(raw_subject or "(无主题)") or "(无主题)"
+
+    @staticmethod
+    def _extract_plain_text(msg: Any) -> str:
+        try:
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = str(part.get_content_type() or "").lower()
+                    disp = str(part.get("Content-Disposition") or "").lower()
+                    if ctype == "text/plain" and "attachment" not in disp:
+                        raw = part.get_payload(decode=True) or b""
+                        return raw.decode(part.get_content_charset() or "utf-8", errors="replace").strip()
+            raw = msg.get_payload(decode=True) or b""
+            return raw.decode(msg.get_content_charset() or "utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _xoauth2_auth_string(user: str, token: str) -> str:
+        return f"user={user}\1auth=Bearer {token}\1\1"
+
+    def _imap_connect(self, acc: dict[str, Any], *, proxies: Any = None):
+        _ = proxies
+        access_token = self._refresh_access_token(acc, proxies=None)
+        mail = imaplib.IMAP4_SSL("outlook.live.com")
+        auth_str = self._xoauth2_auth_string(str(acc.get("email") or ""), access_token)
+        mail.authenticate("XOAUTH2", lambda _: auth_str)
+        return mail
+
+    @staticmethod
+    def _imap_message_id(folder: str, uid: str) -> str:
+        return f"imap:{folder}:{uid}"
+
+    def list_domains(self, *, proxies: Any = None) -> list[str]:
+        _ = proxies
+        domains = []
+        for acc in self._accounts:
+            email = str(acc.get("email") or "").strip().lower()
+            if "@" in email:
+                domains.append(email.split("@", 1)[1])
+        return list(dict.fromkeys([x for x in domains if x]))
+
+    def generate_mailbox(
+        self,
+        *,
+        random_domain: bool = True,
+        allowed_domains: list[str] | None = None,
+        local_prefix: str = "",
+        random_length: int = 0,
+        proxies: Any = None,
+    ) -> str:
+        _ = (random_domain, local_prefix, random_length, proxies)
+        pool = list(self._accounts)
+        if isinstance(allowed_domains, list) and allowed_domains:
+            allow = {str(x).strip().lower() for x in allowed_domains if str(x).strip()}
+            pool = [
+                x
+                for x in pool
+                if "@" in str(x.get("email") or "")
+                and str(x.get("email") or "").split("@", 1)[1].strip().lower() in allow
+            ]
+        if not pool:
+            raise MailServiceError("Graph 账号池为空，无法生成邮箱")
+        if self._next_idx >= len(pool):
+            self._next_idx = 0
+        picked = pool[self._next_idx]
+        self._next_idx = (self._next_idx + 1) % len(pool)
+        email = str(picked.get("email") or "").strip().lower()
+        if not email:
+            raise MailServiceError("Graph 账号池项缺少邮箱")
+        return email
+
+    def refresh_mailbox_token(self, mailbox: str, *, proxies: Any = None) -> dict[str, Any]:
+        acc = self._find_account(mailbox)
+        token = self._refresh_access_token(acc, proxies=proxies, force_refresh=True)
+        return {
+            "ok": True,
+            "mailbox": str(acc.get("email") or mailbox),
+            "token_prefix": (str(token or "")[:10] + "…") if token else "",
+        }
+
+    def list_mailboxes(self, *, limit: int = 100, offset: int = 0, proxies: Any = None) -> list[dict[str, Any]]:
+        _ = proxies
+        lim = max(1, min(500, int(limit)))
+        off = max(0, int(offset))
+        rows: list[dict[str, Any]] = []
+        for idx, acc in enumerate(self._accounts):
+            email = str(acc.get("email") or "").strip().lower()
+            if not email:
+                continue
+            rows.append(
+                {
+                    "key": f"{email}:{idx}",
+                    "address": email,
+                    "created_at": "-",
+                    "expires_at": "-",
+                    "count": 0,
+                }
+            )
+        return rows[off: off + lim]
+
+    def delete_mailbox(self, address: str, *, proxies: Any = None) -> dict[str, Any]:
+        _ = (address, proxies)
+        raise MailServiceError("Graph 模式不支持删除邮箱账号（仅支持删邮件）")
+
+    def list_emails(self, mailbox: str, *, proxies: Any = None) -> list[dict[str, Any]]:
+        acc = self._find_account(mailbox)
+        if self.fetch_mode == "imap_xoauth2":
+            rows: list[dict[str, Any]] = []
+            folders = ["INBOX", "Junk"]
+            try:
+                imap_conn = self._imap_connect(acc, proxies=proxies)
+            except Exception as e:
+                raise MailServiceError(f"IMAP 连接失败: {e}") from e
+            try:
+                for folder in folders:
+                    try:
+                        typ, _ = imap_conn.select(folder)
+                        if typ != "OK":
+                            continue
+                        typ, data = imap_conn.search(None, "ALL")
+                        if typ != "OK":
+                            continue
+                        uids = (data[0] or b"").split()
+                        for raw_uid in reversed(uids[-50:]):
+                            uid = raw_uid.decode("utf-8", errors="ignore")
+                            if not uid:
+                                continue
+                            typ, msg_data = imap_conn.fetch(raw_uid, "(RFC822)")
+                            if typ != "OK":
+                                continue
+                            raw_bytes = b""
+                            for part in msg_data:
+                                if isinstance(part, tuple):
+                                    raw_bytes = part[1] or b""
+                                    break
+                            if not raw_bytes:
+                                continue
+                            msg = email.message_from_bytes(raw_bytes)
+                            subject = self._decode_subject(msg.get("Subject"))
+                            sender = str(msg.get("From") or "-").strip() or "-"
+                            date_val = str(msg.get("Date") or "-").strip() or "-"
+                            body_text = self._extract_plain_text(msg)
+                            preview = (body_text[:180] + "…") if len(body_text) > 180 else body_text
+                            rows.append(
+                                {
+                                    "id": self._imap_message_id(folder, uid),
+                                    "from": sender,
+                                    "subject": subject,
+                                    "date": date_val,
+                                    "preview": preview,
+                                    "mailbox": str(acc.get("email") or mailbox),
+                                    "raw": {"folder": folder, "uid": uid},
+                                }
+                            )
+                    except Exception:
+                        continue
+            finally:
+                try:
+                    imap_conn.logout()
+                except Exception:
+                    pass
+            return rows
+
+        resp = self._graph_request(
+            acc,
+            "GET",
+            "/me/messages",
+            params={
+                "$top": "50",
+                "$orderby": "receivedDateTime desc",
+                "$select": "id,subject,from,receivedDateTime,bodyPreview",
+            },
+            proxies=proxies,
+        )
+        if not (200 <= int(resp.status_code or 0) < 300):
+            raise MailServiceError(
+                f"Graph 拉取邮件失败 HTTP {resp.status_code}: {_safe_text(resp.text)}"
+            )
+        try:
+            payload = resp.json() or {}
+        except Exception:
+            payload = {}
+        arr = payload.get("value") if isinstance(payload, dict) else []
+        if not isinstance(arr, list):
+            arr = []
+        out: list[dict[str, Any]] = []
+        for idx, it in enumerate(arr):
+            if not isinstance(it, dict):
+                continue
+            mid = str(it.get("id") or f"msg-{idx}").strip()
+            if not mid:
+                continue
+            frm = (it.get("from") or {}).get("emailAddress") if isinstance(it.get("from"), dict) else {}
+            sender_name = str((frm or {}).get("name") or "").strip()
+            sender_addr = str((frm or {}).get("address") or "").strip()
+            sender = f"{sender_name} <{sender_addr}>".strip() if sender_name and sender_addr else (sender_addr or sender_name or "-")
+            out.append(
+                {
+                    "id": mid,
+                    "from": sender,
+                    "subject": str(it.get("subject") or "(无主题)"),
+                    "date": str(it.get("receivedDateTime") or "-"),
+                    "preview": str(it.get("bodyPreview") or ""),
+                    "mailbox": str(acc.get("email") or mailbox),
+                    "raw": it,
+                }
+            )
+        return out
+
+    def get_email_detail(self, email_id: str, *, proxies: Any = None) -> dict[str, Any]:
+        target = str(email_id or "").strip()
+        if not target:
+            raise MailServiceError("邮件 ID 不能为空")
+        if self.fetch_mode == "imap_xoauth2":
+            parts = target.split(":", 2)
+            if len(parts) != 3 or parts[0] != "imap":
+                raise MailServiceError("IMAP 邮件 ID 格式无效")
+            folder = str(parts[1] or "").strip() or "INBOX"
+            uid = str(parts[2] or "").strip()
+            if not uid:
+                raise MailServiceError("IMAP 邮件 UID 无效")
+            for acc in self._accounts:
+                try:
+                    imap_conn = self._imap_connect(acc, proxies=proxies)
+                except Exception:
+                    continue
+                try:
+                    typ, _ = imap_conn.select(folder)
+                    if typ != "OK":
+                        continue
+                    typ, msg_data = imap_conn.fetch(uid.encode("utf-8"), "(RFC822)")
+                    if typ != "OK":
+                        continue
+                    raw_bytes = b""
+                    for part in msg_data:
+                        if isinstance(part, tuple):
+                            raw_bytes = part[1] or b""
+                            break
+                    if not raw_bytes:
+                        continue
+                    msg = email.message_from_bytes(raw_bytes)
+                    subject = self._decode_subject(msg.get("Subject"))
+                    sender = str(msg.get("From") or "-").strip() or "-"
+                    date_val = str(msg.get("Date") or "-").strip() or "-"
+                    text = self._extract_plain_text(msg)
+                    content = self.merge_mail_content(
+                        {
+                            "subject": subject,
+                            "intro": "",
+                            "text": text,
+                            "html": "",
+                            "raw": text,
+                        }
+                    )
+                    return {
+                        "id": target,
+                        "from": sender,
+                        "subject": subject,
+                        "date": date_val,
+                        "text": text,
+                        "html": "",
+                        "raw": text,
+                        "content": content,
+                        "payload": {"folder": folder, "uid": uid},
+                    }
+                finally:
+                    try:
+                        imap_conn.logout()
+                    except Exception:
+                        pass
+            raise MailServiceError("IMAP 获取邮件详情失败: 未找到邮件")
+        # 在 Graph 模式中，message id 全局唯一，遍历账号池找到可访问该邮件的账号。
+        last_err = ""
+        for acc in self._accounts:
+            resp = self._graph_request(
+                acc,
+                "GET",
+                f"/me/messages/{urllib.parse.quote(target, safe='')}",
+                params={"$select": "id,subject,from,receivedDateTime,body,bodyPreview"},
+                proxies=proxies,
+            )
+            if int(resp.status_code or 0) == 404:
+                continue
+            if not (200 <= int(resp.status_code or 0) < 300):
+                last_err = f"HTTP {resp.status_code}: {_safe_text(resp.text)}"
+                continue
+            try:
+                body = resp.json() or {}
+            except Exception:
+                body = {}
+            frm = (body.get("from") or {}).get("emailAddress") if isinstance(body.get("from"), dict) else {}
+            sender_name = str((frm or {}).get("name") or "").strip()
+            sender_addr = str((frm or {}).get("address") or "").strip()
+            sender = f"{sender_name} <{sender_addr}>".strip() if sender_name and sender_addr else (sender_addr or sender_name or "-")
+            body_obj = body.get("body") if isinstance(body.get("body"), dict) else {}
+            html = str((body_obj or {}).get("content") or "")
+            text = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+            text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = " ".join(text.split())
+            content = self.merge_mail_content(
+                {
+                    "subject": str(body.get("subject") or "(无主题)"),
+                    "intro": str(body.get("bodyPreview") or ""),
+                    "text": text,
+                    "html": html,
+                    "raw": json.dumps(body, ensure_ascii=False),
+                }
+            )
+            return {
+                "id": str(body.get("id") or target),
+                "from": sender,
+                "subject": str(body.get("subject") or "(无主题)"),
+                "date": str(body.get("receivedDateTime") or "-"),
+                "text": text,
+                "html": html,
+                "raw": json.dumps(body, ensure_ascii=False),
+                "content": content,
+                "payload": body,
+            }
+        raise MailServiceError(f"Graph 获取邮件详情失败: {last_err or '未找到邮件'}")
+
+    def delete_email(self, email_id: str, *, proxies: Any = None) -> dict[str, Any]:
+        target = str(email_id or "").strip()
+        if not target:
+            raise MailServiceError("邮件 ID 不能为空")
+        if self.fetch_mode == "imap_xoauth2":
+            parts = target.split(":", 2)
+            if len(parts) != 3 or parts[0] != "imap":
+                raise MailServiceError("IMAP 邮件 ID 格式无效")
+            folder = str(parts[1] or "").strip() or "INBOX"
+            uid = str(parts[2] or "").strip()
+            if not uid:
+                raise MailServiceError("IMAP 邮件 UID 无效")
+            for acc in self._accounts:
+                try:
+                    imap_conn = self._imap_connect(acc, proxies=proxies)
+                except Exception:
+                    continue
+                try:
+                    typ, _ = imap_conn.select(folder)
+                    if typ != "OK":
+                        continue
+                    typ, _ = imap_conn.store(uid.encode("utf-8"), "+FLAGS", "\\Deleted")
+                    if typ != "OK":
+                        continue
+                    imap_conn.expunge()
+                    return {"success": True, "id": target}
+                finally:
+                    try:
+                        imap_conn.logout()
+                    except Exception:
+                        pass
+            raise MailServiceError("IMAP 删除邮件失败: 未找到邮件")
+        last_err = ""
+        for acc in self._accounts:
+            resp = self._graph_request(
+                acc,
+                "DELETE",
+                f"/me/messages/{urllib.parse.quote(target, safe='')}",
+                proxies=proxies,
+            )
+            code = int(resp.status_code or 0)
+            if code == 404:
+                continue
+            if code in {200, 202, 204}:
+                return {"success": True, "id": target}
+            last_err = f"HTTP {code}: {_safe_text(resp.text)}"
+        raise MailServiceError(f"Graph 删除邮件失败: {last_err or '未找到邮件'}")
+
+    def clear_emails(self, mailbox: str, *, proxies: Any = None) -> dict[str, Any]:
+        target = str(mailbox or "").strip().lower()
+        if not target:
+            raise MailServiceError("邮箱地址不能为空")
+        if self.fetch_mode == "imap_xoauth2":
+            deleted = 0
+            mails = self.list_emails(target, proxies=proxies)
+            for m in mails:
+                mid = str((m or {}).get("id") or "").strip()
+                if not mid:
+                    continue
+                try:
+                    self.delete_email(mid, proxies=proxies)
+                    deleted += 1
+                except Exception:
+                    continue
+            return {"success": True, "mailbox": target, "deleted": deleted}
+        mails = self.list_emails(target, proxies=proxies)
+        deleted = 0
+        for m in mails:
+            mid = str((m or {}).get("id") or "").strip()
+            if not mid:
+                continue
+            try:
+                self.delete_email(mid, proxies=proxies)
+                deleted += 1
+            except Exception:
+                continue
+        return {"success": True, "mailbox": target, "deleted": deleted}
+
+
 def build_mail_service(
     provider: str,
     *,
@@ -673,10 +1448,19 @@ def build_mail_service(
     """按 provider 构建邮箱服务客户端。"""
     p = normalize_mail_provider(provider)
     if p == "mailfree":
-        return MailFreeService(
+        from mail_service_mailfree import build_mailfree_service
+
+        return build_mailfree_service(
             base_url=base_url,
             username=username,
             password=password,
+            verify_ssl=verify_ssl,
+            logger=logger,
+        )
+    if p == "graph":
+        from mail_service_graph import build_graph_service
+
+        return build_graph_service(
             verify_ssl=verify_ssl,
             logger=logger,
         )
@@ -686,6 +1470,7 @@ def build_mail_service(
 __all__ = [
     "MailServiceBase",
     "MailServiceError",
+    "MicrosoftGraphService",
     "MailFreeService",
     "available_mail_providers",
     "build_mail_service",

@@ -6,7 +6,7 @@ from typing import Any
 
 CONFIG_FILE = "gui_config.json"
 ACCOUNTS_TXT = "accounts.txt"
-MAILFREE_DEFAULT_BASE_URL = "https://mailfree.ylmty520.workers.dev"
+MAILFREE_DEFAULT_BASE_URL = "https://mailfree.example.workers.dev"
 
 # 默认配置（缺省键在 load_config 时与文件/.env 合并）
 DEFAULT_CONFIG = {
@@ -36,21 +36,37 @@ DEFAULT_CONFIG = {
     "freemail_username": "",
     "freemail_password": "",
     "mail_service_provider": "mailfree",
+    "graph_accounts_file": "",
+    "graph_tenant": "common",
+    "graph_fetch_mode": "graph_api",
+    "graph_pre_refresh_before_run": True,
+    "hero_sms_enabled": False,
+    "hero_sms_api_key": "",
+    "hero_sms_service": "",
+    "hero_sms_country": "US",
+    "hero_sms_max_price": 2.0,
+    "hero_sms_reuse_phone": False,
+    "hero_sms_auto_pick_country": False,
     "mail_domain_allowlist": [],
+    "mailbox_custom_enabled": False,
+    "mailbox_prefix": "",
+    "mailbox_random_len": 0,
     "mail_domain_error_counts": {},
     "mail_domain_registered_counts": {},
     "json_file_notes": {},
     "mailfree_random_domain": True,
+    "register_random_fingerprint": True,
     "openai_ssl_verify": True,
     "skip_net_check": False,
-    "accounts_sync_api_url": "https://one.ytb.icu/api/v1/admin/accounts/data",
+    "accounts_sync_api_url": "",
     "accounts_sync_bearer_token": "",
-    "accounts_list_api_base": "https://one.ytb.icu/api/v1/admin/accounts",
+    "accounts_list_api_base": "",
     "accounts_list_page_size": 10,
     "accounts_list_fetch_workers": 4,
     "accounts_list_ssl_retry": 3,
     "accounts_list_ssl_retry_wait_sec": 0.8,
     "accounts_list_timezone": "Asia/Shanghai",
+    "codex_export_dir": "",
 }
 
 
@@ -85,6 +101,7 @@ def load_config() -> dict[str, Any]:
                 cfg.update(json.load(f))
         except Exception:
             pass
+
     if not cfg.get("worker_domain"):
         env = _parse_env()
         cfg["worker_domain"] = env.get("WORKER_DOMAIN", "") or MAILFREE_DEFAULT_BASE_URL
@@ -94,6 +111,8 @@ def load_config() -> dict[str, Any]:
         cfg["openai_ssl_verify"] = ssl_v not in ("0", "false", "no")
         skip_v = env.get("SKIP_NET_CHECK", "0").strip().lower()
         cfg["skip_net_check"] = skip_v in ("1", "true", "yes")
+        fp_v = env.get("REGISTER_RANDOM_FINGERPRINT", "1").strip().lower()
+        cfg["register_random_fingerprint"] = fp_v not in ("0", "false", "no")
         save_config(cfg)
     return cfg
 

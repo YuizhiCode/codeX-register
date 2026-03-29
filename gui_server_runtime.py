@@ -108,8 +108,26 @@ def _make_api_handler(service, index_html: str):
                     self._ok(service.mail_providers())
                     return
 
+                if path == "/api/mail/graph-account-files":
+                    self._ok(service.mail_graph_account_files())
+                    return
+
                 if path == "/api/mail/domain-stats":
                     self._ok(service.mail_domain_stats())
+                    return
+
+                if path == "/api/sms/overview":
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    raw_refresh = str((qs.get("refresh") or ["0"])[0] or "0").strip().lower()
+                    refresh = raw_refresh in {"1", "true", "yes", "on"}
+                    self._ok(service.sms_overview(refresh=refresh))
+                    return
+
+                if path == "/api/sms/countries":
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    raw_refresh = str((qs.get("refresh") or ["0"])[0] or "0").strip().lower()
+                    refresh = raw_refresh in {"1", "true", "yes", "on"}
+                    self._ok(service.sms_countries(refresh=refresh))
                     return
 
                 self._err("未找到接口", HTTPStatus.NOT_FOUND)
@@ -140,6 +158,10 @@ def _make_api_handler(service, index_html: str):
                     self._ok({"done": True})
                     return
 
+                if path == "/api/run-stats/clear":
+                    self._ok(service.clear_run_stats())
+                    return
+
                 if path == "/api/data/json/delete":
                     payload = self._read_json_body()
                     paths = payload.get("paths") or []
@@ -161,6 +183,14 @@ def _make_api_handler(service, index_html: str):
                     if not isinstance(emails, list):
                         raise ValueError("emails 必须为数组")
                     self._ok(service.sync_selected_accounts(emails))
+                    return
+
+                if path == "/api/data/codex/export":
+                    payload = self._read_json_body()
+                    emails = payload.get("emails") or []
+                    if not isinstance(emails, list):
+                        raise ValueError("emails 必须为数组")
+                    self._ok(service.export_codex_accounts(emails))
                     return
 
                 if path == "/api/remote/fetch-all":
@@ -191,6 +221,31 @@ def _make_api_handler(service, index_html: str):
                     if not isinstance(ids, list):
                         raise ValueError("ids 必须为数组")
                     self._ok(service.delete_remote_accounts(ids))
+                    return
+
+                if path == "/api/remote/groups":
+                    self._ok(service.remote_list_groups())
+                    return
+
+                if path == "/api/remote/groups/bulk-update":
+                    payload = self._read_json_body()
+                    account_ids = payload.get("account_ids") or []
+                    group_ids = payload.get("group_ids") or []
+                    if not isinstance(account_ids, list):
+                        raise ValueError("account_ids 必须为数组")
+                    if not isinstance(group_ids, list):
+                        raise ValueError("group_ids 必须为数组")
+                    self._ok(service.remote_bulk_update_groups(account_ids, group_ids))
+                    return
+
+                if path == "/api/flclash/probe":
+                    payload = self._read_json_body()
+                    self._ok(
+                        service.probe_flclash_nodes(
+                            rounds=payload.get("rounds", 1),
+                            per_round_limit=payload.get("per_round_limit", 0),
+                        )
+                    )
                     return
 
                 if path == "/api/mail/overview":
@@ -237,6 +292,19 @@ def _make_api_handler(service, index_html: str):
                     payload = self._read_json_body()
                     mailbox = str(payload.get("mailbox") or "")
                     self._ok(service.mail_clear_emails(mailbox))
+                    return
+
+                if path == "/api/mail/graph-account-file/import":
+                    payload = self._read_json_body()
+                    filename = str(payload.get("filename") or "")
+                    content = str(payload.get("content") or "")
+                    self._ok(service.mail_import_graph_account_file(filename, content))
+                    return
+
+                if path == "/api/mail/graph-account-file/delete":
+                    payload = self._read_json_body()
+                    filename = str(payload.get("filename") or "")
+                    self._ok(service.mail_delete_graph_account_file(filename))
                     return
 
                 if path == "/api/mail/mailbox/delete":

@@ -30,7 +30,9 @@
       NAlert,
       NDataTable,
       NScrollbar,
-      NModal
+      NModal,
+      NTabs,
+      NTabPane
     } = naive;
 
     const { message } = naive.createDiscreteApi(["message"]);
@@ -57,7 +59,9 @@
         NAlert,
         NDataTable,
         NScrollbar,
-        NModal
+        NModal,
+        NTabs,
+        NTabPane
       },
       setup() {
 __GUI_FRONTEND_APP_SETUP__

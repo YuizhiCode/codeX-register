@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import glob
+import io
 import json
 import os
+import re
+import subprocess
+import sys
+import zipfile
 from datetime import datetime
 from typing import Any
 
@@ -103,6 +108,181 @@ def source_label(files: list[str]) -> str:
     if len(files) == 1:
         return files[0]
     return f"{files[0]} +{len(files) - 1}"
+
+
+def _safe_export_stem(raw: Any, fallback: str) -> str:
+    base = str(raw or "").strip()
+    if not base:
+        base = fallback
+    if base.lower().endswith(".json"):
+        base = base[:-5]
+    base = re.sub(r"[\\/:*?\"<>|]+", "_", base)
+    base = re.sub(r"\s+", "_", base)
+    base = base.strip("._ ")
+    return base or fallback
+
+
+def _open_directory(path: str) -> bool:
+    target = os.path.abspath(str(path or "").strip())
+    if not target or not os.path.isdir(target):
+        return False
+    try:
+        if os.name == "nt":
+            os.startfile(target)  # type: ignore[attr-defined]
+            return True
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", target])
+            return True
+        subprocess.Popen(["xdg-open", target])
+        return True
+    except Exception:
+        return False
+
+
+def _account_to_codex_record(acc: dict[str, Any]) -> dict[str, str]:
+    creds = acc.get("credentials") if isinstance(acc.get("credentials"), dict) else {}
+    extra = acc.get("extra") if isinstance(acc.get("extra"), dict) else {}
+
+    email = str(
+        acc.get("name")
+        or creds.get("email")
+        or extra.get("email")
+        or ""
+    ).strip()
+    expired = str(
+        creds.get("expires_at")
+        or creds.get("expired")
+        or acc.get("expired")
+        or ""
+    ).strip()
+    id_token = str(creds.get("id_token") or acc.get("id_token") or "").strip()
+    account_id = str(
+        creds.get("chatgpt_account_id")
+        or creds.get("account_id")
+        or acc.get("account_id")
+        or ""
+    ).strip()
+    access_token = str(creds.get("access_token") or acc.get("access_token") or "").strip()
+    last_refresh = str(
+        creds.get("last_refresh")
+        or acc.get("last_refresh")
+        or ""
+    ).strip()
+    refresh_token = str(creds.get("refresh_token") or acc.get("refresh_token") or "").strip()
+
+    return {
+        "type": "codex",
+        "email": email,
+        "expired": expired,
+        "id_token": id_token,
+        "account_id": account_id,
+        "access_token": access_token,
+        "last_refresh": last_refresh,
+        "refresh_token": refresh_token,
+    }
+
+
+def export_codex_accounts(service, emails: list[Any]) -> dict[str, Any]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in emails:
+        em = str(raw or "").strip().lower()
+        if not em or em in seen:
+            continue
+        seen.add(em)
+        ordered.append(em)
+    if not ordered:
+        raise ValueError("请先勾选账号")
+
+    raw_export_dir = str(service.cfg.get("codex_export_dir") or "").strip()
+    if not raw_export_dir:
+        raise ValueError("请先设置 CodeX 导出目录")
+
+    export_dir = os.path.abspath(os.path.expanduser(raw_export_dir))
+    try:
+        os.makedirs(export_dir, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(f"创建导出目录失败: {e}") from e
+    if not os.path.isdir(export_dir):
+        raise RuntimeError("CodeX 导出目录不可用")
+
+    local_map = build_local_account_index(service)
+    source_map = build_email_source_files_map(service)
+
+    picked: list[tuple[str, dict[str, Any], str]] = []
+    missing: list[str] = []
+    for em in ordered:
+        acc = local_map.get(em)
+        if not isinstance(acc, dict):
+            missing.append(em)
+            continue
+        files = list(source_map.get(em, []))
+        source_primary = str(files[0] if files else "").strip()
+        picked.append((em, acc, source_primary))
+
+    if not picked:
+        raise RuntimeError("本地 JSON 中未找到可导出的账号")
+
+    payload_files: list[tuple[str, bytes, str]] = []
+    used_names: set[str] = set()
+    for idx, (em, acc, src) in enumerate(picked, start=1):
+        row = _account_to_codex_record(acc)
+        if not row["email"]:
+            row["email"] = em
+
+        stem = _safe_export_stem(row["email"], f"account_{idx}")
+        filename = f"{stem}.json"
+        suffix = 2
+        while filename.lower() in used_names:
+            filename = f"{stem}_{suffix}.json"
+            suffix += 1
+        used_names.add(filename.lower())
+
+        body = json.dumps(row, ensure_ascii=False, indent=2).encode("utf-8")
+        payload_files.append((filename, body, src))
+
+    if len(payload_files) == 1:
+        out_name = payload_files[0][0]
+        out_bytes = payload_files[0][1]
+    else:
+        src_name = ""
+        for _, _, src in payload_files:
+            if src:
+                src_name = src
+                break
+        zip_stem = _safe_export_stem(src_name, "codex_accounts")
+
+        out_name = f"{zip_stem}.zip"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for fn, body, _ in payload_files:
+                zf.writestr(fn, body)
+        out_bytes = buf.getvalue()
+
+    target_path = os.path.join(export_dir, out_name)
+    try:
+        with open(target_path, "wb") as f:
+            f.write(out_bytes)
+    except Exception as e:
+        raise RuntimeError(f"写入导出文件失败: {e}") from e
+
+    opened_dir = _open_directory(export_dir)
+
+    service.log(
+        f"CodeX 导出完成：选中 {len(ordered)}，导出 {len(payload_files)}"
+        + (f"，缺失 {len(missing)}" if missing else "")
+        + f"，路径 {target_path}"
+    )
+
+    return {
+        "filename": out_name,
+        "saved_path": target_path,
+        "output_dir": export_dir,
+        "opened_dir": opened_dir,
+        "selected": len(ordered),
+        "exported": len(payload_files),
+        "missing": missing,
+    }
 
 
 def save_json_file_note(service, path: str, note: str) -> dict[str, Any]:
@@ -395,6 +575,7 @@ __all__ = [
     "emails_from_accounts_json",
     "list_accounts",
     "list_json_files",
+    "export_codex_accounts",
     "save_json_file_note",
     "source_label",
     "sync_selected_accounts",

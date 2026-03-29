@@ -136,10 +136,25 @@
       text-overflow: ellipsis;
     }
 
+    .run-metrics-actions {
+      grid-column: 1 / 3;
+      display: flex;
+      justify-content: flex-end;
+      margin-top: -2px;
+    }
+
     .content {
       flex: 1;
       min-height: 0;
       padding: 12px;
+      overflow: hidden;
+    }
+
+    .content-logs-mode {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      min-height: 0;
       overflow: hidden;
     }
 
@@ -162,11 +177,22 @@
       align-content: start;
     }
 
-    .log-page {
-      height: 100%;
-      min-height: 100%;
+    .log-page-shell {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 0;
+      min-height: 0;
       overflow: hidden;
-      align-content: stretch;
+    }
+
+    .log-page {
+      flex: 1;
+      height: 0;
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
     }
 
     .glass-card {
@@ -219,7 +245,16 @@
       min-width: 220px;
     }
 
+    .toolbar-path {
+      width: 360px;
+      min-width: 220px;
+    }
+
     .toolbar-select .n-base-selection {
+      min-height: 34px;
+    }
+
+    .toolbar-path .n-input__input-el {
       min-height: 34px;
     }
 
@@ -357,6 +392,28 @@
       margin-top: 10px;
     }
 
+    .flclash-probe-wrap {
+      margin-top: 12px;
+      border: 1px solid rgba(86, 107, 132, 0.35);
+      border-radius: 12px;
+      padding: 10px;
+      background: rgba(10, 18, 30, 0.55);
+    }
+
+    .flclash-probe-toolbar {
+      margin-bottom: 8px;
+    }
+
+    .probe-label {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1;
+    }
+
+    .flclash-probe-table {
+      margin-top: 4px;
+    }
+
     .account-table-wrap {
       height: 430px;
       min-height: 430px;
@@ -465,7 +522,9 @@
     }
 
     .log-card {
-      height: 100%;
+      flex: 1;
+      height: 0;
+      min-height: 0;
       display: flex;
       flex-direction: column;
       border: 1px solid rgba(86, 107, 132, 0.5);
@@ -473,15 +532,41 @@
     }
 
     .log-card .n-card__content {
-      flex: 1;
+      flex: 1 1 auto;
       min-height: 0;
+      height: 100%;
       display: flex;
       flex-direction: column;
+      overflow: hidden;
     }
 
     .log-scroll {
-      flex: 1;
-      min-height: 260px;
+      flex: 1 1 0;
+      min-height: 0;
+      height: 100%;
+      position: relative;
+      overflow-y: auto !important;
+      overflow-x: hidden;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+      -webkit-overflow-scrolling: touch;
+      touch-action: pan-y;
+    }
+
+    .log-textarea {
+      display: block;
+      width: 100%;
+      border: 0;
+      outline: none;
+      resize: none;
+      background: transparent;
+      color: #d4e2f2;
+      padding: 6px 4px 14px;
+      font-family: "Cascadia Mono", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.56;
+      white-space: pre;
+      word-break: break-word;
     }
 
     .log-view {
@@ -496,14 +581,14 @@
     }
 
     .content-inner-scroll .n-scrollbar-container::-webkit-scrollbar,
-    .log-scroll .n-scrollbar-container::-webkit-scrollbar,
+    .log-scroll::-webkit-scrollbar,
     body::-webkit-scrollbar {
       width: 10px;
       height: 10px;
     }
 
     .content-inner-scroll .n-scrollbar-container::-webkit-scrollbar-thumb,
-    .log-scroll .n-scrollbar-container::-webkit-scrollbar-thumb,
+    .log-scroll::-webkit-scrollbar-thumb,
     body::-webkit-scrollbar-thumb {
       background: rgba(91, 114, 142, 0.56);
       border-radius: 9px;
@@ -511,7 +596,7 @@
     }
 
     .content-inner-scroll .n-scrollbar-container::-webkit-scrollbar-track,
-    .log-scroll .n-scrollbar-container::-webkit-scrollbar-track,
+    .log-scroll::-webkit-scrollbar-track,
     body::-webkit-scrollbar-track {
       background: rgba(13, 20, 32, 0.4);
     }
@@ -562,10 +647,6 @@
 
       .tab-page {
         overflow: hidden;
-      }
-
-      .log-scroll {
-        min-height: 320px;
       }
 
     }

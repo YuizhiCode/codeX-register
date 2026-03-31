@@ -1,0 +1,97 @@
+name: Bug Report
+description: 提交问题反馈，请尽量补充完整信息以便排查
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈问题。请尽量完整填写以下内容，尤其是测试流程、截图和运行环境信息，这会明显加快排查速度。
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 请清晰描述你遇到的问题、异常现象，以及你期望看到的正确结果。
+      placeholder: |
+        例如：
+        1. 点击开始注册后任务一直卡在初始化
+        2. 页面没有报错提示，但后台日志显示请求失败
+        3. 期望程序可以正常进入下一步
+    validations:
+      required: true
+
+  - type: textarea
+    id: test-steps
+    attributes:
+      label: 测试流程 / 复现步骤
+      description: 请按顺序写出你的操作步骤，最好能稳定复现。
+      placeholder: |
+        例如：
+        1. 执行 `python gui.py`
+        2. 在界面中填写邮箱配置
+        3. 点击“开始”按钮
+        4. 等待约 30 秒后出现异常
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 测试截图
+      description: 请粘贴截图、录屏链接，或终端/页面关键报错截图。可直接拖拽图片到 GitHub issue。
+      placeholder: |
+        请提供：
+        - 页面截图
+        - 控制台截图
+        - 日志截图
+        - 录屏链接（如有）
+    validations:
+      required: true
+
+  - type: textarea
+    id: current-environment
+    attributes:
+      label: 当前运行环境
+      description: 请填写你的运行环境信息。
+      placeholder: |
+        例如：
+        - OS: Windows 11 / Ubuntu 22.04 / macOS 14
+        - 运行方式: 本地运行 / Docker / VPS / GitHub Actions
+        - 网络环境: 家宽 / 服务器 / 代理
+        - 浏览器: Chrome 134（如涉及前端页面）
+        - 项目版本/分支/提交: main / v1.0.0 / commit sha
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python 版本号
+      description: 请填写执行 `python --version` 或 `python3 --version` 的结果。
+      placeholder: 例如：Python 3.11.9
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志或报错信息
+      description: 请粘贴完整或关键日志，注意脱敏处理。
+      render: shell
+      placeholder: |
+        Traceback (most recent call last):
+        ...
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 可补充配置方式、依赖安装命令、是否能稳定复现、是否改过源码等信息。
+      placeholder: |
+        例如：
+        - 安装命令：`pip install -r requirements.txt`
+        - 是否修改过源码：否
+        - 是否稳定复现：是
+        - 其他你认为有帮助的信息

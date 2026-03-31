@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from gui_frontend import INDEX_HTML
-from gui_server_runtime import main_entry
-from gui_service import RegisterService
+from codex_register.gui_frontend import INDEX_HTML
+from codex_register.gui_server_runtime import main_entry
+from codex_register.gui_service import RegisterService
 
 
 def main() -> None:

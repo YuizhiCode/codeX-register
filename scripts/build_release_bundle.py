@@ -12,17 +12,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "gui.py"
 APP_NAME = "CodeXRegister"
-ASSET_FILES = [
-    "gui_frontend.html",
-    "gui_frontend_style.css",
-    "gui_frontend_bootstrap.js",
-    "gui_frontend_app.js",
-    "gui_frontend_app_setup.js",
-    "gui_frontend_app_template.html",
-    "README.md",
-    "gui_config.example.json",
-    "VERSION",
-    "REPOSITORY",
+ASSET_ITEMS = [
+    ("codex_register/gui_frontend.html", "codex_register"),
+    ("codex_register/gui_frontend_style.css", "codex_register"),
+    ("codex_register/gui_frontend_bootstrap.js", "codex_register"),
+    ("codex_register/gui_frontend_app.js", "codex_register"),
+    ("codex_register/gui_frontend_app_setup.js", "codex_register"),
+    ("codex_register/gui_frontend_app_template.html", "codex_register"),
+    ("README.md", "."),
+    ("gui_config.example.json", "."),
+    ("VERSION", "."),
+    ("REPOSITORY", "."),
 ]
 
 
@@ -67,10 +67,10 @@ def build(tag: str, platform: str) -> Path:
         APP_NAME,
     ]
 
-    for name in ASSET_FILES:
+    for name, dest in ASSET_ITEMS:
         src = ROOT / name
         if src.exists():
-            cmd.extend(["--add-data", f"{src}{sep}."])
+            cmd.extend(["--add-data", f"{src}{sep}{dest}"])
 
     cmd.append(str(ENTRY))
     run(cmd)

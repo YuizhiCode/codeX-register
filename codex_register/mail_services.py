@@ -2148,7 +2148,7 @@ def build_mail_service(
     """按 provider 构建邮箱服务客户端。"""
     p = normalize_mail_provider(provider)
     if p == "cloudflare_temp_email":
-        from mail_providers.cloudflare_temp import build_cloudflare_temp_service
+        from .mail_providers.cloudflare_temp import build_cloudflare_temp_service
 
         return build_cloudflare_temp_service(
             base_url=base_url,
@@ -2156,7 +2156,7 @@ def build_mail_service(
             logger=logger,
         )
     if p == "mailfree":
-        from mail_providers.mailfree import build_mailfree_service
+        from .mail_providers.mailfree import build_mailfree_service
 
         return build_mailfree_service(
             base_url=base_url,
@@ -2166,28 +2166,28 @@ def build_mail_service(
             logger=logger,
         )
     if p == "gmail":
-        from mail_providers.gmail import build_gmail_service
+        from .mail_providers.gmail import build_gmail_service
 
         return build_gmail_service(
             verify_ssl=verify_ssl,
             logger=logger,
         )
     if p == "cloudmail":
-        from mail_providers.cloudmail import build_cloudmail_service
+        from .mail_providers.cloudmail import build_cloudmail_service
 
         return build_cloudmail_service(
             verify_ssl=verify_ssl,
             logger=logger,
         )
     if p == "mail_curl":
-        from mail_providers.mail_curl import build_mail_curl_service
+        from .mail_providers.mail_curl import build_mail_curl_service
 
         return build_mail_curl_service(
             verify_ssl=verify_ssl,
             logger=logger,
         )
     if p == "graph":
-        from mail_providers.graph import build_graph_service
+        from .mail_providers.graph import build_graph_service
 
         return build_graph_service(
             verify_ssl=verify_ssl,

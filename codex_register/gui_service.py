@@ -30,8 +30,8 @@ from datetime import datetime
 from queue import Empty, Queue
 from typing import Any
 
-from gui_config_store import ACCOUNTS_TXT, DEFAULT_CONFIG, load_config, save_config
-from gui_http_utils import (
+from .gui_config_store import ACCOUNTS_TXT, DEFAULT_CONFIG, load_config, save_config
+from .gui_http_utils import (
     _hint_connect_error,
     _http_delete,
     _http_get,
@@ -39,7 +39,7 @@ from gui_http_utils import (
     _merge_http_headers,
     _urlopen_request,
 )
-from gui_service_data_ops import (
+from .gui_service_data_ops import (
     accounts_txt_path as _data_accounts_txt_path,
     build_email_source_files_map as _data_build_email_source_files_map,
     build_local_account_index as _data_build_local_account_index,
@@ -57,7 +57,7 @@ from gui_service_data_ops import (
     test_local_accounts_via_cpa as _data_test_local_accounts_via_cpa,
     upsert_local_account_record as _data_upsert_local_account_record,
 )
-from gui_service_mail_ops import (
+from .gui_service_mail_ops import (
     get_mail_client as _mail_get_mail_client,
     mail_clear_emails as _mail_mail_clear_emails,
     mail_client_signature as _mail_mail_client_signature,
@@ -80,7 +80,7 @@ from gui_service_mail_ops import (
     record_mail_domain_error as _mail_record_mail_domain_error,
     record_mail_domain_registered as _mail_record_mail_domain_registered,
 )
-from gui_service_remote_test import (
+from .gui_service_remote_test import (
     batch_test_remote_accounts as _remote_batch_test_remote_accounts,
     consume_test_event_stream as _remote_consume_test_event_stream,
     is_account_deactivated_error as _remote_is_account_deactivated_error,
@@ -93,7 +93,7 @@ from gui_service_remote_test import (
     set_remote_test_state as _remote_set_remote_test_state,
     try_refresh_remote_token as _remote_try_refresh_remote_token,
 )
-from mail_services import (
+from .mail_services import (
     MailServiceError,
     available_mail_providers,
     build_mail_service,
@@ -2072,7 +2072,7 @@ class RegisterService:
         }
 
         try:
-            import r_with_pwd  # type: ignore
+            from . import r_with_pwd  # type: ignore
 
             stats_fn = getattr(r_with_pwd, "get_hero_sms_runtime_stats", None)
             if callable(stats_fn):
@@ -2146,7 +2146,7 @@ class RegisterService:
             return out
 
         try:
-            import r_with_pwd  # type: ignore
+            from . import r_with_pwd  # type: ignore
 
             proxy_map = {"http": proxy, "https": proxy} if proxy else None
             req_fn = getattr(r_with_pwd, "_hero_sms_request", None)
@@ -2345,7 +2345,7 @@ class RegisterService:
         sys.stderr = cap
 
         try:
-            import r_with_pwd
+            from . import r_with_pwd
 
             domain = str(self.cfg.get("worker_domain") or "").strip()
             if domain and not domain.startswith("http"):

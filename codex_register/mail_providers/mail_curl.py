@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from curl_cffi import requests
 
-from mail_services import MailServiceBase, MailServiceError
+from ..mail_services import MailServiceBase, MailServiceError
 
 
 def _safe_text(obj: Any, limit: int = 220) -> str:

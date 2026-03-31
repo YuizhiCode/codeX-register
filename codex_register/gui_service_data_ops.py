@@ -16,8 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
-from gui_config_store import ACCOUNTS_TXT, save_config
-from gui_http_utils import _http_delete, _http_get, _http_post_json
+from .gui_config_store import ACCOUNTS_TXT, save_config
+from .gui_http_utils import _http_delete, _http_get, _http_post_json
 
 
 def accounts_txt_path(service) -> str:

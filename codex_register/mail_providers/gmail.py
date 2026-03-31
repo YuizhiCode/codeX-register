@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Callable
 
-from mail_services import GmailImapService
+from ..mail_services import GmailImapService
 
 
 def _env_bool(name: str, default: bool) -> bool:

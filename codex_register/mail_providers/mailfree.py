@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from mail_services import MailFreeService
+from ..mail_services import MailFreeService
 
 
 def build_mailfree_service(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Callable
 
-from mail_services import MicrosoftGraphService
+from ..mail_services import MicrosoftGraphService
 
 
 def build_graph_service(

@@ -12,7 +12,7 @@ from datetime import datetime
 from queue import Empty, Queue
 from typing import Any
 
-from gui_http_utils import (
+from .gui_http_utils import (
     _hint_connect_error,
     _http_delete,
     _http_get,
@@ -491,7 +491,7 @@ def _relogin_openai_account_by_password(
         return False, {}, "密码为空"
 
     try:
-        from r_with_pwd import _login_via_password_and_finish_oauth  # 延迟导入，避免启动期开销
+        from .r_with_pwd import _login_via_password_and_finish_oauth  # 延迟导入，避免启动期开销
     except Exception as e:
         return False, {}, f"加载登录模块失败: {e}"
 

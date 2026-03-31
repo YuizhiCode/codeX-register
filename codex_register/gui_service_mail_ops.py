@@ -6,8 +6,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from gui_config_store import save_config
-from mail_services import (
+from .gui_config_store import save_config
+from .mail_services import (
     MailServiceError,
     available_mail_providers,
     build_mail_service,

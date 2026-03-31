@@ -34,7 +34,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from curl_cffi import requests
-from mail_services import MailServiceError, build_mail_service, normalize_mail_provider
+from .mail_services import MailServiceError, build_mail_service, normalize_mail_provider
 
 
 def _out(msg: str, end: str = "\n", flush: bool = False) -> None:

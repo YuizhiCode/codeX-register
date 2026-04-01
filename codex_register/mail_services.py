@@ -38,6 +38,8 @@ def normalize_mail_provider(raw: Any) -> str:
         return "gmail"
     if val in {"graph", "microsoft_graph", "msgraph", "microsoft"}:
         return "graph"
+    if val in {"luckyous", "luckyous_api", "luckymail", "lucky_mail", "luckyous_openapi"}:
+        return "luckyous"
     return "mailfree"
 
 
@@ -48,6 +50,7 @@ def available_mail_providers() -> list[dict[str, str]]:
         {"label": "MailFree", "value": "mailfree"},
         {"label": "CloudMail", "value": "cloudmail"},
         {"label": "Mail-Curl", "value": "mail_curl"},
+        {"label": "Luckyous API", "value": "luckyous"},
         {"label": "Gmail IMAP", "value": "gmail"},
         {"label": "Microsoft Graph", "value": "graph"},
     ]
@@ -882,6 +885,569 @@ class MailFreeService(MailServiceBase):
             except Exception:
                 deleted_count = 0
         return {"success": True, "mailbox": target, "deleted": max(0, deleted_count)}
+
+
+class LuckyousOpenApiService(MailServiceBase):
+    provider_id = "luckyous"
+    provider_label = "Luckyous API"
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        project_code: str,
+        email_type: str,
+        domain: str,
+        variant_mode: str,
+        specified_email: str,
+        verify_ssl: bool,
+        logger: Callable[[str], None] | None = None,
+    ) -> None:
+        base = str(base_url or "").strip()
+        if base and not base.startswith("http"):
+            base = f"https://{base}"
+        self.base_url = base.rstrip("/")
+        self.api_key = str(api_key or "").strip()
+        self.project_code = str(project_code or "").strip()
+        self.email_type = str(email_type or "").strip()
+        self.domain = str(domain or "").strip().lower()
+        self.variant_mode = str(variant_mode or "").strip().lower()
+        self.specified_email = str(specified_email or "").strip().lower()
+        self.verify_ssl = bool(verify_ssl)
+        self._logger = logger
+        self._cache_lock = threading.Lock()
+        self._orders_by_mailbox: dict[str, dict[str, Any]] = {}
+        self._orders_by_no: dict[str, dict[str, Any]] = {}
+
+    def _log(self, msg: str) -> None:
+        if self._logger:
+            self._logger(msg)
+
+    def _ensure_config(self) -> None:
+        if not self.base_url:
+            raise MailServiceError("请先填写 Luckyous API 地址")
+        if not self.api_key:
+            raise MailServiceError("请先填写 Luckyous API Key")
+        if not self.project_code:
+            raise MailServiceError("请先填写 Luckyous 项目编码（project_code）")
+
+    def _api_url(self, path: str) -> str:
+        return f"{self.base_url}{path}"
+
+    @staticmethod
+    def _normalize_mailbox(raw: Any) -> str:
+        return str(raw or "").strip().lower()
+
+    @staticmethod
+    def _strip_html(raw_html: Any) -> str:
+        html = str(raw_html or "")
+        if not html:
+            return ""
+        text = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return " ".join(text.split())
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        need_api_key: bool = True,
+        timeout: int = 25,
+        proxies: Any = None,
+    ):
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if need_api_key and self.api_key:
+            headers["X-API-Key"] = self.api_key
+        try:
+            resp = requests.request(
+                method=method,
+                url=self._api_url(path),
+                params=params,
+                json=json_body,
+                headers=headers,
+                proxies=proxies,
+                impersonate="safari",
+                verify=self.verify_ssl,
+                timeout=timeout,
+            )
+        except Exception as e:
+            raise MailServiceError(f"{method} {path} 请求失败: {e}") from e
+
+        status = int(resp.status_code or 0)
+        if not (200 <= status < 300):
+            raise MailServiceError(
+                f"{method} {path} 失败 HTTP {status}: {_safe_text(resp.text)}"
+            )
+        return resp
+
+    @staticmethod
+    def _json_or_raise(resp, *, path: str) -> dict[str, Any]:
+        try:
+            payload = resp.json()
+        except Exception as e:
+            raise MailServiceError(f"{path} 返回非 JSON: {e}") from e
+        if not isinstance(payload, dict):
+            raise MailServiceError(f"{path} 返回格式异常")
+        return payload
+
+    @staticmethod
+    def _success_data(payload: dict[str, Any], *, path: str) -> Any:
+        code = payload.get("code", 0)
+        ok = False
+        if code in (0, "0", None, ""):
+            ok = True
+        else:
+            try:
+                ok = int(code) == 0
+            except Exception:
+                ok = False
+        if not ok:
+            msg = str(payload.get("message") or payload.get("msg") or "请求失败")
+            raise MailServiceError(f"{path} 返回失败: {msg}")
+        return payload.get("data")
+
+    def _api_call(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        need_api_key: bool = True,
+        timeout: int = 25,
+        proxies: Any = None,
+    ) -> Any:
+        resp = self._request(
+            method,
+            path,
+            params=params,
+            json_body=json_body,
+            need_api_key=need_api_key,
+            timeout=timeout,
+            proxies=proxies,
+        )
+        payload = self._json_or_raise(resp, path=path)
+        return self._success_data(payload, path=path)
+
+    def _cache_order_row(self, row: dict[str, Any]) -> None:
+        if not isinstance(row, dict):
+            return
+        address = self._normalize_mailbox(
+            row.get("email_address")
+            or row.get("address")
+            or row.get("mailbox")
+            or row.get("email")
+            or ""
+        )
+        order_no = str(row.get("order_no") or "").strip()
+        if not address and not order_no:
+            return
+        normalized = dict(row)
+        if address:
+            normalized["email_address"] = address
+        if order_no:
+            normalized["order_no"] = order_no
+        with self._cache_lock:
+            if address:
+                self._orders_by_mailbox[address] = normalized
+            if order_no:
+                self._orders_by_no[order_no] = normalized
+
+    def _find_order_by_mailbox(self, mailbox: str, *, proxies: Any = None) -> dict[str, Any] | None:
+        target = self._normalize_mailbox(mailbox)
+        if not target:
+            return None
+        with self._cache_lock:
+            hit = self._orders_by_mailbox.get(target)
+            if isinstance(hit, dict):
+                return dict(hit)
+
+        data = self._api_call(
+            "GET",
+            "/api/v1/openapi/orders",
+            params={"page": "1", "page_size": "100"},
+            need_api_key=True,
+            timeout=25,
+            proxies=proxies,
+        )
+        rows = []
+        if isinstance(data, dict):
+            rows = data.get("list") or []
+        elif isinstance(data, list):
+            rows = data
+        if not isinstance(rows, list):
+            rows = []
+
+        found: dict[str, Any] | None = None
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            self._cache_order_row(it)
+            em = self._normalize_mailbox(
+                it.get("email_address") or it.get("address") or it.get("mailbox") or it.get("email")
+            )
+            if em and em == target and found is None:
+                found = dict(it)
+        return found
+
+    def _fetch_order_code(self, order_no: str, *, proxies: Any = None) -> dict[str, Any]:
+        target = str(order_no or "").strip()
+        if not target:
+            return {}
+        path = f"/api/v1/openapi/order/{urllib.parse.quote(target, safe='')}/code"
+        data = self._api_call(
+            "GET",
+            path,
+            need_api_key=True,
+            timeout=20,
+            proxies=proxies,
+        )
+        if not isinstance(data, dict):
+            return {}
+        merged = dict(data)
+        merged["order_no"] = target
+        self._cache_order_row(merged)
+        return merged
+
+    def list_domains(self, *, proxies: Any = None) -> list[str]:
+        domains: list[str] = []
+        data = None
+        try:
+            data = self._api_call(
+                "GET",
+                "/api/v1/openapi/projects",
+                params={"page": "1", "page_size": "100"},
+                need_api_key=True,
+                timeout=20,
+                proxies=proxies,
+            )
+        except Exception:
+            data = None
+
+        rows = []
+        if isinstance(data, dict):
+            rows = data.get("list") or []
+        elif isinstance(data, list):
+            rows = data
+        if isinstance(rows, list):
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                vals = item.get("domains")
+                if isinstance(vals, list):
+                    for d in vals:
+                        dm = str(d or "").strip().lower()
+                        if dm:
+                            domains.append(dm)
+                one = str(item.get("domain") or item.get("default_domain") or "").strip().lower()
+                if one:
+                    domains.append(one)
+
+        if self.domain:
+            domains.insert(0, self.domain)
+        return list(dict.fromkeys([d for d in domains if d]))
+
+    def generate_mailbox(
+        self,
+        *,
+        random_domain: bool = True,
+        allowed_domains: list[str] | None = None,
+        local_prefix: str = "",
+        random_length: int = 0,
+        proxies: Any = None,
+    ) -> str:
+        _ = (random_domain, allowed_domains, local_prefix, random_length)
+        self._ensure_config()
+        body: dict[str, Any] = {
+            "project_code": self.project_code,
+            "quantity": 1,
+        }
+        if self.email_type:
+            body["email_type"] = self.email_type
+        if self.domain:
+            body["domain"] = self.domain
+        if self.variant_mode:
+            body["variant_mode"] = self.variant_mode
+        if self.specified_email:
+            body["specified_email"] = self.specified_email
+
+        data = self._api_call(
+            "POST",
+            "/api/v1/openapi/order/create",
+            json_body=body,
+            need_api_key=True,
+            timeout=25,
+            proxies=proxies,
+        )
+        if not isinstance(data, dict):
+            raise MailServiceError("Luckyous 下单成功但返回格式异常")
+
+        address = self._normalize_mailbox(data.get("email_address") or data.get("address") or "")
+        order_no = str(data.get("order_no") or "").strip()
+        if not address:
+            raise MailServiceError("Luckyous 下单成功但未返回邮箱地址")
+
+        self._cache_order_row(
+            {
+                "order_no": order_no,
+                "email_address": address,
+                "project_name": data.get("project") or data.get("project_name") or "",
+                "status": "pending",
+                "created_at": data.get("created_at") or data.get("assigned_at") or "-",
+                "expired_at": data.get("expired_at") or "-",
+                "raw": data,
+            }
+        )
+        return address
+
+    def list_mailboxes(self, *, limit: int = 100, offset: int = 0, proxies: Any = None) -> list[dict[str, Any]]:
+        self._ensure_config()
+        lim = max(1, min(500, int(limit)))
+        off = max(0, int(offset))
+        page = off // lim + 1
+        data = self._api_call(
+            "GET",
+            "/api/v1/openapi/orders",
+            params={"page": str(page), "page_size": str(lim)},
+            need_api_key=True,
+            timeout=25,
+            proxies=proxies,
+        )
+        rows = []
+        if isinstance(data, dict):
+            rows = data.get("list") or []
+        elif isinstance(data, list):
+            rows = data
+        if not isinstance(rows, list):
+            rows = []
+
+        out: list[dict[str, Any]] = []
+        for idx, it in enumerate(rows):
+            if not isinstance(it, dict):
+                continue
+            address = self._normalize_mailbox(
+                it.get("email_address")
+                or it.get("address")
+                or it.get("mailbox")
+                or it.get("email")
+                or ""
+            )
+            if not address:
+                continue
+            order_no = str(it.get("order_no") or "").strip()
+            status = str(it.get("status") or "").strip()
+            created = str(it.get("created_at") or it.get("assigned_at") or "-")
+            expires = str(it.get("expired_at") or it.get("warranty_until") or "-")
+            code = str(it.get("verification_code") or "").strip()
+            self._cache_order_row(it)
+            out.append(
+                {
+                    "key": f"{order_no or address}:{idx}",
+                    "address": address,
+                    "created_at": created,
+                    "expires_at": expires,
+                    "count": 1 if code else 0,
+                    "status": status,
+                    "raw": it,
+                }
+            )
+        return out
+
+    def delete_mailbox(self, address: str, *, proxies: Any = None) -> dict[str, Any]:
+        target = self._normalize_mailbox(address)
+        if not target:
+            raise MailServiceError("邮箱地址不能为空")
+
+        hit = self._find_order_by_mailbox(target, proxies=proxies)
+        order_no = str((hit or {}).get("order_no") or "").strip()
+        if not order_no:
+            return {"success": False, "mailbox": target, "message": "未找到对应订单"}
+
+        path = f"/api/v1/openapi/order/{urllib.parse.quote(order_no, safe='')}/cancel"
+        try:
+            self._api_call(
+                "POST",
+                path,
+                need_api_key=True,
+                timeout=20,
+                proxies=proxies,
+            )
+        except MailServiceError as e:
+            msg = str(e)
+            low = msg.lower()
+            tolerant = ("已" in msg and ("完成" in msg or "取消" in msg or "超时" in msg)) or (
+                "already" in low
+                or "cancel" in low
+                or "timeout" in low
+                or "completed" in low
+            )
+            if not tolerant:
+                raise
+            return {
+                "success": True,
+                "mailbox": target,
+                "order_no": order_no,
+                "message": msg,
+            }
+        return {"success": True, "mailbox": target, "order_no": order_no}
+
+    def list_emails(self, mailbox: str, *, proxies: Any = None) -> list[dict[str, Any]]:
+        target = self._normalize_mailbox(mailbox)
+        if not target:
+            raise MailServiceError("邮箱地址不能为空")
+
+        hit = self._find_order_by_mailbox(target, proxies=proxies)
+        order_no = str((hit or {}).get("order_no") or "").strip()
+        if not order_no:
+            return []
+
+        data = self._fetch_order_code(order_no, proxies=proxies)
+        if not isinstance(data, dict):
+            return []
+
+        code = str(data.get("verification_code") or "").strip()
+        subject = str(data.get("mail_subject") or "").strip()
+        sender = str(data.get("mail_from") or "").strip()
+        html = str(data.get("mail_body_html") or "")
+        text = self._strip_html(html)
+        status = str(data.get("status") or "").strip().lower()
+        received = str(
+            data.get("received_at")
+            or (hit or {}).get("completed_at")
+            or (hit or {}).get("assigned_at")
+            or (hit or {}).get("created_at")
+            or "-"
+        )
+
+        if not code and not subject and not text and status != "success":
+            return []
+        preview = text or subject or (f"验证码 {code}" if code else "")
+        if len(preview) > 180:
+            preview = preview[:180] + "…"
+
+        row = {
+            "id": order_no,
+            "from": sender or "-",
+            "subject": subject or ("Verification Code" if code else "(无主题)"),
+            "date": received,
+            "preview": preview,
+            "mailbox": target,
+            "raw": data,
+            "text": text,
+            "html": html,
+        }
+        return [row]
+
+    def get_email_detail(self, email_id: str, *, proxies: Any = None) -> dict[str, Any]:
+        order_no = str(email_id or "").strip()
+        if not order_no:
+            raise MailServiceError("邮件 ID 不能为空")
+
+        data = self._fetch_order_code(order_no, proxies=proxies)
+        if not isinstance(data, dict):
+            raise MailServiceError("获取邮件详情失败：返回为空")
+
+        code = str(data.get("verification_code") or "").strip()
+        sender = str(data.get("mail_from") or "").strip()
+        subject = str(data.get("mail_subject") or "").strip() or ("Verification Code" if code else "(无主题)")
+        html = str(data.get("mail_body_html") or "")
+        text = self._strip_html(html)
+        received = str(data.get("received_at") or "-")
+        payload_text = json.dumps(data, ensure_ascii=False, indent=2)
+        content = self.merge_mail_content(
+            {
+                "subject": subject,
+                "intro": f"verification_code={code}" if code else "",
+                "text": text,
+                "html": html,
+                "raw": payload_text,
+            }
+        )
+        return {
+            "id": order_no,
+            "from": sender or "-",
+            "subject": subject,
+            "date": received,
+            "text": text,
+            "html": html,
+            "raw": payload_text,
+            "content": content,
+            "payload": data,
+        }
+
+    def delete_email(self, email_id: str, *, proxies: Any = None) -> dict[str, Any]:
+        _ = (proxies,)
+        target = str(email_id or "").strip()
+        if not target:
+            raise MailServiceError("邮件 ID 不能为空")
+        return {"success": True, "id": target, "message": "Luckyous 订单邮件不支持单条删除"}
+
+    def clear_emails(self, mailbox: str, *, proxies: Any = None) -> dict[str, Any]:
+        _ = (proxies,)
+        target = self._normalize_mailbox(mailbox)
+        if not target:
+            raise MailServiceError("邮箱地址不能为空")
+        return {"success": True, "mailbox": target, "deleted": 0, "message": "Luckyous 订单邮件不支持清空"}
+
+    def poll_otp_code(
+        self,
+        mailbox: str,
+        *,
+        poll_rounds: int = 40,
+        poll_interval: float = 3.0,
+        proxies: Any = None,
+        progress_cb: Callable[[], None] | None = None,
+    ) -> str:
+        target = self._normalize_mailbox(mailbox)
+        if not target:
+            return ""
+        hit = self._find_order_by_mailbox(target, proxies=proxies)
+        order_no = str((hit or {}).get("order_no") or "").strip()
+        if not order_no:
+            return ""
+
+        rounds = max(1, int(poll_rounds))
+        interval = max(0.2, float(poll_interval))
+        for _ in range(rounds):
+            if progress_cb:
+                progress_cb()
+            data = {}
+            try:
+                data = self._fetch_order_code(order_no, proxies=proxies)
+            except Exception:
+                data = {}
+
+            code = str((data or {}).get("verification_code") or "").strip()
+            if code:
+                return code
+
+            html = str((data or {}).get("mail_body_html") or "")
+            subject = str((data or {}).get("mail_subject") or "")
+            sender = str((data or {}).get("mail_from") or "")
+            fallback = self.extract_otp_code(
+                self.merge_mail_content(
+                    {
+                        "subject": subject,
+                        "intro": sender,
+                        "text": self._strip_html(html),
+                        "html": html,
+                        "raw": json.dumps(data or {}, ensure_ascii=False),
+                    }
+                )
+            )
+            if fallback:
+                return fallback
+
+            status = str((data or {}).get("status") or "").strip().lower()
+            if status in {"timeout", "cancelled", "canceled", "refunded"}:
+                break
+            time.sleep(interval)
+        return ""
 
 
 class GmailImapService(MailServiceBase):
@@ -2237,6 +2803,14 @@ def build_mail_service(
             verify_ssl=verify_ssl,
             logger=logger,
         )
+    if p == "luckyous":
+        from .mail_providers.luckyous import build_luckyous_service
+
+        return build_luckyous_service(
+            base_url=base_url,
+            verify_ssl=verify_ssl,
+            logger=logger,
+        )
     if p == "graph":
         from .mail_providers.graph import build_graph_service
 
@@ -2252,6 +2826,7 @@ __all__ = [
     "MailServiceError",
     "GmailImapService",
     "MicrosoftGraphService",
+    "LuckyousOpenApiService",
     "MailFreeService",
     "available_mail_providers",
     "build_mail_service",

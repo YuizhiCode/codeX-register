@@ -5,6 +5,7 @@ __all__ = [
     "cloudmail",
     "gmail",
     "graph",
+    "luckyous",
     "mail_curl",
     "mailfree",
 ]

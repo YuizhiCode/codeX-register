@@ -51,6 +51,13 @@ def mail_client_signature(service) -> tuple[Any, ...]:
     cloudmail_admin_password = str(service.cfg.get("cloudmail_admin_password") or "")
     mail_curl_api_base = str(service.cfg.get("mail_curl_api_base") or "").strip()
     mail_curl_key = str(service.cfg.get("mail_curl_key") or "")
+    luckyous_api_base = str(service.cfg.get("luckyous_api_base") or "https://mails.luckyous.com").strip()
+    luckyous_api_key = str(service.cfg.get("luckyous_api_key") or "").strip()
+    luckyous_project_code = str(service.cfg.get("luckyous_project_code") or "").strip()
+    luckyous_email_type = str(service.cfg.get("luckyous_email_type") or "ms_graph").strip().lower()
+    luckyous_domain = str(service.cfg.get("luckyous_domain") or "").strip().lower()
+    luckyous_variant_mode = str(service.cfg.get("luckyous_variant_mode") or "").strip().lower()
+    luckyous_specified_email = str(service.cfg.get("luckyous_specified_email") or "").strip().lower()
     gmail_imap_user = str(service.cfg.get("gmail_imap_user") or "").strip()
     gmail_imap_pass = str(service.cfg.get("gmail_imap_pass") or "")
     gmail_alias_emails = str(service.cfg.get("gmail_alias_emails") or "").strip()
@@ -71,6 +78,13 @@ def mail_client_signature(service) -> tuple[Any, ...]:
         cloudmail_admin_password,
         mail_curl_api_base,
         mail_curl_key,
+        luckyous_api_base,
+        luckyous_api_key,
+        luckyous_project_code,
+        luckyous_email_type,
+        luckyous_domain,
+        luckyous_variant_mode,
+        luckyous_specified_email,
         graph_accounts_file,
         graph_tenant,
         graph_fetch_mode,
@@ -105,6 +119,13 @@ def get_mail_client(service):
         cloudmail_admin_password,
         mail_curl_api_base,
         mail_curl_key,
+        luckyous_api_base,
+        luckyous_api_key,
+        luckyous_project_code,
+        luckyous_email_type,
+        luckyous_domain,
+        luckyous_variant_mode,
+        luckyous_specified_email,
         graph_accounts_file,
         graph_tenant,
         graph_fetch_mode,
@@ -124,6 +145,13 @@ def get_mail_client(service):
     os.environ["CLOUDMAIL_ADMIN_PASSWORD"] = cloudmail_admin_password
     os.environ["MAIL_CURL_API_BASE"] = mail_curl_api_base
     os.environ["MAIL_CURL_KEY"] = mail_curl_key
+    os.environ["LUCKYOUS_API_BASE"] = luckyous_api_base
+    os.environ["LUCKYOUS_API_KEY"] = luckyous_api_key
+    os.environ["LUCKYOUS_PROJECT_CODE"] = luckyous_project_code
+    os.environ["LUCKYOUS_EMAIL_TYPE"] = luckyous_email_type
+    os.environ["LUCKYOUS_DOMAIN"] = luckyous_domain
+    os.environ["LUCKYOUS_VARIANT_MODE"] = luckyous_variant_mode
+    os.environ["LUCKYOUS_SPECIFIED_EMAIL"] = luckyous_specified_email
     os.environ["GRAPH_ACCOUNTS_FILE"] = graph_accounts_file
     os.environ["GRAPH_TENANT"] = graph_tenant
     os.environ["GRAPH_FETCH_MODE"] = graph_fetch_mode

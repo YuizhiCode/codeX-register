@@ -1041,6 +1041,9 @@ class RegisterService:
         cloudmail_admin_password = str(cfg.get("cloudmail_admin_password") or "").strip()
         mail_curl_api_base = str(cfg.get("mail_curl_api_base") or "").strip()
         mail_curl_key = str(cfg.get("mail_curl_key") or "").strip()
+        luckyous_api_base = str(cfg.get("luckyous_api_base") or "").strip()
+        luckyous_api_key = str(cfg.get("luckyous_api_key") or "").strip()
+        luckyous_project_code = str(cfg.get("luckyous_project_code") or "").strip()
         graph_file = str(cfg.get("graph_accounts_file") or "").strip()
         gmail_user = str(cfg.get("gmail_imap_user") or "").strip()
         gmail_pass = str(cfg.get("gmail_imap_pass") or "").strip()
@@ -1080,6 +1083,13 @@ class RegisterService:
                 blockers.append("Mail-Curl API 地址未填写（mail_curl_api_base）")
             if not mail_curl_key:
                 blockers.append("Mail-Curl Key 未填写（mail_curl_key）")
+        elif provider == "luckyous":
+            if not luckyous_api_base:
+                blockers.append("Luckyous API 地址未填写（luckyous_api_base）")
+            if not luckyous_api_key:
+                blockers.append("Luckyous API Key 未填写（luckyous_api_key）")
+            if not luckyous_project_code:
+                blockers.append("Luckyous 项目编码未填写（luckyous_project_code）")
         elif provider == "gmail":
             if not gmail_user:
                 blockers.append("Gmail IMAP 账号未填写（gmail_imap_user）")
@@ -1454,6 +1464,13 @@ class RegisterService:
             "cloudmail_admin_password",
             "mail_curl_api_base",
             "mail_curl_key",
+            "luckyous_api_base",
+            "luckyous_api_key",
+            "luckyous_project_code",
+            "luckyous_email_type",
+            "luckyous_domain",
+            "luckyous_variant_mode",
+            "luckyous_specified_email",
             "graph_accounts_file",
             "graph_tenant",
             "graph_fetch_mode",
@@ -1604,6 +1621,16 @@ class RegisterService:
             str(cfg.get("cf_worker_mail_domain_binding") or "MAIL_DOMAIN").strip() or "MAIL_DOMAIN"
         )
         cfg["cf_dns_target_domain"] = str(cfg.get("cf_dns_target_domain") or "").strip().lower()
+        cfg["luckyous_api_base"] = (
+            str(cfg.get("luckyous_api_base") or "https://mails.luckyous.com").strip()
+            or "https://mails.luckyous.com"
+        )
+        cfg["luckyous_api_key"] = str(cfg.get("luckyous_api_key") or "").strip()
+        cfg["luckyous_project_code"] = str(cfg.get("luckyous_project_code") or "").strip()
+        cfg["luckyous_email_type"] = str(cfg.get("luckyous_email_type") or "ms_graph").strip().lower()
+        cfg["luckyous_domain"] = str(cfg.get("luckyous_domain") or "").strip().lower()
+        cfg["luckyous_variant_mode"] = str(cfg.get("luckyous_variant_mode") or "").strip().lower()
+        cfg["luckyous_specified_email"] = str(cfg.get("luckyous_specified_email") or "").strip().lower()
         graph_mode = str(cfg.get("graph_fetch_mode") or "graph_api").strip().lower()
         if graph_mode not in {"graph_api", "imap_xoauth2"}:
             graph_mode = "graph_api"
@@ -1715,6 +1742,17 @@ class RegisterService:
         os.environ["CLOUDMAIL_ADMIN_PASSWORD"] = str(self.cfg.get("cloudmail_admin_password") or "")
         os.environ["MAIL_CURL_API_BASE"] = str(self.cfg.get("mail_curl_api_base") or "").strip()
         os.environ["MAIL_CURL_KEY"] = str(self.cfg.get("mail_curl_key") or "")
+        os.environ["LUCKYOUS_API_BASE"] = str(
+            self.cfg.get("luckyous_api_base") or "https://mails.luckyous.com"
+        ).strip()
+        os.environ["LUCKYOUS_API_KEY"] = str(self.cfg.get("luckyous_api_key") or "").strip()
+        os.environ["LUCKYOUS_PROJECT_CODE"] = str(self.cfg.get("luckyous_project_code") or "").strip()
+        os.environ["LUCKYOUS_EMAIL_TYPE"] = str(self.cfg.get("luckyous_email_type") or "ms_graph").strip().lower()
+        os.environ["LUCKYOUS_DOMAIN"] = str(self.cfg.get("luckyous_domain") or "").strip().lower()
+        os.environ["LUCKYOUS_VARIANT_MODE"] = str(self.cfg.get("luckyous_variant_mode") or "").strip().lower()
+        os.environ["LUCKYOUS_SPECIFIED_EMAIL"] = str(
+            self.cfg.get("luckyous_specified_email") or ""
+        ).strip().lower()
         os.environ["MAIL_SERVICE_PROVIDER"] = normalize_mail_provider(
             self.cfg.get("mail_service_provider") or "mailfree"
         )
@@ -2543,6 +2581,12 @@ class RegisterService:
                     domain = cf_domain
                 if cf_domains_raw:
                     mail_domains_raw = cf_domains_raw
+            elif mail_provider == "luckyous":
+                lucky_base = str(
+                    self.cfg.get("luckyous_api_base") or "https://mails.luckyous.com"
+                ).strip()
+                if lucky_base:
+                    domain = lucky_base
             if domain and not domain.startswith("http"):
                 domain = f"https://{domain}"
 
@@ -2622,6 +2666,26 @@ class RegisterService:
                     self.log(
                         "配置 -> "
                         f"mail={mail_provider}, api={mc_api}, key={mc_mask}"
+                    )
+                elif mail_provider == "luckyous":
+                    lucky_api = str(
+                        self.cfg.get("luckyous_api_base") or "https://mails.luckyous.com"
+                    ).strip()
+                    lucky_key = str(self.cfg.get("luckyous_api_key") or "")
+                    lucky_key_mask = (
+                        lucky_key[:4] + "***"
+                        if len(lucky_key) >= 4
+                        else ("***" if lucky_key else "")
+                    )
+                    lucky_project = str(self.cfg.get("luckyous_project_code") or "").strip()
+                    lucky_type = str(self.cfg.get("luckyous_email_type") or "ms_graph").strip().lower()
+                    lucky_domain = str(self.cfg.get("luckyous_domain") or "").strip().lower()
+                    lucky_mode = str(self.cfg.get("luckyous_variant_mode") or "").strip().lower()
+                    self.log(
+                        "配置 -> "
+                        f"mail={mail_provider}, api={lucky_api}, key={lucky_key_mask}, "
+                        f"project={lucky_project or '-'}, type={lucky_type or '-'}, "
+                        f"domain={lucky_domain or '-'}, variant={lucky_mode or '-'}"
                     )
                 else:
                     gmail_user = str(self.cfg.get("gmail_imap_user") or "").strip().lower()

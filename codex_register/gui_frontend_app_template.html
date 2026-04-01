@@ -369,6 +369,9 @@
                         <n-tab-pane name="mail_curl" tab="Mail-Curl">
                           <span style="display:none"></span>
                         </n-tab-pane>
+                        <n-tab-pane name="luckyous" tab="Luckyous API">
+                          <span style="display:none"></span>
+                        </n-tab-pane>
                         <n-tab-pane name="gmail" tab="Gmail IMAP">
                           <span style="display:none"></span>
                         </n-tab-pane>
@@ -541,6 +544,15 @@
                         <n-input class="toolbar-path" v-model:value="settingsForm.mail_curl_api_base" placeholder="Mail-Curl API 地址" />
                         <n-input class="toolbar-path" v-model:value="settingsForm.mail_curl_key" type="password" show-password-on="click" placeholder="Mail-Curl Key" />
                       </div>
+                      <div v-else-if="mailProviderTab === 'luckyous'" class="toolbar" style="margin-top: 10px">
+                        <n-input class="toolbar-path" v-model:value="settingsForm.luckyous_api_base" placeholder="Luckyous API 地址（默认 https://mails.luckyous.com）" />
+                        <n-input class="toolbar-path" v-model:value="settingsForm.luckyous_api_key" type="password" show-password-on="click" placeholder="Luckyous API Key（X-API-Key）" />
+                        <n-input class="toolbar-path" v-model:value="settingsForm.luckyous_project_code" placeholder="项目编码（例如 twitter）" />
+                        <n-input class="toolbar-path" v-model:value="settingsForm.luckyous_email_type" placeholder="邮箱类型（默认 ms_graph）" />
+                        <n-input class="toolbar-path" v-model:value="settingsForm.luckyous_domain" placeholder="指定域名（可选，如 outlook.com）" />
+                        <n-input class="toolbar-path" v-model:value="settingsForm.luckyous_variant_mode" placeholder="变种模式（可选：dot/plus/mixed/all）" />
+                        <n-input class="toolbar-path" v-model:value="settingsForm.luckyous_specified_email" placeholder="指定邮箱（可选，优先于 domain）" />
+                      </div>
                       <div v-else-if="mailProviderTab === 'gmail'" class="toolbar" style="margin-top: 10px">
                         <n-input
                           class="toolbar-path"
@@ -634,6 +646,9 @@
                       </div>
                       <div v-if="mailProviderTab === 'mail_curl'" class="meta" style="margin-top: 6px">
                         Mail-Curl 通过 <code>/api/remail</code> 创建邮箱，邮件读取依赖本地邮箱-ID 映射。
+                      </div>
+                      <div v-if="mailProviderTab === 'luckyous'" class="meta" style="margin-top: 6px">
+                        Luckyous API 使用 <code>/api/v1/openapi/order/create</code> 下单并通过 <code>/order/{order_no}/code</code> 轮询验证码。
                       </div>
                       <div v-if="mailProviderTab === 'graph'" class="meta" style="margin-top: 6px">
                         文件格式要求：每行必须为 <code>邮箱----密码----client_id----令牌</code>（共 4 段，使用四个中划线分隔）。

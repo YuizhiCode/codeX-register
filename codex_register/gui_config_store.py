@@ -51,6 +51,13 @@ DEFAULT_CONFIG = {
     "cloudmail_admin_password": "",
     "mail_curl_api_base": "",
     "mail_curl_key": "",
+    "luckyous_api_base": "https://mails.luckyous.com",
+    "luckyous_api_key": "",
+    "luckyous_project_code": "",
+    "luckyous_email_type": "ms_graph",
+    "luckyous_domain": "",
+    "luckyous_variant_mode": "",
+    "luckyous_specified_email": "",
     "mail_service_provider": "mailfree",
     "graph_accounts_file": "",
     "graph_tenant": "common",
@@ -158,6 +165,13 @@ def load_config() -> dict[str, Any]:
         cfg["cloudmail_admin_password"] = env.get("CLOUDMAIL_ADMIN_PASSWORD", env.get("CM_ADMIN_PASS", ""))
         cfg["mail_curl_api_base"] = env.get("MAIL_CURL_API_BASE", env.get("MC_API_BASE", ""))
         cfg["mail_curl_key"] = env.get("MAIL_CURL_KEY", env.get("MC_KEY", ""))
+        cfg["luckyous_api_base"] = env.get("LUCKYOUS_API_BASE", "https://mails.luckyous.com")
+        cfg["luckyous_api_key"] = env.get("LUCKYOUS_API_KEY", "")
+        cfg["luckyous_project_code"] = env.get("LUCKYOUS_PROJECT_CODE", "")
+        cfg["luckyous_email_type"] = env.get("LUCKYOUS_EMAIL_TYPE", "ms_graph")
+        cfg["luckyous_domain"] = env.get("LUCKYOUS_DOMAIN", "")
+        cfg["luckyous_variant_mode"] = env.get("LUCKYOUS_VARIANT_MODE", "")
+        cfg["luckyous_specified_email"] = env.get("LUCKYOUS_SPECIFIED_EMAIL", "")
         cfg["mail_service_provider"] = mode
         cfg["remote_account_provider"] = env.get("REMOTE_ACCOUNT_PROVIDER", cfg.get("remote_account_provider", "sub2api"))
         cfg["cliproxy_api_base"] = env.get("CLIPROXY_API_BASE", env.get("CLIPROXY_MANAGEMENT_API", ""))

@@ -113,6 +113,13 @@
           cloudmail_admin_password: "",
           mail_curl_api_base: "",
           mail_curl_key: "",
+          luckyous_api_base: "https://mails.luckyous.com",
+          luckyous_api_key: "",
+          luckyous_project_code: "",
+          luckyous_email_type: "ms_graph",
+          luckyous_domain: "",
+          luckyous_variant_mode: "",
+          luckyous_specified_email: "",
           graph_accounts_file: "",
           graph_tenant: "common",
           graph_fetch_mode: "graph_api",
@@ -950,6 +957,7 @@
           }
           if (["cloudmail", "cloud_mail"].includes(val)) return "cloudmail";
           if (["mail_curl", "mailcurl", "curl_mail"].includes(val)) return "mail_curl";
+          if (["luckyous", "luckyous_api", "luckymail", "lucky_mail", "luckyous_openapi"].includes(val)) return "luckyous";
           if (val === "graph") return "graph";
           if (val === "gmail" || val === "imap") return "gmail";
           return "mailfree";
@@ -1505,6 +1513,13 @@
           settingsForm.cloudmail_admin_password = String(cfg.cloudmail_admin_password || "");
           settingsForm.mail_curl_api_base = String(cfg.mail_curl_api_base || "");
           settingsForm.mail_curl_key = String(cfg.mail_curl_key || "");
+          settingsForm.luckyous_api_base = String(cfg.luckyous_api_base || "https://mails.luckyous.com");
+          settingsForm.luckyous_api_key = String(cfg.luckyous_api_key || "");
+          settingsForm.luckyous_project_code = String(cfg.luckyous_project_code || "");
+          settingsForm.luckyous_email_type = String(cfg.luckyous_email_type || "ms_graph");
+          settingsForm.luckyous_domain = String(cfg.luckyous_domain || "");
+          settingsForm.luckyous_variant_mode = String(cfg.luckyous_variant_mode || "");
+          settingsForm.luckyous_specified_email = String(cfg.luckyous_specified_email || "");
           settingsForm.graph_accounts_file = String(cfg.graph_accounts_file || "");
           settingsForm.graph_tenant = String(cfg.graph_tenant || "common");
           settingsForm.graph_fetch_mode = String(cfg.graph_fetch_mode || "graph_api");
@@ -1588,6 +1603,13 @@
             cloudmail_admin_password: String(settingsForm.cloudmail_admin_password || "").trim(),
             mail_curl_api_base: String(settingsForm.mail_curl_api_base || "").trim(),
             mail_curl_key: String(settingsForm.mail_curl_key || "").trim(),
+            luckyous_api_base: String(settingsForm.luckyous_api_base || "https://mails.luckyous.com").trim(),
+            luckyous_api_key: String(settingsForm.luckyous_api_key || "").trim(),
+            luckyous_project_code: String(settingsForm.luckyous_project_code || "").trim(),
+            luckyous_email_type: String(settingsForm.luckyous_email_type || "ms_graph").trim(),
+            luckyous_domain: String(settingsForm.luckyous_domain || "").trim(),
+            luckyous_variant_mode: String(settingsForm.luckyous_variant_mode || "").trim(),
+            luckyous_specified_email: String(settingsForm.luckyous_specified_email || "").trim(),
             graph_accounts_file: String(settingsForm.graph_accounts_file || "").trim(),
             graph_tenant: String(settingsForm.graph_tenant || "common").trim(),
             graph_fetch_mode: String(settingsForm.graph_fetch_mode || "graph_api").trim(),

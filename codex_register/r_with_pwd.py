@@ -1612,6 +1612,13 @@ def _mail_service_signature() -> tuple[Any, ...]:
     cloudmail_admin_password = str(os.getenv("CLOUDMAIL_ADMIN_PASSWORD", "") or "")
     mail_curl_api_base = str(os.getenv("MAIL_CURL_API_BASE", "") or "").strip()
     mail_curl_key = str(os.getenv("MAIL_CURL_KEY", "") or "")
+    luckyous_api_base = str(os.getenv("LUCKYOUS_API_BASE", "https://mails.luckyous.com") or "").strip()
+    luckyous_api_key = str(os.getenv("LUCKYOUS_API_KEY", "") or "")
+    luckyous_project_code = str(os.getenv("LUCKYOUS_PROJECT_CODE", "") or "").strip()
+    luckyous_email_type = str(os.getenv("LUCKYOUS_EMAIL_TYPE", "ms_graph") or "").strip().lower()
+    luckyous_domain = str(os.getenv("LUCKYOUS_DOMAIN", "") or "").strip().lower()
+    luckyous_variant_mode = str(os.getenv("LUCKYOUS_VARIANT_MODE", "") or "").strip().lower()
+    luckyous_specified_email = str(os.getenv("LUCKYOUS_SPECIFIED_EMAIL", "") or "").strip().lower()
     graph_accounts_file = str(os.getenv("GRAPH_ACCOUNTS_FILE", "") or "").strip()
     graph_tenant = str(os.getenv("GRAPH_TENANT", "common") or "common").strip()
     graph_fetch_mode = str(os.getenv("GRAPH_FETCH_MODE", "graph_api") or "graph_api").strip()
@@ -1643,6 +1650,13 @@ def _mail_service_signature() -> tuple[Any, ...]:
         cloudmail_admin_password,
         mail_curl_api_base,
         mail_curl_key,
+        luckyous_api_base,
+        luckyous_api_key,
+        luckyous_project_code,
+        luckyous_email_type,
+        luckyous_domain,
+        luckyous_variant_mode,
+        luckyous_specified_email,
         graph_accounts_file,
         graph_tenant,
         graph_fetch_mode,
@@ -1686,6 +1700,13 @@ def _get_mail_service_client():
         cloudmail_admin_password,
         mail_curl_api_base,
         mail_curl_key,
+        luckyous_api_base,
+        luckyous_api_key,
+        luckyous_project_code,
+        luckyous_email_type,
+        luckyous_domain,
+        luckyous_variant_mode,
+        luckyous_specified_email,
         graph_accounts_file,
         graph_tenant,
         graph_fetch_mode,
@@ -1705,6 +1726,13 @@ def _get_mail_service_client():
     os.environ["CLOUDMAIL_ADMIN_PASSWORD"] = cloudmail_admin_password
     os.environ["MAIL_CURL_API_BASE"] = mail_curl_api_base
     os.environ["MAIL_CURL_KEY"] = mail_curl_key
+    os.environ["LUCKYOUS_API_BASE"] = luckyous_api_base
+    os.environ["LUCKYOUS_API_KEY"] = luckyous_api_key
+    os.environ["LUCKYOUS_PROJECT_CODE"] = luckyous_project_code
+    os.environ["LUCKYOUS_EMAIL_TYPE"] = luckyous_email_type
+    os.environ["LUCKYOUS_DOMAIN"] = luckyous_domain
+    os.environ["LUCKYOUS_VARIANT_MODE"] = luckyous_variant_mode
+    os.environ["LUCKYOUS_SPECIFIED_EMAIL"] = luckyous_specified_email
     os.environ["GRAPH_ACCOUNTS_FILE"] = graph_accounts_file
     os.environ["GRAPH_TENANT"] = graph_tenant
     os.environ["GRAPH_FETCH_MODE"] = graph_fetch_mode
@@ -1888,6 +1916,18 @@ def get_email_and_token(proxies: Any = None) -> tuple:
             _info("Graph 模式：忽略 MailFree 域名/前缀规则，直接从账号池取邮箱")
         elif provider == "mail_curl":
             _info("Mail-Curl 模式：按邮箱 ID 轮询收件")
+        elif provider == "luckyous":
+            lucky_project = str(os.getenv("LUCKYOUS_PROJECT_CODE", "") or "").strip()
+            lucky_type = str(os.getenv("LUCKYOUS_EMAIL_TYPE", "ms_graph") or "").strip().lower()
+            lucky_domain = str(os.getenv("LUCKYOUS_DOMAIN", "") or "").strip().lower()
+            lucky_variant = str(os.getenv("LUCKYOUS_VARIANT_MODE", "") or "").strip().lower()
+            _info(
+                "Luckyous API 模式："
+                f"project={lucky_project or '-'}，"
+                f"email_type={lucky_type or '-'}，"
+                f"domain={lucky_domain or '-'}，"
+                f"variant={lucky_variant or '-'}"
+            )
         else:
             _info("Gmail 模式：通过 IMAP 别名池接码，忽略 MailFree 域名规则")
             gmail_user = str(os.getenv("GMAIL_IMAP_USER", "") or "").strip().lower()

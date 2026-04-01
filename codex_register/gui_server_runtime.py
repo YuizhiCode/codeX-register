@@ -315,6 +315,40 @@ def _make_api_handler(service, index_html: str):
                     )
                     return
 
+                if path == "/api/mail/cf/zones":
+                    self._ok(service.mail_cf_zones())
+                    return
+
+                if path == "/api/mail/cf/dns/list":
+                    payload = self._read_json_body()
+                    zone_id = str(payload.get("zone_id") or "")
+                    self._ok(service.mail_cf_dns_list(zone_id))
+                    return
+
+                if path == "/api/mail/cf/dns/create":
+                    payload = self._read_json_body()
+                    self._ok(service.mail_cf_dns_create_batch(payload))
+                    return
+
+                if path == "/api/mail/cf/dns/update":
+                    payload = self._read_json_body()
+                    self._ok(service.mail_cf_dns_update(payload))
+                    return
+
+                if path == "/api/mail/cf/dns/delete":
+                    payload = self._read_json_body()
+                    zone_id = str(payload.get("zone_id") or "")
+                    record_ids = payload.get("record_ids") or []
+                    if not isinstance(record_ids, list):
+                        raise ValueError("record_ids 必须为数组")
+                    self._ok(service.mail_cf_dns_delete_batch(zone_id, record_ids))
+                    return
+
+                if path == "/api/mail/cf/worker/set-mail-domain":
+                    payload = self._read_json_body()
+                    self._ok(service.mail_cf_worker_set_mail_domain(payload))
+                    return
+
                 if path == "/api/mail/generate":
                     self._ok(service.mail_generate_mailbox())
                     return

@@ -32,7 +32,9 @@
       NScrollbar,
       NModal,
       NTabs,
-      NTabPane
+      NTabPane,
+      NRadioGroup,
+      NRadioButton
     } = naive;
 
     const { message } = naive.createDiscreteApi(["message"]);
@@ -61,7 +63,9 @@
         NScrollbar,
         NModal,
         NTabs,
-        NTabPane
+        NTabPane,
+        NRadioGroup,
+        NRadioButton
       },
       setup() {
 __GUI_FRONTEND_APP_SETUP__

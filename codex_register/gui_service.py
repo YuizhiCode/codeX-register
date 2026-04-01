@@ -60,6 +60,12 @@ from .gui_service_data_ops import (
 )
 from .gui_service_mail_ops import (
     get_mail_client as _mail_get_mail_client,
+    mail_cf_dns_create_batch as _mail_mail_cf_dns_create_batch,
+    mail_cf_dns_delete_batch as _mail_mail_cf_dns_delete_batch,
+    mail_cf_dns_list as _mail_mail_cf_dns_list,
+    mail_cf_dns_update as _mail_mail_cf_dns_update,
+    mail_cf_worker_set_mail_domain as _mail_mail_cf_worker_set_mail_domain,
+    mail_cf_zones as _mail_mail_cf_zones,
     mail_clear_emails as _mail_mail_clear_emails,
     mail_client_signature as _mail_mail_client_signature,
     mail_content_preview as _mail_mail_content_preview,
@@ -1360,6 +1366,13 @@ class RegisterService:
                 0,
                 5,
             )
+        if "flclash_rotate_every" in data:
+            cfg["flclash_rotate_every"] = self._to_int(
+                data.get("flclash_rotate_every"),
+                cfg.get("flclash_rotate_every", 3),
+                1,
+                200,
+            )
         if "hero_sms_max_price" in data:
             cfg["hero_sms_max_price"] = self._to_float(
                 data.get("hero_sms_max_price"),
@@ -1383,6 +1396,11 @@ class RegisterService:
             "mail_domains",
             "freemail_username",
             "freemail_password",
+            "cf_api_token",
+            "cf_account_id",
+            "cf_worker_script",
+            "cf_worker_mail_domain_binding",
+            "cf_dns_target_domain",
             "cf_temp_admin_auth",
             "cloudmail_api_url",
             "cloudmail_admin_email",
@@ -1499,6 +1517,12 @@ class RegisterService:
         if policy not in {"round_robin", "random"}:
             policy = "round_robin"
         cfg["flclash_switch_policy"] = policy
+        cfg["flclash_rotate_every"] = self._to_int(
+            cfg.get("flclash_rotate_every"),
+            3,
+            1,
+            200,
+        )
 
         cfg["mail_service_provider"] = normalize_mail_provider(
             cfg.get("mail_service_provider") or "mailfree"
@@ -1517,6 +1541,11 @@ class RegisterService:
             )
         else:
             cfg["mail_domains"] = ""
+        cfg["cf_worker_script"] = str(cfg.get("cf_worker_script") or "mailfree").strip() or "mailfree"
+        cfg["cf_worker_mail_domain_binding"] = (
+            str(cfg.get("cf_worker_mail_domain_binding") or "MAIL_DOMAIN").strip() or "MAIL_DOMAIN"
+        )
+        cfg["cf_dns_target_domain"] = str(cfg.get("cf_dns_target_domain") or "").strip().lower()
         graph_mode = str(cfg.get("graph_fetch_mode") or "graph_api").strip().lower()
         if graph_mode not in {"graph_api", "imap_xoauth2"}:
             graph_mode = "graph_api"
@@ -1600,6 +1629,13 @@ class RegisterService:
         os.environ["MAIL_DOMAINS"] = str(self.cfg.get("mail_domains") or "").strip()
         os.environ["FREEMAIL_USERNAME"] = str(self.cfg.get("freemail_username") or "")
         os.environ["FREEMAIL_PASSWORD"] = str(self.cfg.get("freemail_password") or "")
+        os.environ["CF_API_TOKEN"] = str(self.cfg.get("cf_api_token") or "").strip()
+        os.environ["CF_ACCOUNT_ID"] = str(self.cfg.get("cf_account_id") or "").strip()
+        os.environ["CF_WORKER_SCRIPT"] = str(self.cfg.get("cf_worker_script") or "mailfree").strip()
+        os.environ["CF_WORKER_MAIL_DOMAIN_BINDING"] = (
+            str(self.cfg.get("cf_worker_mail_domain_binding") or "MAIL_DOMAIN").strip()
+        )
+        os.environ["CF_DNS_TARGET_DOMAIN"] = str(self.cfg.get("cf_dns_target_domain") or "").strip()
         os.environ["CF_TEMP_ADMIN_AUTH"] = str(self.cfg.get("cf_temp_admin_auth") or "")
         os.environ["ADMIN_AUTH"] = str(self.cfg.get("cf_temp_admin_auth") or "")
         os.environ["CLOUDMAIL_API_URL"] = str(self.cfg.get("cloudmail_api_url") or "").strip()
@@ -2066,6 +2102,24 @@ class RegisterService:
 
     def mail_domain_stats(self) -> dict[str, Any]:
         return _mail_mail_domain_stats(self)
+
+    def mail_cf_zones(self) -> dict[str, Any]:
+        return _mail_mail_cf_zones(self)
+
+    def mail_cf_dns_list(self, zone_id: str) -> dict[str, Any]:
+        return _mail_mail_cf_dns_list(self, zone_id)
+
+    def mail_cf_dns_create_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return _mail_mail_cf_dns_create_batch(self, payload)
+
+    def mail_cf_dns_update(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return _mail_mail_cf_dns_update(self, payload)
+
+    def mail_cf_dns_delete_batch(self, zone_id: str, record_ids: list[Any]) -> dict[str, Any]:
+        return _mail_mail_cf_dns_delete_batch(self, zone_id, record_ids)
+
+    def mail_cf_worker_set_mail_domain(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return _mail_mail_cf_worker_set_mail_domain(self, payload)
 
     def mail_providers(self) -> dict[str, Any]:
         return _mail_mail_providers(self)
@@ -2550,7 +2604,60 @@ class RegisterService:
             retry_403_wait = self._to_int(self.cfg.get("retry_403_wait_sec"), 10, 3, 30)
             if fast_mode:
                 retry_403_wait = min(retry_403_wait, 6)
-            proxy = str(self.cfg.get("proxy") or "").strip() or None
+
+            proxy_raw = str(self.cfg.get("proxy") or "").strip()
+            proxy_items = [
+                x
+                for x in [str(v or "").strip() for v in re.split(r"[\n\r,;\s]+", proxy_raw)]
+                if x
+            ]
+            if not proxy_items and proxy_raw:
+                proxy_items = [proxy_raw]
+            proxy = proxy_items[0] if proxy_items else None
+            proxy_pick_lock = threading.Lock()
+            proxy_pick_idx = 0
+
+            def _mask_proxy_for_log(raw_proxy: str | None) -> str:
+                text = str(raw_proxy or "").strip()
+                if not text:
+                    return "直连"
+                try:
+                    parsed = urllib.parse.urlsplit(text)
+                    scheme = parsed.scheme or "http"
+                    hostname = str(parsed.hostname or "").strip()
+                    port = f":{parsed.port}" if parsed.port else ""
+                    if hostname:
+                        return f"{scheme}://{hostname}{port}"
+                except Exception:
+                    pass
+                if "@" in text:
+                    left, right = text.rsplit("@", 1)
+                    if ":" in left:
+                        user = left.split(":", 1)[0]
+                        return f"{user}:***@{right}"
+                return text
+
+            def _pick_attempt_proxy() -> str | None:
+                nonlocal proxy_pick_idx
+                if not proxy_items:
+                    return None
+                if len(proxy_items) == 1:
+                    return proxy_items[0]
+                with proxy_pick_lock:
+                    picked = proxy_items[proxy_pick_idx % len(proxy_items)]
+                    proxy_pick_idx += 1
+                return picked
+
+            if len(proxy_items) > 1:
+                self.log(
+                    "代理轮换已启用："
+                    f"共 {len(proxy_items)} 个入口，按顺序轮换"
+                )
+            elif proxy:
+                self.log(f"代理入口：{_mask_proxy_for_log(proxy)}")
+            else:
+                self.log("代理入口：直连")
+
             outdir = os.getenv("TOKEN_OUTPUT_DIR", "").strip()
             graph_pre_refresh_before_run = bool(
                 self.cfg.get("graph_pre_refresh_before_run", True)
@@ -2690,6 +2797,12 @@ class RegisterService:
                 0,
                 5,
             )
+            flclash_rotate_every = self._to_int(
+                self.cfg.get("flclash_rotate_every"),
+                max(1, min(concurrency, per_file_num)),
+                1,
+                200,
+            )
 
             total_target = per_file_num * num_files
             self._reset_run_stats(planned_total=total_target)
@@ -2702,8 +2815,8 @@ class RegisterService:
             worker_count = min(concurrency, per_file_num)
             if flclash_enable and worker_count > 1:
                 self.log(
-                    "FlClash 动态换 IP + 多并发已启用：同一批并发任务共享同一个节点；"
-                    "仅在该批并发全部结束后再切到下一节点"
+                    "FlClash 动态换 IP + 多并发已启用：同一并发波次共享同一节点；"
+                    f"每累计 {flclash_rotate_every} 次尝试后，等待当前波次结束再切到下一节点"
                 )
             max_attempts = max(per_file_num * 50, per_file_num + 100)
             self.log(
@@ -3039,29 +3152,51 @@ class RegisterService:
                 flc_batch_lock = threading.Condition()
                 flc_active_runs = 0
                 flc_switching = False
+                flc_runs_on_node = 0
+                flc_force_rollover = False
+                flc_switch_every = max(1, int(flclash_rotate_every))
+
+                def _flclash_mark_run_begin_locked() -> None:
+                    nonlocal flc_active_runs, flc_runs_on_node, flc_force_rollover
+                    flc_active_runs += 1
+                    flc_runs_on_node += 1
+                    if flc_runs_on_node >= flc_switch_every:
+                        flc_force_rollover = True
 
                 def _flclash_acquire_for_batch(tag: str) -> bool:
-                    nonlocal flc_active_runs, flc_switching
+                    nonlocal flc_switching, flc_runs_on_node, flc_force_rollover
                     if not flclash_state["enabled"]:
                         return True
 
                     with flc_batch_lock:
-                        while flc_switching and not self._stop.is_set():
-                            flc_batch_lock.wait(timeout=0.2)
+                        while not self._stop.is_set():
+                            if flc_switching:
+                                flc_batch_lock.wait(timeout=0.2)
+                                continue
+
+                            # 达到轮换阈值后，阻塞新任务进入，等待当前在跑任务全部结束再切换。
+                            if flc_force_rollover and flc_active_runs > 0:
+                                flc_batch_lock.wait(timeout=0.2)
+                                continue
+
+                            if flc_active_runs == 0:
+                                flc_switching = True
+                                break
+
+                            _flclash_mark_run_begin_locked()
+                            return True
+
                         if self._stop.is_set():
                             return False
-                        if flc_active_runs == 0:
-                            flc_switching = True
-                        else:
-                            flc_active_runs += 1
-                            return True
 
                     ok = _flclash_switch(tag, force_diff=True)
 
                     with flc_batch_lock:
                         flc_switching = False
                         if ok:
-                            flc_active_runs += 1
+                            flc_runs_on_node = 0
+                            flc_force_rollover = False
+                            _flclash_mark_run_begin_locked()
                         flc_batch_lock.notify_all()
                     return ok
 
@@ -3151,7 +3286,13 @@ class RegisterService:
                                         need_retry = True
                                         retry_reason = "节点切换/延迟测试失败"
                                         continue
-                                result = r_with_pwd.run(proxy)
+                                attempt_proxy = _pick_attempt_proxy()
+                                if len(proxy_items) > 1:
+                                    self.log(
+                                        f"[F{file_no}W{worker_no}] 代理轮换 -> "
+                                        f"{_mask_proxy_for_log(attempt_proxy)}"
+                                    )
+                                result = r_with_pwd.run(attempt_proxy)
                                 if not isinstance(result, (tuple, list)):
                                     self.log(f"[F{file_no}W{worker_no}] 返回异常，跳过")
                                     need_retry = True

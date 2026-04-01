@@ -59,7 +59,7 @@
                             <n-switch v-model:value="dashForm.fast_mode" />
                           </n-form-item>
                           <n-form-item label="代理地址">
-                            <n-input v-model:value="dashForm.proxy" placeholder="留空直连；例 http://127.0.0.1:7890" />
+                            <n-input v-model:value="dashForm.proxy" placeholder="留空直连；支持多代理（逗号/空格/换行分隔）轮换" />
                           </n-form-item>
                         </n-form>
                         <div class="dash-actions">
@@ -101,7 +101,8 @@
                         </n-alert>
                         <n-alert style="margin-top: 10px" type="success" title="提速建议" :show-icon="false">
                           建议并发 2~3；冷却 1~3 秒；开启加速模式可缩短 OTP 轮询与网络退避等待。<br />
-                          若启用 FlClash 动态换 IP，将自动跳过香港节点；并发批次任务共享同一节点，批次结束后再切换。
+                          若启用 FlClash 动态换 IP，将自动跳过香港节点；并发场景会按“波次”切换节点。<br />
+                          代理地址支持多条（逗号/空格/换行分隔），运行时会按顺序轮换。
                         </n-alert>
                         <n-alert style="margin-top: 10px" type="warning" title="网络提醒" :show-icon="false">
                           若管理端/API 访问失败，请确认代理地址与证书校验开关是否匹配当前网络。
@@ -159,7 +160,7 @@
                               :data="accountFilteredRows"
                               :row-key="rowKeyAccount"
                               :row-class-name="accountRowClassName"
-                              :max-height="430"
+                              :max-height="520"
                               v-model:checked-row-keys="accountSelection"
                             />
                           </div>
@@ -401,29 +402,116 @@
                           style="width: 140px"
                         />
                       </div>
-                      <div v-else-if="mailProviderTab === 'mailfree'" class="toolbar" style="margin-top: 10px">
-                        <n-input class="toolbar-path" v-model:value="settingsForm.worker_domain" placeholder="MailFree 服务地址" />
-                        <n-input class="toolbar-path" v-model:value="settingsForm.freemail_username" placeholder="Freemail 用户名" />
-                        <n-input class="toolbar-path" v-model:value="settingsForm.freemail_password" type="password" show-password-on="click" placeholder="Freemail 密码" />
-                        <n-input class="toolbar-path" v-model:value="settingsForm.mail_domains" placeholder="域名池（可选，逗号/空格分隔）" />
-                        <n-switch v-model:value="settingsForm.mailfree_random_domain" />
-                        <span class="meta">随机域名</span>
-                        <n-switch v-model:value="settingsForm.mailbox_custom_enabled" />
-                        <span class="meta">自定义邮箱</span>
-                        <n-input
-                          v-if="settingsForm.mailbox_custom_enabled"
-                          class="toolbar-path"
-                          v-model:value="settingsForm.mailbox_prefix"
-                          placeholder="邮箱前缀（字母数字._-）"
-                        />
-                        <n-input-number
-                          v-if="settingsForm.mailbox_custom_enabled"
-                          v-model:value="settingsForm.mailbox_random_len"
-                          :min="0"
-                          :max="32"
-                          :step="1"
-                          style="width: 140px"
-                        />
+                      <div v-else-if="mailProviderTab === 'mailfree'" class="mailfree-config-shell" style="margin-top: 10px">
+                        <div class="mailfree-side-tabs">
+                          <button
+                            type="button"
+                            class="mailfree-side-tab"
+                            :class="{ 'is-active': mailfreePanelTab === 'basic' }"
+                            @click="mailfreePanelTab = 'basic'"
+                          >MailFree</button>
+                          <button
+                            type="button"
+                            class="mailfree-side-tab"
+                            :class="{ 'is-active': mailfreePanelTab === 'domain' }"
+                            @click="mailfreePanelTab = 'domain'"
+                          >域名配置</button>
+                        </div>
+
+                        <div class="mailfree-panel-content">
+                          <div v-if="mailfreePanelTab === 'basic'" class="toolbar">
+                            <n-input class="toolbar-path" v-model:value="settingsForm.worker_domain" placeholder="MailFree 服务地址" />
+                            <n-input class="toolbar-path" v-model:value="settingsForm.freemail_username" placeholder="Freemail 用户名" />
+                            <n-input class="toolbar-path" v-model:value="settingsForm.freemail_password" type="password" show-password-on="click" placeholder="Freemail 密码" />
+                            <n-input class="toolbar-path" v-model:value="settingsForm.mail_domains" placeholder="域名池（可选，逗号/空格分隔）" />
+                            <n-switch v-model:value="settingsForm.mailfree_random_domain" />
+                            <span class="meta">随机域名</span>
+                            <n-switch v-model:value="settingsForm.mailbox_custom_enabled" />
+                            <span class="meta">自定义邮箱</span>
+                            <n-input
+                              v-if="settingsForm.mailbox_custom_enabled"
+                              class="toolbar-path"
+                              v-model:value="settingsForm.mailbox_prefix"
+                              placeholder="邮箱前缀（字母数字._-）"
+                            />
+                            <n-input-number
+                              v-if="settingsForm.mailbox_custom_enabled"
+                              v-model:value="settingsForm.mailbox_random_len"
+                              :min="0"
+                              :max="32"
+                              :step="1"
+                              style="width: 140px"
+                            />
+                          </div>
+
+                          <div v-else class="mailfree-domain-panel">
+                            <div class="toolbar" style="margin-bottom: 6px">
+                              <n-input
+                                class="toolbar-path"
+                                v-model:value="settingsForm.cf_api_token"
+                                type="password"
+                                show-password-on="click"
+                                placeholder="Cloudflare API Token（cf_api_token）"
+                              />
+                              <n-button class="toolbar-btn" :loading="loading.mail_cf_zones" @click="refreshMailfreeCfZones(true)">刷新域名</n-button>
+                            </div>
+
+                            <div class="meta" style="margin-bottom: 6px">
+                              “同步到MailFree”会把所选 DNS 完整域名写入 MailFree 的 <code>/api/domains</code>（需要严格管理员账号）。
+                            </div>
+
+                            <div class="toolbar" style="margin-bottom: 6px">
+                              <n-select
+                                class="toolbar-select"
+                                v-model:value="cfZoneId"
+                                :options="cfZoneOptions"
+                                filterable
+                                clearable
+                                placeholder="选择要管理 DNS 的域名"
+                              />
+                              <n-select
+                                class="toolbar-select"
+                                v-model:value="cfTargetDomain"
+                                :options="cfZoneOptions.map((x) => ({ label: x.label, value: x.label }))"
+                                filterable
+                                clearable
+                                placeholder="CNAME 指向域名（下拉选择）"
+                              />
+                              <n-button class="toolbar-btn" :loading="loading.mail_cf_dns" @click="refreshMailfreeCfDnsRecords(true)">刷新记录</n-button>
+                              <n-button class="toolbar-btn" type="primary" :loading="loading.mail_cf_dns_create" @click="openCfDnsAddModal">添加</n-button>
+                              <n-button
+                                class="toolbar-btn"
+                                type="primary"
+                                ghost
+                                :loading="loading.mail_cf_worker_batch"
+                                :disabled="!cfDnsSelection.length"
+                                @click="syncSelectedCfDnsToMailfree"
+                              >批量同步MailFree</n-button>
+                              <n-button
+                                class="toolbar-btn"
+                                type="error"
+                                ghost
+                                :loading="loading.mail_cf_dns_delete"
+                                :disabled="!cfDnsSelection.length"
+                                @click="deleteSelectedCfDnsRecords"
+                              >批量删除</n-button>
+                            </div>
+
+                            <div class="meta">{{ cfDnsInfoText }}</div>
+
+                            <n-data-table
+                              class="remote-table"
+                              size="small"
+                              table-layout="fixed"
+                              :single-line="false"
+                              :columns="cfDnsColumns"
+                              :data="cfDnsRows"
+                              :row-key="rowKeyCfDns"
+                              :max-height="360"
+                              v-model:checked-row-keys="cfDnsSelection"
+                            />
+                          </div>
+                        </div>
                       </div>
                       <div v-else-if="mailProviderTab === 'cloudmail'" class="toolbar" style="margin-top: 10px">
                         <n-input class="toolbar-path" v-model:value="settingsForm.cloudmail_api_url" placeholder="CloudMail API 地址" />
@@ -555,8 +643,15 @@
                       <div v-if="mailProviderTab === 'graph'" class="meta" style="margin-top: 4px">
                         可切换“注册前预刷新 token”：关闭后可加快启动，但失效账号会在运行中再被淘汰。
                       </div>
-                      <div v-if="['mailfree','cloudflare_temp_email','cloudmail'].includes(mailProviderTab)" class="meta" style="margin-top: 6px">{{ mailboxPatternPreviewText }}</div>
-                      <div v-if="['mailfree','cloudflare_temp_email','cloudmail'].includes(mailProviderTab)" class="mail-domain-wrap">
+                      <div
+                        v-if="['mailfree','cloudflare_temp_email','cloudmail'].includes(mailProviderTab) && !(mailProviderTab === 'mailfree' && mailfreePanelTab === 'domain')"
+                        class="meta"
+                        style="margin-top: 6px"
+                      >{{ mailboxPatternPreviewText }}</div>
+                      <div
+                        v-if="['mailfree','cloudflare_temp_email','cloudmail'].includes(mailProviderTab) && !(mailProviderTab === 'mailfree' && mailfreePanelTab === 'domain')"
+                        class="mail-domain-wrap"
+                      >
                         <button
                           v-for="dm in mailDomains"
                           :key="dm"
@@ -572,7 +667,11 @@
                         </button>
                         <span v-if="!mailDomains.length" class="meta">暂无域名，点击“保存并刷新”后加载</span>
                       </div>
-                      <div v-if="['mailfree','cloudflare_temp_email','cloudmail'].includes(mailProviderTab)" class="meta" style="margin-top: 6px">点击域名标签可启用/禁用该域名；绿色角标为累计注册数，红色角标为 registration_disallowed 次数（均持久化保存）。</div>
+                      <div
+                        v-if="['mailfree','cloudflare_temp_email','cloudmail'].includes(mailProviderTab) && !(mailProviderTab === 'mailfree' && mailfreePanelTab === 'domain')"
+                        class="meta"
+                        style="margin-top: 6px"
+                      >点击域名标签可启用/禁用该域名；绿色角标为累计注册数，红色角标为 registration_disallowed 次数（均持久化保存）。</div>
                     </n-card>
 
                     <div class="split-grid mail-split-grid">
@@ -660,6 +759,77 @@
                       <n-scrollbar class="mail-modal-scroll">
                         <pre class="mail-detail-pre">{{ mailDetailText }}</pre>
                       </n-scrollbar>
+                    </n-modal>
+
+                    <n-modal
+                      v-model:show="showCfDnsAddModal"
+                      preset="card"
+                      title="批量添加 CNAME"
+                      style="width: min(560px, 94vw)"
+                    >
+                      <n-form label-placement="left" label-width="120">
+                        <n-form-item label="生成数量">
+                          <n-input-number v-model:value="cfDnsAddForm.count" :min="1" :max="200" :step="1" style="width: 180px" />
+                        </n-form-item>
+                        <n-form-item label="命名方式">
+                          <n-radio-group v-model:value="cfDnsAddForm.mode">
+                            <n-radio-button value="random">随机</n-radio-button>
+                            <n-radio-button value="manual">手动</n-radio-button>
+                          </n-radio-group>
+                        </n-form-item>
+                        <n-form-item v-if="cfDnsAddForm.mode === 'random'" label="随机前缀">
+                          <n-input v-model:value="cfDnsAddForm.random_prefix" placeholder="可空，例如 banana" />
+                        </n-form-item>
+                        <n-form-item v-if="cfDnsAddForm.mode === 'random'" label="随机长度">
+                          <n-input-number v-model:value="cfDnsAddForm.random_length" :min="3" :max="32" :step="1" style="width: 180px" />
+                        </n-form-item>
+                        <n-form-item v-if="cfDnsAddForm.mode === 'manual'" label="手动名称">
+                          <n-input v-model:value="cfDnsAddForm.manual_name" placeholder="例如 darkbanana（批量时自动追加序号）" />
+                        </n-form-item>
+                        <n-form-item label="TTL">
+                          <n-input-number v-model:value="cfDnsAddForm.ttl" :min="1" :max="86400" :step="1" style="width: 180px" />
+                        </n-form-item>
+                        <n-form-item label="代理开关">
+                          <n-switch v-model:value="cfDnsAddForm.proxied" />
+                        </n-form-item>
+                        <n-form-item label="指向域名">
+                          <n-tag type="info" :bordered="false">{{ cfTargetDomain || '-' }}</n-tag>
+                        </n-form-item>
+                      </n-form>
+                      <template #footer>
+                        <n-space justify="end">
+                          <n-button :disabled="loading.mail_cf_dns_create" @click="showCfDnsAddModal = false">取消</n-button>
+                          <n-button type="primary" :loading="loading.mail_cf_dns_create" @click="confirmCfDnsBatchCreate">开始添加</n-button>
+                        </n-space>
+                      </template>
+                    </n-modal>
+
+                    <n-modal
+                      v-model:show="showCfDnsEditModal"
+                      preset="card"
+                      title="编辑 CNAME"
+                      style="width: min(520px, 94vw)"
+                    >
+                      <n-form label-placement="left" label-width="120">
+                        <n-form-item label="二级域名">
+                          <n-input v-model:value="cfDnsEditForm.label" placeholder="例如 darkbanana" />
+                        </n-form-item>
+                        <n-form-item label="指向域名">
+                          <n-tag type="info" :bordered="false">{{ cfTargetDomain || '-' }}</n-tag>
+                        </n-form-item>
+                        <n-form-item label="TTL">
+                          <n-input-number v-model:value="cfDnsEditForm.ttl" :min="1" :max="86400" :step="1" style="width: 180px" />
+                        </n-form-item>
+                        <n-form-item label="代理开关">
+                          <n-switch v-model:value="cfDnsEditForm.proxied" />
+                        </n-form-item>
+                      </n-form>
+                      <template #footer>
+                        <n-space justify="end">
+                          <n-button :disabled="loading.mail_cf_dns_update" @click="showCfDnsEditModal = false">取消</n-button>
+                          <n-button type="primary" :loading="loading.mail_cf_dns_update" @click="confirmCfDnsUpdate">保存</n-button>
+                        </n-space>
+                      </template>
                     </n-modal>
                   </div>
 
@@ -803,6 +973,9 @@
                         </n-form-item>
                         <n-form-item label="切换后等待(秒)">
                           <n-input-number v-model:value="settingsForm.flclash_switch_wait_sec" :min="0" :max="10" :step="0.1" style="width: 220px" />
+                        </n-form-item>
+                        <n-form-item label="每波次尝试数">
+                          <n-input-number v-model:value="settingsForm.flclash_rotate_every" :min="1" :max="200" :step="1" style="width: 220px" />
                         </n-form-item>
                         <n-form-item label="节点延迟测试链接">
                           <n-input v-model:value="settingsForm.flclash_delay_test_url" placeholder="https://www.gstatic.com/generate_204" />

@@ -100,6 +100,11 @@
           mail_domains: "",
           freemail_username: "",
           freemail_password: "",
+          cf_api_token: "",
+          cf_account_id: "",
+          cf_worker_script: "mailfree",
+          cf_worker_mail_domain_binding: "MAIL_DOMAIN",
+          cf_dns_target_domain: "",
           cf_temp_admin_auth: "",
           cloudmail_api_url: "",
           cloudmail_admin_email: "",
@@ -137,6 +142,7 @@
           flclash_group: "PROXY",
           flclash_switch_policy: "round_robin",
           flclash_switch_wait_sec: 1.2,
+          flclash_rotate_every: 3,
           flclash_delay_test_url: "https://www.gstatic.com/generate_204",
           flclash_delay_timeout_ms: 4000,
           flclash_delay_max_ms: 1800,
@@ -182,6 +188,13 @@
           mail_delete: false,
           mailbox_delete: false,
           mail_clear: false,
+          mail_cf_zones: false,
+          mail_cf_dns: false,
+          mail_cf_dns_create: false,
+          mail_cf_dns_update: false,
+          mail_cf_dns_delete: false,
+          mail_cf_worker_set: false,
+          mail_cf_worker_batch: false,
           sms_overview: false,
           sms_countries: false
         });
@@ -257,6 +270,7 @@
 
         const mailProviders = Vue.ref([]);
         const mailProviderTab = Vue.ref("mailfree");
+        const mailfreePanelTab = Vue.ref("basic");
         const graphAccountFileOptions = Vue.ref([]);
         const mailDomains = Vue.ref([]);
         const mailboxRows = Vue.ref([]);
@@ -280,6 +294,28 @@
         });
         const mailDomainErrors = Vue.reactive({});
         const mailDomainRegistered = Vue.reactive({});
+        const cfZoneOptions = Vue.ref([]);
+        const cfZoneId = Vue.ref("");
+        const cfTargetDomain = Vue.ref("");
+        const cfDnsRows = Vue.ref([]);
+        const cfDnsSelection = Vue.ref([]);
+        const showCfDnsAddModal = Vue.ref(false);
+        const showCfDnsEditModal = Vue.ref(false);
+        const cfDnsAddForm = Vue.reactive({
+          count: 5,
+          mode: "random",
+          random_prefix: "",
+          random_length: 8,
+          manual_name: "",
+          proxied: false,
+          ttl: 1
+        });
+        const cfDnsEditForm = Vue.reactive({
+          record_id: "",
+          label: "",
+          proxied: false,
+          ttl: 1
+        });
         const showMailModal = Vue.ref(false);
         const graphFileInputRef = Vue.ref(null);
         const mailViewCache = Vue.reactive({
@@ -723,6 +759,10 @@
         }
 
         function rowKeyMail(row) {
+          return row.key;
+        }
+
+        function rowKeyCfDns(row) {
           return row.key;
         }
 
@@ -1249,6 +1289,65 @@
           { title: "接收时间", key: "date", width: 170, ellipsis: { tooltip: true } }
         ];
 
+        const cfDnsInfoText = Vue.computed(() => {
+          const zone = cfZoneOptions.value.find((x) => String(x.value || "") === String(cfZoneId.value || ""));
+          const zname = String((zone && zone.label) || "").trim() || "-";
+          const target = String(cfTargetDomain.value || settingsForm.cf_dns_target_domain || "").trim() || "-";
+          const total = Number(cfDnsRows.value.length || 0);
+          const selected = Number(cfDnsSelection.value.length || 0);
+          return `当前域名：${zname} · 指向：${target} · CNAME 记录 ${total} 条 · 已选 ${selected} 条`;
+        });
+
+        const cfDnsColumns = [
+          { type: "selection", multiple: true },
+          { title: "二级域名", key: "label", minWidth: 140, ellipsis: { tooltip: true } },
+          { title: "完整域名", key: "name", minWidth: 240, ellipsis: { tooltip: true } },
+          { title: "指向", key: "target", minWidth: 220, ellipsis: { tooltip: true } },
+          {
+            title: "代理",
+            key: "proxied",
+            width: 76,
+            render(row) {
+              const on = !!(row && row.proxied);
+              return Vue.h(
+                naive.NTag,
+                { type: on ? "success" : "default", size: "small", bordered: false },
+                { default: () => (on ? "开" : "关") }
+              );
+            }
+          },
+          { title: "TTL", key: "ttl", width: 76 },
+          {
+            title: "操作",
+            key: "actions",
+            width: 190,
+            render(row) {
+              return Vue.h("div", { class: "cf-dns-actions" }, [
+                Vue.h(
+                  naive.NButton,
+                  {
+                    size: "small",
+                    tertiary: true,
+                    onClick: () => openCfDnsEditModal(row)
+                  },
+                  { default: () => "编辑" }
+                ),
+                Vue.h(
+                  naive.NButton,
+                  {
+                    size: "small",
+                    type: "primary",
+                    tertiary: true,
+                    loading: loading.mail_cf_worker_set || loading.mail_cf_worker_batch,
+                    onClick: () => setCfWorkerMailDomain(row)
+                  },
+                  { default: () => "同步到MailFree" }
+                )
+              ]);
+            }
+          }
+        ];
+
         async function apiRequest(path, options = {}) {
           const opts = Object.assign({}, options);
           if (!opts.method) opts.method = "GET";
@@ -1348,6 +1447,14 @@
           settingsForm.mail_domains = String(cfg.mail_domains || "");
           settingsForm.freemail_username = String(cfg.freemail_username || "");
           settingsForm.freemail_password = String(cfg.freemail_password || "");
+          settingsForm.cf_api_token = String(cfg.cf_api_token || "");
+          settingsForm.cf_account_id = String(cfg.cf_account_id || "");
+          settingsForm.cf_worker_script = String(cfg.cf_worker_script || "mailfree");
+          settingsForm.cf_worker_mail_domain_binding = String(cfg.cf_worker_mail_domain_binding || "MAIL_DOMAIN");
+          settingsForm.cf_dns_target_domain = String(cfg.cf_dns_target_domain || "").toLowerCase();
+          if (!String(cfTargetDomain.value || "").trim()) {
+            cfTargetDomain.value = String(settingsForm.cf_dns_target_domain || "").trim().toLowerCase();
+          }
           settingsForm.cf_temp_admin_auth = String(cfg.cf_temp_admin_auth || "");
           settingsForm.cloudmail_api_url = String(cfg.cloudmail_api_url || "");
           settingsForm.cloudmail_admin_email = String(cfg.cloudmail_admin_email || "");
@@ -1391,6 +1498,7 @@
           settingsForm.flclash_group = String(cfg.flclash_group || "PROXY");
           settingsForm.flclash_switch_policy = String(cfg.flclash_switch_policy || "round_robin");
           settingsForm.flclash_switch_wait_sec = Number(cfg.flclash_switch_wait_sec || 1.2);
+          settingsForm.flclash_rotate_every = Number(cfg.flclash_rotate_every || 3);
           settingsForm.flclash_delay_test_url = String(cfg.flclash_delay_test_url || "https://www.gstatic.com/generate_204");
           settingsForm.flclash_delay_timeout_ms = Number(cfg.flclash_delay_timeout_ms || 4000);
           settingsForm.flclash_delay_max_ms = Number(cfg.flclash_delay_max_ms || 1800);
@@ -1423,6 +1531,11 @@
             mail_domains: String(settingsForm.mail_domains || "").trim(),
             freemail_username: String(settingsForm.freemail_username || "").trim(),
             freemail_password: String(settingsForm.freemail_password || "").trim(),
+            cf_api_token: String(settingsForm.cf_api_token || "").trim(),
+            cf_account_id: String(settingsForm.cf_account_id || "").trim(),
+            cf_worker_script: String(settingsForm.cf_worker_script || "mailfree").trim(),
+            cf_worker_mail_domain_binding: String(settingsForm.cf_worker_mail_domain_binding || "MAIL_DOMAIN").trim(),
+            cf_dns_target_domain: String(cfTargetDomain.value || settingsForm.cf_dns_target_domain || "").trim().toLowerCase(),
             cf_temp_admin_auth: String(settingsForm.cf_temp_admin_auth || "").trim(),
             cloudmail_api_url: String(settingsForm.cloudmail_api_url || "").trim(),
             cloudmail_admin_email: String(settingsForm.cloudmail_admin_email || "").trim(),
@@ -1460,6 +1573,7 @@
             flclash_group: String(settingsForm.flclash_group || "").trim(),
             flclash_switch_policy: String(settingsForm.flclash_switch_policy || "round_robin").trim(),
             flclash_switch_wait_sec: Number(settingsForm.flclash_switch_wait_sec || 1.2),
+            flclash_rotate_every: Number(settingsForm.flclash_rotate_every || 3),
             flclash_delay_test_url: String(settingsForm.flclash_delay_test_url || "").trim(),
             flclash_delay_timeout_ms: Number(settingsForm.flclash_delay_timeout_ms || 4000),
             flclash_delay_max_ms: Number(settingsForm.flclash_delay_max_ms || 1800),
@@ -2591,6 +2705,9 @@
           const current = normalizeMailProvider(data.current || settingsForm.mail_service_provider || "mailfree");
           settingsForm.mail_service_provider = current;
           mailProviderTab.value = current;
+          if (current !== "mailfree") {
+            mailfreePanelTab.value = "basic";
+          }
           mailState.provider = current;
           mailDomains.value = Array.isArray(data.domains)
             ? normalizeDomainList(data.domains)
@@ -2766,9 +2883,17 @@
           const val = normalizeMailProvider(nextVal || "mailfree");
           mailProviderTab.value = val;
           settingsForm.mail_service_provider = mailProviderTab.value;
+          if (mailProviderTab.value !== "mailfree") {
+            mailfreePanelTab.value = "basic";
+          }
           restoreMailViewFromCache(mailProviderTab.value);
           if (mailProviderTab.value === "graph") {
             refreshGraphAccountFiles(false);
+          }
+          if (mailProviderTab.value === "mailfree" && mailfreePanelTab.value === "domain") {
+            refreshMailfreeCfZones(false)
+              .then(() => refreshMailfreeCfDnsRecords(false))
+              .catch(() => {});
           }
           refreshMailOverview(false);
         }
@@ -2801,6 +2926,382 @@
             applyDomainStats(data || {});
           } catch (_e) {
             // 统计接口失败不影响主流程。
+          }
+        }
+
+        function normalizeCfDomainValue(raw) {
+          let text = String(raw || "").trim().toLowerCase();
+          if (!text) return "";
+          text = text.replace(/^https?:\/\//, "");
+          text = text.replace(/\/$/, "");
+          text = text.replace(/^\.+|\.+$/g, "");
+          if (text.includes("@")) {
+            text = text.split("@").pop();
+          }
+          if (text.includes(":")) {
+            text = text.split(":", 1)[0];
+          }
+          return String(text || "").trim().toLowerCase();
+        }
+
+        function selectedCfZoneName() {
+          const hit = cfZoneOptions.value.find((x) => String(x.value || "") === String(cfZoneId.value || ""));
+          return normalizeCfDomainValue((hit && hit.label) || "");
+        }
+
+        async function refreshMailfreeCfZones(showSuccess = false) {
+          loading.mail_cf_zones = true;
+          try {
+            await saveConfig(false);
+            const data = await apiRequest("/api/mail/cf/zones", { method: "POST", body: {} });
+            const zones = Array.isArray(data.zones) ? data.zones : [];
+            cfZoneOptions.value = zones
+              .map((x) => ({
+                label: String((x && x.name) || "").trim().toLowerCase(),
+                value: String((x && x.id) || "").trim(),
+                account_id: String((x && x.account_id) || "").trim(),
+                account_name: String((x && x.account_name) || "").trim()
+              }))
+              .filter((x) => x.label && x.value);
+
+            const zoneSet = new Set(cfZoneOptions.value.map((x) => x.value));
+            const apiZone = String((data && data.selected_zone_id) || "").trim();
+            if (apiZone && zoneSet.has(apiZone)) {
+              cfZoneId.value = apiZone;
+            } else if (!zoneSet.has(String(cfZoneId.value || ""))) {
+              cfZoneId.value = cfZoneOptions.value.length ? String(cfZoneOptions.value[0].value || "") : "";
+            }
+
+            if (data && data.account_id) {
+              settingsForm.cf_account_id = String(data.account_id || "").trim();
+            }
+            settingsForm.cf_worker_script = String((data && data.worker_script) || settingsForm.cf_worker_script || "mailfree").trim();
+            settingsForm.cf_worker_mail_domain_binding = String(
+              (data && data.worker_binding) || settingsForm.cf_worker_mail_domain_binding || "MAIL_DOMAIN"
+            ).trim();
+
+            const target = normalizeCfDomainValue((data && data.target_domain) || settingsForm.cf_dns_target_domain || "");
+            cfTargetDomain.value = target || selectedCfZoneName();
+            settingsForm.cf_dns_target_domain = String(cfTargetDomain.value || "");
+
+            if (showSuccess) {
+              message.success(`Cloudflare 域名已刷新：${cfZoneOptions.value.length} 个`);
+            }
+          } catch (e) {
+            if (showSuccess) {
+              message.error(String(e.message || e));
+            }
+          } finally {
+            loading.mail_cf_zones = false;
+          }
+        }
+
+        async function refreshMailfreeCfDnsRecords(showSuccess = false) {
+          const zid = String(cfZoneId.value || "").trim();
+          if (!zid) {
+            cfDnsRows.value = [];
+            cfDnsSelection.value = [];
+            if (showSuccess) message.warning("请先选择域名");
+            return;
+          }
+          loading.mail_cf_dns = true;
+          try {
+            await saveConfig(false);
+            const data = await apiRequest("/api/mail/cf/dns/list", {
+              method: "POST",
+              body: { zone_id: zid }
+            });
+            cfDnsRows.value = Array.isArray(data.records)
+              ? data.records.map((x, idx) => ({
+                key: String((x && x.id) || `cf-dns-${idx + 1}`),
+                id: String((x && x.id) || ""),
+                label: String((x && x.label) || "").trim().toLowerCase(),
+                name: String((x && x.name) || "").trim().toLowerCase(),
+                target: String((x && x.target) || "").trim().toLowerCase(),
+                zone_id: String((x && x.zone_id) || zid),
+                zone_name: String((x && x.zone_name) || selectedCfZoneName()),
+                ttl: Number((x && x.ttl) || 1),
+                proxied: !!(x && x.proxied)
+              })).filter((x) => x.id && x.name)
+              : [];
+            const keySet = new Set(cfDnsRows.value.map((x) => x.key));
+            cfDnsSelection.value = cfDnsSelection.value.filter((k) => keySet.has(k));
+
+            const targetNow = normalizeCfDomainValue(cfTargetDomain.value || settingsForm.cf_dns_target_domain || "");
+            cfTargetDomain.value = targetNow || selectedCfZoneName();
+            settingsForm.cf_dns_target_domain = String(cfTargetDomain.value || "");
+
+            if (showSuccess) {
+              message.success(`已加载 CNAME 记录：${cfDnsRows.value.length} 条`);
+            }
+          } catch (e) {
+            if (showSuccess) {
+              message.error(String(e.message || e));
+            }
+          } finally {
+            loading.mail_cf_dns = false;
+          }
+        }
+
+        function openCfDnsAddModal() {
+          const zid = String(cfZoneId.value || "").trim();
+          if (!zid) {
+            message.warning("请先选择域名");
+            return;
+          }
+          cfDnsAddForm.count = Math.max(1, Number(cfDnsAddForm.count || 5));
+          cfDnsAddForm.mode = String(cfDnsAddForm.mode || "random").trim().toLowerCase() === "manual"
+            ? "manual"
+            : "random";
+          cfDnsAddForm.random_length = Math.max(3, Number(cfDnsAddForm.random_length || 8));
+          showCfDnsAddModal.value = true;
+        }
+
+        async function confirmCfDnsBatchCreate() {
+          const zid = String(cfZoneId.value || "").trim();
+          if (!zid) {
+            message.warning("请先选择域名");
+            return;
+          }
+          const target = normalizeCfDomainValue(cfTargetDomain.value || selectedCfZoneName());
+          if (!target) {
+            message.warning("请先选择 CNAME 指向域名");
+            return;
+          }
+          if (String(cfDnsAddForm.mode || "") === "manual" && !String(cfDnsAddForm.manual_name || "").trim()) {
+            message.warning("手动模式请填写二级域名前缀");
+            return;
+          }
+
+          loading.mail_cf_dns_create = true;
+          try {
+            cfTargetDomain.value = target;
+            settingsForm.cf_dns_target_domain = target;
+            await saveConfig(false);
+            const data = await apiRequest("/api/mail/cf/dns/create", {
+              method: "POST",
+              body: {
+                zone_id: zid,
+                target_domain: target,
+                count: Number(cfDnsAddForm.count || 1),
+                mode: String(cfDnsAddForm.mode || "random"),
+                random_prefix: String(cfDnsAddForm.random_prefix || "").trim(),
+                random_length: Number(cfDnsAddForm.random_length || 8),
+                manual_name: String(cfDnsAddForm.manual_name || "").trim(),
+                proxied: !!cfDnsAddForm.proxied,
+                ttl: Number(cfDnsAddForm.ttl || 1)
+              }
+            });
+
+            const ok = Number((data && data.ok) || 0);
+            const fail = Number((data && data.fail) || 0);
+            await refreshMailfreeCfDnsRecords(false);
+            if (ok > 0) {
+              showCfDnsAddModal.value = false;
+            }
+            if (fail > 0) {
+              message.warning(`批量新增完成：成功 ${ok}，失败 ${fail}`);
+            } else {
+              message.success(`批量新增完成：成功 ${ok}`);
+            }
+          } catch (e) {
+            message.error(String(e.message || e));
+          } finally {
+            loading.mail_cf_dns_create = false;
+          }
+        }
+
+        function openCfDnsEditModal(row) {
+          if (!row) {
+            message.warning("请先选择一条 DNS 记录");
+            return;
+          }
+          cfDnsEditForm.record_id = String(row.id || "").trim();
+          cfDnsEditForm.label = String(row.label || "").trim().toLowerCase();
+          cfDnsEditForm.proxied = !!row.proxied;
+          cfDnsEditForm.ttl = Number(row.ttl || 1);
+          showCfDnsEditModal.value = true;
+        }
+
+        async function confirmCfDnsUpdate() {
+          const zid = String(cfZoneId.value || "").trim();
+          const rid = String(cfDnsEditForm.record_id || "").trim();
+          const label = String(cfDnsEditForm.label || "").trim();
+          const target = normalizeCfDomainValue(cfTargetDomain.value || selectedCfZoneName());
+          if (!zid || !rid) {
+            message.warning("记录信息不完整，请重试");
+            return;
+          }
+          if (!label) {
+            message.warning("请填写二级域名前缀");
+            return;
+          }
+          if (!target) {
+            message.warning("请先选择 CNAME 指向域名");
+            return;
+          }
+
+          loading.mail_cf_dns_update = true;
+          try {
+            cfTargetDomain.value = target;
+            settingsForm.cf_dns_target_domain = target;
+            await saveConfig(false);
+            await apiRequest("/api/mail/cf/dns/update", {
+              method: "POST",
+              body: {
+                zone_id: zid,
+                record_id: rid,
+                label,
+                target_domain: target,
+                proxied: !!cfDnsEditForm.proxied,
+                ttl: Number(cfDnsEditForm.ttl || 1)
+              }
+            });
+            showCfDnsEditModal.value = false;
+            await refreshMailfreeCfDnsRecords(false);
+            message.success("DNS 记录已更新");
+          } catch (e) {
+            message.error(String(e.message || e));
+          } finally {
+            loading.mail_cf_dns_update = false;
+          }
+        }
+
+        async function deleteSelectedCfDnsRecords() {
+          const zid = String(cfZoneId.value || "").trim();
+          if (!zid) {
+            message.warning("请先选择域名");
+            return;
+          }
+          const keySet = new Set(cfDnsSelection.value);
+          const ids = cfDnsRows.value
+            .filter((x) => keySet.has(x.key))
+            .map((x) => String(x.id || "").trim())
+            .filter((x) => !!x);
+          if (!ids.length) {
+            message.warning("请先勾选要删除的 DNS 记录");
+            return;
+          }
+          const ok = window.confirm(`确认删除已选 ${ids.length} 条 DNS 记录？该操作不可恢复。`);
+          if (!ok) return;
+
+          loading.mail_cf_dns_delete = true;
+          try {
+            await saveConfig(false);
+            const data = await apiRequest("/api/mail/cf/dns/delete", {
+              method: "POST",
+              body: { zone_id: zid, record_ids: ids }
+            });
+            const successCount = Number((data && data.ok) || 0);
+            const failCount = Number((data && data.fail) || 0);
+            cfDnsSelection.value = [];
+            await refreshMailfreeCfDnsRecords(false);
+            if (failCount > 0) {
+              message.warning(`删除完成：成功 ${successCount}，失败 ${failCount}`);
+            } else {
+              message.success(`删除完成：成功 ${successCount}`);
+            }
+          } catch (e) {
+            message.error(String(e.message || e));
+          } finally {
+            loading.mail_cf_dns_delete = false;
+          }
+        }
+
+        async function setCfWorkerMailDomain(row) {
+          const domain = normalizeCfDomainValue((row && row.name) || "");
+          if (!domain) {
+            message.warning("该记录缺少完整域名");
+            return;
+          }
+          loading.mail_cf_worker_set = true;
+          try {
+            settingsForm.cf_dns_target_domain = normalizeCfDomainValue(cfTargetDomain.value || settingsForm.cf_dns_target_domain || "");
+            await saveConfig(false);
+            const data = await apiRequest("/api/mail/cf/worker/set-mail-domain", {
+              method: "POST",
+              body: {
+                mail_domain: domain
+              }
+            });
+            await refreshMailOverview(false);
+            const existed = !!(data && data.existed);
+            if (existed) {
+              message.success(`域名已存在于 MailFree：${domain}`);
+            } else {
+              message.success(`已同步到 MailFree 域名池：${domain}`);
+            }
+          } catch (e) {
+            message.error(String(e.message || e));
+          } finally {
+            loading.mail_cf_worker_set = false;
+          }
+        }
+
+        async function syncSelectedCfDnsToMailfree() {
+          const keySet = new Set(cfDnsSelection.value);
+          const rows = cfDnsRows.value.filter((x) => keySet.has(x.key));
+          if (!rows.length) {
+            message.warning("请先勾选要同步的 DNS 记录");
+            return;
+          }
+
+          const domains = [];
+          const seen = new Set();
+          for (const row of rows) {
+            const dm = normalizeCfDomainValue((row && row.name) || "");
+            if (!dm || seen.has(dm)) continue;
+            seen.add(dm);
+            domains.push(dm);
+          }
+          if (!domains.length) {
+            message.warning("未找到可同步的完整域名");
+            return;
+          }
+
+          const ok = window.confirm(`确认批量同步 ${domains.length} 个域名到 MailFree 域名池？`);
+          if (!ok) return;
+
+          loading.mail_cf_worker_batch = true;
+          try {
+            settingsForm.cf_dns_target_domain = normalizeCfDomainValue(cfTargetDomain.value || settingsForm.cf_dns_target_domain || "");
+            await saveConfig(false);
+
+            let success = 0;
+            let existed = 0;
+            let fail = 0;
+            const errorSamples = [];
+
+            for (const domain of domains) {
+              try {
+                const data = await apiRequest("/api/mail/cf/worker/set-mail-domain", {
+                  method: "POST",
+                  body: { mail_domain: domain }
+                });
+                success += 1;
+                if (data && data.existed) {
+                  existed += 1;
+                }
+              } catch (e) {
+                fail += 1;
+                if (errorSamples.length < 3) {
+                  errorSamples.push(`${domain}: ${String(e.message || e)}`);
+                }
+              }
+            }
+
+            await refreshMailOverview(false);
+
+            if (fail > 0) {
+              const sampleText = errorSamples.length ? `；示例：${errorSamples.join(" | ")}` : "";
+              message.warning(`批量同步完成：成功 ${success}（已存在 ${existed}），失败 ${fail}${sampleText}`);
+            } else {
+              message.success(`批量同步完成：成功 ${success}（已存在 ${existed}）`);
+            }
+          } catch (e) {
+            message.error(String(e.message || e));
+          } finally {
+            loading.mail_cf_worker_batch = false;
           }
         }
 
@@ -3226,6 +3727,15 @@
               await refreshGraphAccountFiles(false);
             }
             await loadMailDomainStats();
+            if (
+              normalizeMailProvider(mailProviderTab.value) === "mailfree"
+              && String(mailfreePanelTab.value || "basic") === "domain"
+            ) {
+              await refreshMailfreeCfZones(false);
+              if (cfZoneId.value) {
+                await refreshMailfreeCfDnsRecords(false);
+              }
+            }
             if (mailState.loaded) return;
             try {
               await refreshMailOverview(false);
@@ -3244,6 +3754,38 @@
             } catch (_e) {
               // 忽略即时刷新失败。
             }
+          }
+        );
+
+        Vue.watch(
+          () => `${normalizeMailProvider(mailProviderTab.value)}:${String(mailfreePanelTab.value || "basic")}`,
+          async (sig) => {
+            if (activeTab.value !== "mail") return;
+            if (!String(sig || "").startsWith("mailfree:domain")) return;
+            try {
+              await refreshMailfreeCfZones(false);
+              if (cfZoneId.value) {
+                await refreshMailfreeCfDnsRecords(false);
+              }
+            } catch (_e) {
+              // 忽略自动刷新失败，允许用户手动重试。
+            }
+          }
+        );
+
+        Vue.watch(
+          () => String(cfZoneId.value || ""),
+          async (val, oldVal) => {
+            if (val === oldVal) return;
+            if (activeTab.value !== "mail") return;
+            if (normalizeMailProvider(mailProviderTab.value) !== "mailfree") return;
+            if (String(mailfreePanelTab.value || "basic") !== "domain") return;
+            if (!String(val || "").trim()) {
+              cfDnsRows.value = [];
+              cfDnsSelection.value = [];
+              return;
+            }
+            await refreshMailfreeCfDnsRecords(false);
           }
         );
 
@@ -3296,6 +3838,7 @@
           remoteInfoText,
           mailProviders,
           mailProviderTab,
+          mailfreePanelTab,
           graphAccountFileOptions,
           mailDomains,
           mailboxRows,
@@ -3311,6 +3854,16 @@
           mailState,
           mailDomainErrors,
           mailDomainRegistered,
+          cfZoneOptions,
+          cfZoneId,
+          cfTargetDomain,
+          cfDnsRows,
+          cfDnsSelection,
+          cfDnsInfoText,
+          showCfDnsAddModal,
+          showCfDnsEditModal,
+          cfDnsAddForm,
+          cfDnsEditForm,
           showMailModal,
           graphFileInputRef,
           mailInfoText,
@@ -3334,11 +3887,13 @@
           remoteTableColumns,
           mailboxColumns,
           mailColumns,
+          cfDnsColumns,
           rowKeyPath,
           rowKeyAccount,
           rowKeyRemote,
           rowKeyMailbox,
           rowKeyMail,
+          rowKeyCfDns,
           jsonRowClassName,
           accountRowClassName,
           isDomainSelected,
@@ -3376,6 +3931,15 @@
           exportSelectedCodeX,
           refreshMailOverview,
           refreshGraphAccountFiles,
+          refreshMailfreeCfZones,
+          refreshMailfreeCfDnsRecords,
+          openCfDnsAddModal,
+          confirmCfDnsBatchCreate,
+          openCfDnsEditModal,
+          confirmCfDnsUpdate,
+          deleteSelectedCfDnsRecords,
+          setCfWorkerMailDomain,
+          syncSelectedCfDnsToMailfree,
           pickGraphAccountFile,
           onGraphAccountFilePicked,
           deleteSelectedGraphAccountFile,

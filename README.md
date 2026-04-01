@@ -1,76 +1,46 @@
 # CodeX Register
 
-CodeX Register 是一个桌面化的 Web 控制台，用于统一管理注册流程、邮箱池、SMS 接码、代理切换、账号文件与远端账户测试。
+CodeX Register 是一个本地桌面化控制台，用于统一执行注册流程、邮箱池管理、SMS 接码、代理切换、本地账号库管理、以及云端账号运维。
 
-- 前端：Vue 3 + Naive UI（内嵌 HTML）
+- 前端：Vue 3 + Naive UI
 - 后端：Python 本地 HTTP 服务
-- 运行方式：`pywebview` 窗口模式 / 浏览器模式
+- 运行模式：`window`（pywebview）/ `browser`
 
-## 目录
+## 1. 核心能力
 
-- [功能概览](#功能概览)
-- [运行架构](#运行架构)
-- [目录速览](#目录速览)
-- [环境要求](#环境要求)
-- [快速开始](#快速开始)
-- [界面说明](#界面说明)
-- [配置文件与安全](#配置文件与安全)
-- [使用协议](#使用协议)
-- [完整配置项](#完整配置项)
-- [Graph 账号文件格式](#graph-账号文件格式)
-- [SMS 管理策略](#sms-管理策略)
-- [运行产物](#运行产物)
-- [自动发布（Tag Release）](#自动发布tag-release)
-- [本地 API 简表](#本地-api-简表)
-- [常见问题](#常见问题)
+- 工作台：启动/停止任务、实时日志、成功率、重试原因、SMS 消耗与余额统计。
+- 邮箱体系：支持 `Cloudflare Temp Email`、`MailFree`、`CloudMail`、`Mail-Curl`、`Gmail IMAP`、`Microsoft Graph`。
+- MailFree 域名配置：可在 UI 内读取 Cloudflare Zone、管理 CNAME、并将 DNS 子域名批量同步到 MailFree 域名池（`/api/domains`）。
+- 代理能力：支持单代理或多代理轮换（逗号/空格/换行分隔）；支持 FlClash 动态切节点、延迟探测、自动跳过香港节点。
+- 本地账号管理：SQLite（`local_accounts.db`）作为本地账号真源，支持导入、筛选、状态展示、导出与同步。
+- 云端账号管理：支持 `Sub2API` 与 `CLIProxyAPI` 双模式，支持测活、刷新、删除、批量操作。
+- 发布能力：推送 `v*` Tag 自动触发多平台 Release 打包。
 
-## 功能概览
-
-- 统一工作台：开始/停止任务、实时日志、重试原因、成功率、SMS 花费与余额统计。
-- 邮箱体系：支持 Cloudflare Temp Email、MailFree、CloudMail、Mail-Curl、Gmail IMAP 与 Microsoft Graph，支持 Graph 文件导入、轮询与 token 刷新。
-- SMS 管理：支持 HeroSMS 余额检查、国家下拉（含价格/库存）、国家过滤、手机号复用、自动国家优选。
-- 代理能力：支持固定 HTTP 代理与 FlClash 动态切节点（含延迟探测、批次共享节点、自动过滤不可用节点）。
-- 数据管理：本地 `accounts_*.json` 导出文件管理；本地账号统一落地到 SQLite（`local_accounts.db`），账号导入/云端维护独立到左侧“账号管理”。
-- 远端维护：支持 Sub2API / CLIProxyAPI 双云端账号源；均支持导入、批量测活、批量刷新、批量删除，Sub2API 额外支持复活与分组更新。
-
-## 运行架构
-
-```text
-gui.py
-  -> codex_register/gui_server_runtime.py (本地 HTTP API + UI 托管)
-  -> codex_register/gui_frontend.py (组装 HTML/CSS/JS)
-  -> codex_register/gui_service.py (核心编排/状态/日志)
-      -> codex_register/r_with_pwd.py (注册与 OAuth 主流程)
-      -> codex_register/mail_services.py + codex_register/mail_providers/ (邮箱服务抽象与各 Provider 模块)
-```
-
-目录整理后，核心 Python/前端资源统一放在 `codex_register/`，根目录只保留入口、配置、脚本和文档。
-
-## 目录速览
+## 2. 目录结构
 
 ```text
 .
-├─ gui.py                        # 程序入口（窗口/浏览器模式）
-├─ codex_register/               # 核心代码包
-│  ├─ gui_service.py             # 核心编排与状态管理
-│  ├─ gui_server_runtime.py      # 本地 HTTP API
-│  ├─ gui_frontend.py            # 前端页面组装
-│  ├─ r_with_pwd.py              # 注册与 OAuth 主流程
-│  ├─ mail_services.py           # 邮箱服务工厂
-│  └─ mail_providers/            # 各邮箱 Provider 模块
-├─ scripts/                      # 打包/Release 脚本
-├─ .github/workflows/            # CI/CD（Tag 自动发布）
-├─ gui_config.example.json       # 配置示例
-├─ README.md
+├─ gui.py
 ├─ VERSION
-└─ REPOSITORY
+├─ REPOSITORY
+├─ gui_config.example.json
+├─ codex_register/
+│  ├─ gui_service.py
+│  ├─ gui_server_runtime.py
+│  ├─ gui_frontend_app_template.html
+│  ├─ gui_frontend_app_setup.js
+│  ├─ r_with_pwd.py
+│  ├─ mail_services.py
+│  ├─ mail_providers/
+│  └─ ...
+├─ scripts/
+└─ .github/workflows/release.yml
 ```
 
-## 环境要求
+## 3. 环境要求
 
 - Python `>= 3.10`
-- 推荐系统：Windows 10/11（Linux/macOS 可用浏览器模式）
-- 依赖：
+- 依赖安装：
 
 ```bash
 pip install requests curl_cffi pywebview
@@ -78,10 +48,10 @@ pip install requests curl_cffi pywebview
 
 说明：
 
-- `window` 模式依赖 `pywebview`；Windows 还需要安装 **Microsoft Edge WebView2 Runtime**。
-- 前端通过 CDN 加载 Vue/Naive UI（需可访问 `unpkg.com`）。
+- `window` 模式依赖 `pywebview`，Windows 需安装 WebView2 Runtime。
+- 前端资源通过 CDN 加载（`unpkg.com`）。
 
-## 快速开始
+## 4. 快速开始
 
 1) 复制示例配置
 
@@ -89,13 +59,13 @@ pip install requests curl_cffi pywebview
 cp gui_config.example.json gui_config.json
 ```
 
-PowerShell:
+PowerShell：
 
 ```powershell
 Copy-Item gui_config.example.json gui_config.json
 ```
 
-2) 修改 `gui_config.json`（至少填邮箱服务、远端接口、代理/SMS 等关键项）
+2) 填写 `gui_config.json` 关键项（邮箱服务、代理、SMS、云端管理地址等）
 
 3) 启动
 
@@ -103,166 +73,184 @@ Copy-Item gui_config.example.json gui_config.json
 python gui.py
 ```
 
-4) 可选启动参数
+4) 可选参数
 
 ```bash
 python gui.py --mode browser --host 127.0.0.1 --port 8765
 python gui.py --mode browser --no-auto-open
 ```
 
-## 界面说明
+## 5. 使用方法（推荐流程）
 
-- `工作台`：任务控制、实时统计（含 SMS 消耗/余额/阈值）。
-- `数据`：本地 `accounts_*.json` 导出文件管理。
-- `账号管理`：本地账号以 SQLite（`local_accounts.db`）为唯一真源，支持按数量勾选、删除已选账号；`导出为Sub2API可用文件` 会弹窗设置“文件数/每文件账号数”；保留 `导入到sub2api`、`导入到cpa`、`导出为CPA可用文件`。
-- `云端账号`：支持 Sub2API / CLIProxyAPI 双源（测活/刷新/删除），其中 Sub2API 额外支持复活与分组维护。
-- `邮箱设置`：MailFree / Gmail IMAP / Graph 设置，支持 Graph 文件导入与收件检查。
-- `SMS管理`：HeroSMS 开关、API Key、服务代码、国家价格下拉、余额刷新。
-- `服务设置`：并发、冷却、重试、网络与指纹相关配置。
-- `代理服务`：FlClash 配置与节点探测。
-- `关于`：查看版本号、作者、项目介绍，支持一键检测 GitHub 最新版本。
-- `运行日志`：完整运行日志输出。
+### 5.1 工作台
 
-## 配置文件与安全
+- 配置“计划注册数/并发/冷却/代理”后点击开始。
+- 日志区会实时显示每个线程的尝试、成功、失败和重试补位。
 
-- `gui_config.json`：本地真实配置（包含密钥，不要提交）。
-- `gui_config.example.json`：示例配置（可提交）。
-- `.env`：可选，仅用于部分默认值补全。
+### 5.2 邮箱设置
 
-当前仓库 `.gitignore` 已忽略 `*.json`、`*.txt`、`gui_config.json`，可避免误提交多数敏感文件。
+- 先选择 `mail_service_provider`。
+- MailFree / Cloudflare Temp / CloudMail 可配置域名策略（随机域名、白名单、自定义 local-part）。
+- Graph 模式需提供账号文件，支持启动前预刷新 token。
+- Gmail 模式需使用应用专用密码（非登录密码）。
 
-## 使用协议
+### 5.3 MailFree 域名配置（Cloudflare DNS）
 
-- 作者：`Msg-Lbo`（GitHub: `https://github.com/Msg-Lbo`）。
-- 本项目采用仓库根目录 `LICENSE`（`CodeX Register 使用协议（非开源许可）`）。
-- 协议地址：`https://github.com/Msg-Lbo/codeX-register/blob/main/LICENSE`
-- 本项目仅用于学习研究，允许非商业使用与非商业二次开发自用。
-- 明确禁止：任何商业售卖、收费服务、以及二次开发后用于收费/变现。
-- 如需商业授权，请先取得作者书面许可。
+在“邮箱设置 -> MailFree -> 域名配置”中：
 
-## 完整配置项
+1. 填 Cloudflare API Token，点击“刷新域名”。
+2. 选择 Zone 与 CNAME 指向域名。
+3. 可查看/新增/编辑/批量删除 CNAME。
+4. 勾选记录后可“批量同步MailFree”，会把完整域名写入 MailFree 的 `/api/domains`。
 
-以下配置与 `gui_config_store.py` 中 `DEFAULT_CONFIG` 对应。
+注意：同步到 MailFree 需要该 MailFree 账号具备严格管理员权限。
 
-### 1) 注册任务
+### 5.4 代理服务
 
-| 键名 | 类型 | 默认值 | 说明 |
-|---|---|---:|---|
-| `num_accounts` | int | `1` | 每个导出 JSON 文件目标注册数 |
-| `num_files` | int | `1` | 导出文件数量 |
-| `concurrency` | int | `1` | 单文件并发线程数 |
-| `sleep_min` | int | `5` | 每次尝试后的最小冷却秒数 |
-| `sleep_max` | int | `30` | 每次尝试后的最大冷却秒数 |
-| `fast_mode` | bool | `false` | 加速模式（缩短等待、重试与退避） |
-| `retry_403_wait_sec` | int | `10` | 403 后等待秒数 |
-| `proxy` | string | `""` | HTTP 代理，例如 `http://127.0.0.1:7890` |
+- `proxy` 支持多条代理，格式可用逗号/空格/换行分隔，运行时按顺序轮换。
+- 开启 FlClash 后，会在可用节点中切换（过滤香港节点，并做延迟检测）。
+- 并发场景采用“波次切换”：每累计 `flclash_rotate_every` 次尝试后，等待当前波次结束再切下一节点。
 
-### 2) 代理服务（[FlClash](https://github.com/chen08209/FlClash)）
+### 5.5 账号管理
+
+- 本地账号页：按邮箱/备注/状态搜索，支持批量选择、删除、导入到 Sub2API/CPA、导出文件。
+- 云端账号页：支持分组、测活、刷新、复活（Sub2API）、删除。
+- 云端删除支持附加操作：可选同时删除本地数据库中对应账号。
+
+## 6. 配置说明（完整键）
+
+以下与 `codex_register/gui_config_store.py` 的 `DEFAULT_CONFIG` 对应。
+
+### 6.1 注册与运行节奏
 
 | 键名 | 类型 | 默认值 | 说明 |
 |---|---|---:|---|
-| `flclash_enable_switch` | bool | `false` | 启用 FlClash 动态切节点 |
-| `flclash_controller` | string | `"127.0.0.1:9090"` | 控制器地址（host:port） |
+| `num_accounts` | int | `1` | 每个批次目标成功数 |
+| `num_files` | int | `1` | 批次数量 |
+| `concurrency` | int | `1` | 并发线程数 |
+| `sleep_min` | int | `5` | 每次尝试后最小冷却秒数 |
+| `sleep_max` | int | `30` | 每次尝试后最大冷却秒数 |
+| `fast_mode` | bool | `false` | 加速模式 |
+| `retry_403_wait_sec` | int | `10` | 命中 403 的等待秒数 |
+| `proxy` | string | `""` | 代理地址；支持多条轮换 |
+| `register_random_fingerprint` | bool | `true` | 是否随机浏览器指纹 |
+| `openai_ssl_verify` | bool | `true` | HTTPS 证书校验 |
+| `skip_net_check` | bool | `false` | 跳过出口地区检测 |
+
+### 6.2 FlClash 动态换 IP
+
+| 键名 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `flclash_enable_switch` | bool | `false` | 是否启用 FlClash 动态切换 |
+| `flclash_controller` | string | `127.0.0.1:9090` | 控制器地址 |
 | `flclash_secret` | string | `""` | 控制器鉴权 secret |
-| `flclash_group` | string | `"PROXY"` | 策略组名（与 FlClash 界面一致） |
-| `flclash_switch_policy` | string | `"round_robin"` | `round_robin` / `random` |
+| `flclash_group` | string | `PROXY` | Selector 组名 |
+| `flclash_switch_policy` | string | `round_robin` | `round_robin` / `random` |
 | `flclash_switch_wait_sec` | float | `1.2` | 切换后等待秒数 |
-| `flclash_delay_test_url` | string | `"https://www.gstatic.com/generate_204"` | 延迟探测 URL |
+| `flclash_rotate_every` | int | `3` | 每波次尝试数（达到后切下一节点） |
+| `flclash_delay_test_url` | string | `https://www.gstatic.com/generate_204` | 延迟探测 URL |
 | `flclash_delay_timeout_ms` | int | `4000` | 延迟探测超时 |
-| `flclash_delay_max_ms` | int | `1800` | 可用延迟阈值 |
-| `flclash_delay_retry` | int | `1` | 单节点延迟探测重试次数 |
+| `flclash_delay_max_ms` | int | `1800` | 可用阈值 |
+| `flclash_delay_retry` | int | `1` | 延迟探测重试次数 |
 
-### 3) 邮箱服务（Cloudflare Temp Email / [MailFree](https://github.com/Msg-Lbo/mailfree) / CloudMail / Mail-Curl / Gmail IMAP / [Graph](https://learn.microsoft.com/zh-cn/graph/use-the-api)）
+### 6.3 邮箱通用策略
 
 | 键名 | 类型 | 默认值 | 说明 |
 |---|---|---:|---|
-| `mail_service_provider` | string | `"mailfree"` | `cloudflare_temp_email` / `mailfree` / `cloudmail` / `mail_curl` / `gmail` / `graph` |
-| `mail_domains` | string | `""` | 域名池（逗号/空格分隔），供 Cloudflare Temp / CloudMail 使用 |
-| `worker_domain` | string | `""` | MailFree 服务基地址 |
-| `freemail_username` | string | `""` | MailFree 用户名 |
-| `freemail_password` | string | `""` | MailFree 密码 |
-| `cf_temp_admin_auth` | string | `""` | Cloudflare Temp Email 管理员口令 |
-| `cloudmail_api_url` | string | `""` | CloudMail API 基地址 |
-| `cloudmail_admin_email` | string | `""` | CloudMail 管理员邮箱 |
-| `cloudmail_admin_password` | string | `""` | CloudMail 管理员密码 |
-| `mail_curl_api_base` | string | `""` | Mail-Curl API 基地址 |
-| `mail_curl_key` | string | `""` | Mail-Curl Key |
-| `gmail_imap_user` | string | `""` | Gmail IMAP 登录账号（建议 Gmail 主号） |
-| `gmail_imap_pass` | string | `""` | Gmail 应用专用密码（16 位） |
-| `gmail_alias_emails` | string | `""` | 别名主邮箱池，逗号/空格分隔（留空默认用 `gmail_imap_user`） |
-| `gmail_imap_server` | string | `"imap.gmail.com"` | IMAP 服务器地址 |
-| `gmail_imap_port` | int | `993` | IMAP SSL 端口 |
-| `gmail_alias_tag_len` | int | `8` | Gmail 别名 tag 长度（`user+tag@gmail.com`） |
-| `gmail_alias_mix_googlemail` | bool | `true` | 是否混用 `gmail.com`/`googlemail.com` 后缀 |
-| `graph_accounts_file` | string | `""` | Graph 账号文件路径 |
-| `graph_tenant` | string | `"common"` | Graph tenant |
-| `graph_fetch_mode` | string | `"graph_api"` | `graph_api` / `imap_xoauth2` |
-| `graph_pre_refresh_before_run` | bool | `true` | 启动前批量预刷新 Graph token |
-| `mail_domain_allowlist` | array | `[]` | 邮箱域白名单 |
-| `mailfree_random_domain` | bool | `true` | MailFree 是否随机域名 |
-| `mailbox_custom_enabled` | bool | `false` | 启用自定义邮箱 local-part |
-| `mailbox_prefix` | string | `""` | 自定义前缀 |
+| `mail_service_provider` | string | `mailfree` | `cloudflare_temp_email` / `mailfree` / `cloudmail` / `mail_curl` / `gmail` / `graph` |
+| `mail_domains` | string | `""` | 通用域名池（主要用于 Cloudflare Temp / CloudMail） |
+| `mail_domain_allowlist` | array | `[]` | 注册域白名单 |
+| `mailfree_random_domain` | bool | `true` | 是否随机域名 |
+| `mailbox_custom_enabled` | bool | `false` | 自定义邮箱 local-part |
+| `mailbox_prefix` | string | `""` | local-part 前缀 |
 | `mailbox_random_len` | int | `0` | 前缀后追加随机长度 |
 
-实现对齐（参考开源文档）：
-- Cloudflare Temp Email（`dreamhunter2333/cloudflare_temp_email`）：`/admin/new_address`、`/admin/mails`、`/admin/address`、`/admin/delete_address/:id`，使用 `x-admin-auth`。
-- MailFree（`Msg-Lbo/mailfree`）：`/api/login`、`/api/generate`、`/api/emails`、`/api/email/{id}`、`/api/mailbox/{address}`（同时兼容旧版 `/api/mailboxes`）。
-- CloudMail（`maillab/cloud-mail`）：`/api/public/genToken`、`/api/public/addUser`、`/api/public/emailList`，使用 `Authorization` token。
-- Mail-Curl（`s12ryt/mail-curl`）：`/api/remail`、`/api/inbox`、`/api/mail`、`/api/ls`（通过 `key` 鉴权）。
-
-### 4) SMS（[HeroSMS](https://hero-sms.com/cn)）
+### 6.4 MailFree / Cloudflare Temp / Cloudflare DNS 配置
 
 | 键名 | 类型 | 默认值 | 说明 |
 |---|---|---:|---|
-| `hero_sms_enabled` | bool | `false` | 启用 HeroSMS |
+| `worker_domain` | string | `""` | MailFree 服务地址 |
+| `freemail_username` | string | `""` | MailFree 用户名 |
+| `freemail_password` | string | `""` | MailFree 密码 |
+| `cf_api_token` | string | `""` | Cloudflare API Token（域名配置页使用） |
+| `cf_account_id` | string | `""` | 兼容字段 |
+| `cf_worker_script` | string | `mailfree` | 兼容字段 |
+| `cf_worker_mail_domain_binding` | string | `MAIL_DOMAIN` | 兼容字段 |
+| `cf_dns_target_domain` | string | `""` | CNAME 目标域名默认值 |
+| `cf_temp_admin_auth` | string | `""` | Cloudflare Temp Email 管理员认证 |
+
+### 6.5 CloudMail / Mail-Curl
+
+| 键名 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `cloudmail_api_url` | string | `""` | CloudMail API 地址 |
+| `cloudmail_admin_email` | string | `""` | CloudMail 管理员邮箱 |
+| `cloudmail_admin_password` | string | `""` | CloudMail 管理员密码 |
+| `mail_curl_api_base` | string | `""` | Mail-Curl API 地址 |
+| `mail_curl_key` | string | `""` | Mail-Curl Key |
+
+### 6.6 Gmail / Graph
+
+| 键名 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `gmail_imap_user` | string | `""` | Gmail IMAP 账号 |
+| `gmail_imap_pass` | string | `""` | Gmail 应用专用密码 |
+| `gmail_alias_emails` | string | `""` | 别名邮箱池 |
+| `gmail_imap_server` | string | `imap.gmail.com` | IMAP 服务器 |
+| `gmail_imap_port` | int | `993` | IMAP 端口 |
+| `gmail_alias_tag_len` | int | `8` | 别名 tag 长度 |
+| `gmail_alias_mix_googlemail` | bool | `true` | 混用 gmail/googlemail 域名 |
+| `graph_accounts_file` | string | `""` | Graph 账号文件路径 |
+| `graph_tenant` | string | `common` | Graph tenant |
+| `graph_fetch_mode` | string | `graph_api` | `graph_api` / `imap_xoauth2` |
+| `graph_pre_refresh_before_run` | bool | `true` | 启动前预刷新 token |
+
+### 6.7 HeroSMS
+
+| 键名 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `hero_sms_enabled` | bool | `false` | 开启 HeroSMS |
 | `hero_sms_api_key` | string | `""` | HeroSMS API Key |
-| `hero_sms_service` | string | `""` | 服务代码（留空自动识别） |
-| `hero_sms_country` | string | `"US"` | 国家偏好（SMS 管理页可下拉选） |
-| `hero_sms_max_price` | float | `2.0` | 余额下限（美元），低于即停任务 |
-| `hero_sms_reuse_phone` | bool | `false` | 复用手机号（实验） |
-| `hero_sms_auto_pick_country` | bool | `false` | 自动按价格/库存/历史评分选国 |
+| `hero_sms_service` | string | `""` | 服务代码（可自动识别） |
+| `hero_sms_country` | string | `US` | 国家偏好 |
+| `hero_sms_max_price` | float | `2.0` | 余额下限（美元） |
+| `hero_sms_reuse_phone` | bool | `false` | 启用号码复用 |
+| `hero_sms_auto_pick_country` | bool | `false` | 自动选国家 |
 
-### 5) 远端账号与批量测试
+### 6.8 云端账号管理
 
 | 键名 | 类型 | 默认值 | 说明 |
 |---|---|---:|---|
-| `remote_account_provider` | string | `"sub2api"` | 云端账号类型：`sub2api` / `cliproxyapi` |
-| `accounts_sync_api_url` | string | `""` | 本地同步接口（需自行填写） |
-| `accounts_sync_bearer_token` | string | `""` | Bearer Token |
-| `accounts_list_api_base` | string | `""` | 远端列表 API 基地址（需自行填写） |
-| `cliproxy_api_base` | string | `""` | CLIProxyAPI Management API 地址（支持自动补全到 `/v0/management`） |
-| `cliproxy_management_key` | string | `""` | CLIProxyAPI 管理密钥（Authorization Bearer） |
-| `accounts_list_page_size` | int | `10` | 每页拉取条数 |
-| `accounts_list_fetch_workers` | int | `4` | 列表并发拉取线程数 |
-| `accounts_list_ssl_retry` | int | `3` | 列表 SSL 重试次数 |
-| `accounts_list_ssl_retry_wait_sec` | float | `0.8` | SSL 重试等待基数 |
-| `accounts_list_timezone` | string | `"Asia/Shanghai"` | 查询时区 |
-| `remote_test_concurrency` | int | `4` | 批量测活并发 |
-| `remote_test_ssl_retry` | int | `2` | 批量测活 SSL 重试 |
-| `remote_refresh_concurrency` | int | `4` | 批量刷新并发 |
-| `remote_revive_concurrency` | int | `4` | 批量复活并发 |
+| `remote_account_provider` | string | `sub2api` | 云端类型：`sub2api` / `cliproxyapi` |
+| `accounts_sync_api_url` | string | `""` | 同步 API 地址 |
+| `accounts_sync_bearer_token` | string | `""` | 同步 API Token |
+| `accounts_list_api_base` | string | `""` | 列表 API 基地址 |
+| `cliproxy_api_base` | string | `""` | CLIProxyAPI 管理地址 |
+| `cliproxy_management_key` | string | `""` | CLIProxyAPI 管理密钥 |
+| `accounts_list_page_size` | int | `10` | 列表每页数量 |
+| `accounts_list_fetch_workers` | int | `4` | 拉取并发 |
+| `accounts_list_ssl_retry` | int | `3` | SSL 重试次数 |
+| `accounts_list_ssl_retry_wait_sec` | float | `0.8` | SSL 重试间隔 |
+| `accounts_list_timezone` | string | `Asia/Shanghai` | 时区 |
+| `remote_test_concurrency` | int | `4` | 测活并发 |
+| `remote_test_ssl_retry` | int | `2` | 测活 SSL 重试 |
+| `remote_refresh_concurrency` | int | `4` | 刷新并发 |
+| `remote_revive_concurrency` | int | `4` | 复活并发（Sub2API） |
 
-### 6) 安全与运行控制
+### 6.9 其他配置
 
 | 键名 | 类型 | 默认值 | 说明 |
 |---|---|---:|---|
 | `mail_delete_concurrency` | int | `4` | 邮件删除并发 |
-| `openai_ssl_verify` | bool | `true` | HTTPS 证书校验 |
-| `skip_net_check` | bool | `false` | 跳过出口地区检测 |
-| `register_random_fingerprint` | bool | `true` | 随机浏览器指纹 |
-| `codex_export_dir` | string | `""` | 导出目录（为空禁用） |
+| `codex_export_dir` | string | `""` | CPA 导出目录 |
+| `mail_domain_error_counts` | object | `{}` | 域名失败计数（运行时维护） |
+| `mail_domain_registered_counts` | object | `{}` | 域名成功计数（运行时维护） |
+| `json_file_notes` | object | `{}` | JSON 文件备注 |
+| `local_cpa_test_state` | object | `{}` | 本地账号测活状态缓存 |
 
-### 7) 运行时统计（自动维护）
+## 7. Graph 账号文件格式
 
-| 键名 | 类型 | 默认值 | 说明 |
-|---|---|---:|---|
-| `mail_domain_error_counts` | object | `{}` | 各域名失败统计 |
-| `mail_domain_registered_counts` | object | `{}` | 各域名成功统计 |
-| `json_file_notes` | object | `{}` | JSON 文件备注映射 |
-
-## Graph 账号文件格式
-
-Graph 账号文件每行一个账号，格式：
+每行格式：
 
 ```text
 email----password----client_id----refresh_token
@@ -275,79 +263,32 @@ alice@outlook.com----pass123----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AXEA..
 bob@outlook.com----pass456----yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy----0.AXEA...
 ```
 
-说明：
+## 8. 常见问题
 
-- 支持空行与 `#` 注释行。
-- 运行中可能更新 refresh token 并回写该文件。
+- IP 不切换：
+  - 检查是否只配置了 1 条代理；
+  - 多代理请使用逗号/空格/换行分隔；
+  - FlClash 仅有 1 个可用非香港节点时无法切换。
+- MailFree 域名同步失败：确认是严格管理员账号，且 MailFree 服务已升级到动态域名版本。
+- `invalid_auth_step` 频繁：降低并发、提高代理质量、开启随机指纹。
+- Gmail 登录失败：必须用应用专用密码。
+- HeroSMS `NO_BALANCE`：充值或降低余额下限策略。
 
-## SMS 管理策略
+## 9. 使用协议
 
-- 国家列表自动过滤 OpenAI 不支持国家（如中国/香港/澳门等）。
-- 支持按 `价格 + 库存 + 历史成功率` 自动优选国家（开启 `hero_sms_auto_pick_country`）。
-- 支持手机号复用（`hero_sms_reuse_phone`），默认复用上限由内部参数控制。
-- 余额低于阈值（`hero_sms_max_price`，语义为余额下限）会直接停止任务。
+- 作者：`Msg-Lbo`（GitHub: `https://github.com/Msg-Lbo`）
+- 协议文件：`LICENSE`
+- 协议链接：`https://github.com/Msg-Lbo/codeX-register/blob/main/LICENSE`
+- 允许学习研究与非商业自用；禁止商业售卖和二开后收费变现。
 
-常用高级环境变量（可选）：
+## 10. 自动发布（Tag Release）
 
-| 环境变量 | 默认 | 说明 |
-|---|---:|---|
-| `HERO_SMS_POLL_TIMEOUT_SEC` | `75` | 单次等码超时 |
-| `HERO_SMS_RESEND_AFTER_SEC` | `24` | 多少秒后触发重发请求 |
-| `HERO_SMS_REUSE_MAX_USES` | `2` | 单号码最大复用次数 |
-| `HERO_SMS_COUNTRY_TIMEOUT_LIMIT` | `2` | 连续超时多少次后切国家 |
-| `HERO_SMS_COUNTRY_COOLDOWN_SEC` | `900` | 触发后国家冷却秒数 |
+- 推送 `v*` Tag 会触发 `.github/workflows/release.yml` 自动构建并发布。
+- 示例：
 
-## 运行产物
+```bash
+git tag v1.0.3
+git push origin v1.0.3
+```
 
-- `accounts_*.json`：成功账号 token 文件（兼容保留，可清理）。
-- `accounts.txt`：账号与密码汇总（兼容保留，可清理）。
-- `local_accounts.db`：本地账号 SQLite 存储（唯一真源）。
-- `gui_config.json`：本地配置回写。
-
-## 自动发布（Tag Release）
-
-- 仓库内置 `.github/workflows/release.yml`，当推送 `v*` 标签时自动触发。
-- 会在 GitHub Actions 中构建 Windows/macOS/Linux 三个平台包，并上传到同一个 Release。
-- Release 描述会包含“更新信息”（标签注释/提交摘要）与校验文件 `SHA256SUMS.txt`。
-- 构建时会写入 `VERSION` 与 `REPOSITORY`，供「关于」页展示版本并检测更新。
-
-## 本地 API 简表
-
-部分常用接口：
-
-- `GET /api/config`：读取配置
-- `POST /api/config`：保存配置
-- `POST /api/start`：开始任务
-- `POST /api/stop`：停止任务
-- `GET /api/status`：状态与统计
-- `GET /api/logs`：增量日志
-- `GET /api/sms/overview`：SMS 余额/消耗信息
-- `GET /api/sms/countries`：国家价格库存列表（含过滤）
-
-## 常见问题
-
-- `invalid_auth_step` 频繁：通常是链路状态/风控波动，优先降低并发、开启随机指纹、提高代理质量。
-- 点击开始提示“配置未完成”：先按工作台红色提示补齐必填项（例如 MailFree 凭据、Graph 文件、FlClash 关键字段）。
-- Gmail IMAP 登录失败：确认 Gmail 已开启 IMAP，并使用 16 位应用专用密码而非账号登录密码。
-- `NO_BALANCE`：HeroSMS 余额不足，充值或提高阈值策略后重试。
-- 长时间卡在等码：检查国家库存、切换国家或开启自动优选国家。
-- `window` 模式打不开：安装 WebView2 Runtime，或先用 `--mode browser`。
-- 页面加载失败：检查是否可访问 `unpkg.com`（Vue/Naive UI CDN）。
-
-## 贡献指南
-
-欢迎提交 Issue / PR，建议按以下流程：
-
-1. 先提 Issue 说明问题或需求（附日志与复现步骤）。
-2. 新建分支开发，保持改动聚焦（避免无关重构）。
-3. 提交 PR 时说明「改了什么 / 为什么改 / 怎么验证」。
-4. 不要在 PR 中提交任何密钥、token、真实账号文件。
-
-建议 PR 自检：
-
-- 前端脚本语法检查：`node --check gui_frontend_app_setup.js`
-- Python 语法检查：`python -m compileall -f gui.py gui_service.py r_with_pwd.py`
-
-## 免责声明
-
-本项目仅用于技术研究与自动化工程实践。请遵守目标平台服务条款与所在地法律法规，风险自担。
+- Release 产物包含多平台包与校验信息。

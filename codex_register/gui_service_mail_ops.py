@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import re
+import string
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
+from curl_cffi import requests
 
 from .gui_config_store import save_config
 from .mail_services import (
@@ -157,6 +162,583 @@ def mail_sender_text(raw_sender: Any) -> str:
         vals = [v for v in vals if v]
         return ", ".join(vals)
     return str(raw_sender or "").strip()
+
+
+def _cf_safe_text(raw: Any, limit: int = 260) -> str:
+    text = str(raw or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _cf_extract_error(payload: Any) -> str:
+    if isinstance(payload, dict):
+        errors = payload.get("errors")
+        if isinstance(errors, list) and errors:
+            first = errors[0]
+            if isinstance(first, dict):
+                code = str(first.get("code") or "").strip()
+                msg = str(first.get("message") or first.get("error") or "").strip()
+                if code and msg:
+                    return f"{code}: {msg}"
+                if msg:
+                    return msg
+        msg = str(payload.get("message") or payload.get("msg") or "").strip()
+        if msg:
+            return msg
+    return "请求失败"
+
+
+def _cf_has_error_code(payload: Any, code: int) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    errors = payload.get("errors")
+    if not isinstance(errors, list):
+        return False
+    for it in errors:
+        if not isinstance(it, dict):
+            continue
+        try:
+            c = int(it.get("code"))
+        except Exception:
+            continue
+        if c == int(code):
+            return True
+    return False
+
+
+def _cf_token(service) -> str:
+    token = str(service.cfg.get("cf_api_token") or "").strip()
+    if not token:
+        raise ValueError("请先填写 Cloudflare API Token（cf_api_token）")
+    return token
+
+
+def _cf_clean_domain(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"^https?://", "", text)
+    text = text.strip("/")
+    if ":" in text:
+        text = text.split(":", 1)[0].strip()
+    if "@" in text:
+        text = text.split("@", 1)[1].strip()
+    text = text.strip(".")
+    return text
+
+
+def _cf_clean_label(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    text = text.split(".", 1)[0]
+    text = re.sub(r"[^a-z0-9-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text)
+    text = text.strip("-")
+    if len(text) > 63:
+        text = text[:63].rstrip("-")
+    return text
+
+
+def _cf_render_fqdn(label: str, zone_name: str) -> str:
+    lb = _cf_clean_label(label)
+    zone = _cf_clean_domain(zone_name)
+    if not lb or not zone:
+        return ""
+    return f"{lb}.{zone}"
+
+
+def _cf_relative_label(full_name: str, zone_name: str) -> str:
+    name = _cf_clean_domain(full_name)
+    zone = _cf_clean_domain(zone_name)
+    if not name:
+        return ""
+    if zone and name.endswith("." + zone):
+        return name[: -(len(zone) + 1)]
+    return name
+
+
+def _cf_suffix_label(base: str, idx: int) -> str:
+    base_label = _cf_clean_label(base)
+    if not base_label:
+        return ""
+    if idx <= 1:
+        return base_label
+    suffix = f"-{idx}"
+    max_len = 63 - len(suffix)
+    if max_len <= 0:
+        return ""
+    return f"{base_label[:max_len].rstrip('-')}{suffix}"
+
+
+def _cf_random_label(prefix: str, random_len: int) -> str:
+    plen = max(3, min(32, int(random_len)))
+    pfx = _cf_clean_label(prefix)
+    tail = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(plen))
+    if pfx:
+        room = 63 - (len(pfx) + 1)
+        if room <= 0:
+            return pfx[:63]
+        return f"{pfx}-{tail[:room]}"
+    return tail[:63]
+
+
+def _cf_headers(service) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {_cf_token(service)}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _cf_request(
+    service,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    timeout: int = 35,
+) -> dict[str, Any]:
+    url = f"https://api.cloudflare.com/client/v4{path}"
+    proxy = mail_proxy(service)
+    verify_ssl = bool(service.cfg.get("openai_ssl_verify", True))
+    try:
+        resp = requests.request(
+            method=method,
+            url=url,
+            params=params,
+            json=json_body,
+            headers=_cf_headers(service),
+            proxies=proxy,
+            impersonate="safari",
+            verify=verify_ssl,
+            timeout=timeout,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Cloudflare API 请求失败: {e}") from e
+
+    status = int(resp.status_code or 0)
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+
+    if not (200 <= status < 300):
+        detail = _cf_extract_error(payload)
+        raw = _cf_safe_text(getattr(resp, "text", ""))
+        hint = ""
+        if status == 403 and _cf_has_error_code(payload, 10000):
+            hint = (
+                "。请检查 Token 是否包含对应资源与权限："
+                "账户->Workers 脚本(读取/编辑)；区域->DNS(读取/编辑)"
+            )
+        raise RuntimeError(f"Cloudflare API {method} {path} HTTP {status}: {detail or raw}{hint}")
+
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise RuntimeError(f"Cloudflare API {method} {path} 失败: {_cf_extract_error(payload)}")
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Cloudflare API 返回格式异常")
+    return payload
+
+
+def _cf_list_zones_internal(service) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    page = 1
+    while page <= 20:
+        payload = _cf_request(
+            service,
+            "GET",
+            "/zones",
+            params={"page": str(page), "per_page": "50", "status": "active"},
+            timeout=25,
+        )
+        result = payload.get("result") if isinstance(payload, dict) else []
+        if not isinstance(result, list):
+            break
+        if not result:
+            break
+        rows.extend([x for x in result if isinstance(x, dict)])
+        info = payload.get("result_info") if isinstance(payload, dict) else {}
+        if not isinstance(info, dict):
+            break
+        total_pages = int(info.get("total_pages") or page)
+        if page >= total_pages:
+            break
+        page += 1
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for it in rows:
+        zid = str(it.get("id") or "").strip()
+        zname = _cf_clean_domain(it.get("name") or "")
+        if not zid or not zname or zid in seen:
+            continue
+        seen.add(zid)
+        account = it.get("account") if isinstance(it.get("account"), dict) else {}
+        out.append(
+            {
+                "id": zid,
+                "name": zname,
+                "status": str(it.get("status") or "").strip() or "active",
+                "account_id": str(account.get("id") or "").strip(),
+                "account_name": str(account.get("name") or "").strip(),
+            }
+        )
+    out.sort(key=lambda x: (str(x.get("name") or ""), str(x.get("id") or "")))
+    return out
+
+
+def _cf_get_zone(service, zone_id: str) -> dict[str, Any]:
+    zid = str(zone_id or "").strip()
+    if not zid:
+        raise ValueError("zone_id 不能为空")
+    payload = _cf_request(service, "GET", f"/zones/{zid}", timeout=25)
+    result = payload.get("result") if isinstance(payload, dict) else {}
+    if not isinstance(result, dict):
+        raise RuntimeError("读取 Zone 信息失败")
+    return result
+
+
+def mail_cf_zones(service) -> dict[str, Any]:
+    zones = _cf_list_zones_internal(service)
+    selected_zone_id = ""
+    with service._lock:
+        selected_zone_id = str(service.cfg.get("cf_zone_id") or "").strip()
+        cfg_account_id = str(service.cfg.get("cf_account_id") or "").strip()
+        worker_script = str(service.cfg.get("cf_worker_script") or "mailfree").strip() or "mailfree"
+        worker_binding = str(service.cfg.get("cf_worker_mail_domain_binding") or "MAIL_DOMAIN").strip() or "MAIL_DOMAIN"
+        target_domain = _cf_clean_domain(service.cfg.get("cf_dns_target_domain") or "")
+
+    zone_ids = {str(x.get("id") or "").strip() for x in zones}
+    if selected_zone_id not in zone_ids:
+        selected_zone_id = str((zones[0] or {}).get("id") or "") if zones else ""
+
+    zone_name_map = {str(x.get("id") or ""): str(x.get("name") or "") for x in zones}
+    if not target_domain:
+        target_domain = _cf_clean_domain(zone_name_map.get(selected_zone_id) or "")
+
+    account_id = cfg_account_id
+    if not account_id:
+        for z in zones:
+            aid = str(z.get("account_id") or "").strip()
+            if aid:
+                account_id = aid
+                break
+
+    return {
+        "zones": zones,
+        "total": len(zones),
+        "selected_zone_id": selected_zone_id,
+        "target_domain": target_domain,
+        "account_id": account_id,
+        "worker_script": worker_script,
+        "worker_binding": worker_binding,
+    }
+
+
+def mail_cf_dns_list(service, zone_id: str) -> dict[str, Any]:
+    zid = str(zone_id or "").strip()
+    if not zid:
+        raise ValueError("请先选择要查看的域名")
+    zone = _cf_get_zone(service, zid)
+    zone_name = _cf_clean_domain(zone.get("name") or "")
+    if not zone_name:
+        raise RuntimeError("Zone 名称为空，无法读取 DNS")
+
+    rows: list[dict[str, Any]] = []
+    page = 1
+    while page <= 30:
+        payload = _cf_request(
+            service,
+            "GET",
+            f"/zones/{zid}/dns_records",
+            params={"type": "CNAME", "page": str(page), "per_page": "200"},
+            timeout=30,
+        )
+        result = payload.get("result") if isinstance(payload, dict) else []
+        if not isinstance(result, list) or not result:
+            break
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            rid = str(item.get("id") or "").strip()
+            name = _cf_clean_domain(item.get("name") or "")
+            content = _cf_clean_domain(item.get("content") or "")
+            if not rid or not name:
+                continue
+            rows.append(
+                {
+                    "key": rid,
+                    "id": rid,
+                    "type": "CNAME",
+                    "name": name,
+                    "label": _cf_relative_label(name, zone_name),
+                    "zone_id": zid,
+                    "zone_name": zone_name,
+                    "target": content,
+                    "ttl": int(item.get("ttl") or 1),
+                    "proxied": bool(item.get("proxied", False)),
+                }
+            )
+        info = payload.get("result_info") if isinstance(payload, dict) else {}
+        total_pages = int((info or {}).get("total_pages") or page)
+        if page >= total_pages:
+            break
+        page += 1
+
+    rows.sort(key=lambda x: (str(x.get("label") or ""), str(x.get("id") or "")))
+    return {
+        "zone_id": zid,
+        "zone_name": zone_name,
+        "records": rows,
+        "total": len(rows),
+    }
+
+
+def mail_cf_dns_create_batch(service, payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload or {}
+    zid = str(data.get("zone_id") or "").strip()
+    if not zid:
+        raise ValueError("请先选择域名")
+
+    zone = _cf_get_zone(service, zid)
+    zone_name = _cf_clean_domain(zone.get("name") or "")
+    if not zone_name:
+        raise RuntimeError("目标 Zone 无效")
+
+    target_domain = _cf_clean_domain(data.get("target_domain") or "")
+    if not target_domain:
+        target_domain = zone_name
+
+    count = service._to_int(data.get("count"), 1, 1, 200)
+    mode = str(data.get("mode") or "random").strip().lower()
+    if mode not in {"random", "manual"}:
+        mode = "random"
+    random_len = service._to_int(data.get("random_length"), 8, 3, 32)
+    random_prefix = _cf_clean_label(data.get("random_prefix") or "")
+    manual_name = _cf_clean_label(data.get("manual_name") or "")
+    proxied = service._to_bool(data.get("proxied"), False)
+    ttl = service._to_int(data.get("ttl"), 1, 1, 86400)
+
+    existing_rows = mail_cf_dns_list(service, zid).get("records") or []
+    existing = {str((x or {}).get("label") or "").strip().lower() for x in existing_rows if isinstance(x, dict)}
+    generated: list[str] = []
+
+    if mode == "manual":
+        if not manual_name:
+            raise ValueError("手动模式下请先填写二级域名前缀")
+        idx = 1
+        max_rounds = max(300, count * 20)
+        while len(generated) < count and idx <= max_rounds:
+            label = _cf_suffix_label(manual_name, 1 if idx == 1 else (idx - 1))
+            idx += 1
+            if not label:
+                continue
+            low = label.lower()
+            if low in existing or low in generated:
+                continue
+            generated.append(low)
+    else:
+        max_rounds = max(300, count * 40)
+        attempts = 0
+        while len(generated) < count and attempts < max_rounds:
+            attempts += 1
+            label = _cf_random_label(random_prefix, random_len)
+            low = str(label or "").strip().lower()
+            if not low or low in existing or low in generated:
+                continue
+            generated.append(low)
+
+    if len(generated) < count:
+        raise RuntimeError("可用二级域名不足，请调整前缀或长度后重试")
+
+    ok = 0
+    fail = 0
+    errors: list[dict[str, str]] = []
+    created: list[dict[str, Any]] = []
+    for lb in generated:
+        fqdn = _cf_render_fqdn(lb, zone_name)
+        if not fqdn:
+            fail += 1
+            errors.append({"name": lb, "error": "域名生成失败"})
+            continue
+        try:
+            res = _cf_request(
+                service,
+                "POST",
+                f"/zones/{zid}/dns_records",
+                json_body={
+                    "type": "CNAME",
+                    "name": fqdn,
+                    "content": target_domain,
+                    "ttl": ttl,
+                    "proxied": proxied,
+                },
+                timeout=30,
+            )
+            item = res.get("result") if isinstance(res, dict) else {}
+            ok += 1
+            created.append(
+                {
+                    "id": str((item or {}).get("id") or "").strip(),
+                    "name": _cf_clean_domain((item or {}).get("name") or fqdn),
+                    "label": lb,
+                    "target": _cf_clean_domain((item or {}).get("content") or target_domain),
+                    "ttl": int((item or {}).get("ttl") or ttl),
+                    "proxied": bool((item or {}).get("proxied", proxied)),
+                    "zone_name": zone_name,
+                    "zone_id": zid,
+                }
+            )
+        except Exception as e:
+            fail += 1
+            errors.append({"name": fqdn, "error": str(e)})
+
+    service.log(f"[MailFree][Cloudflare] DNS 批量新增: zone={zone_name} 成功 {ok} 失败 {fail}")
+    return {
+        "zone_id": zid,
+        "zone_name": zone_name,
+        "target_domain": target_domain,
+        "ok": ok,
+        "fail": fail,
+        "total": len(generated),
+        "records": created,
+        "errors": errors,
+    }
+
+
+def mail_cf_dns_update(service, payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload or {}
+    zid = str(data.get("zone_id") or "").strip()
+    rid = str(data.get("record_id") or "").strip()
+    if not zid or not rid:
+        raise ValueError("zone_id 与 record_id 不能为空")
+
+    zone = _cf_get_zone(service, zid)
+    zone_name = _cf_clean_domain(zone.get("name") or "")
+    if not zone_name:
+        raise RuntimeError("Zone 无效")
+
+    label = _cf_clean_label(data.get("label") or "")
+    if not label:
+        raise ValueError("请填写二级域名前缀")
+    fqdn = _cf_render_fqdn(label, zone_name)
+    if not fqdn:
+        raise RuntimeError("域名生成失败")
+
+    target_domain = _cf_clean_domain(data.get("target_domain") or "")
+    if not target_domain:
+        target_domain = zone_name
+
+    proxied = service._to_bool(data.get("proxied"), False)
+    ttl = service._to_int(data.get("ttl"), 1, 1, 86400)
+
+    res = _cf_request(
+        service,
+        "PATCH",
+        f"/zones/{zid}/dns_records/{rid}",
+        json_body={
+            "type": "CNAME",
+            "name": fqdn,
+            "content": target_domain,
+            "ttl": ttl,
+            "proxied": proxied,
+        },
+        timeout=30,
+    )
+    item = res.get("result") if isinstance(res, dict) else {}
+    service.log(f"[MailFree][Cloudflare] DNS 已更新: {fqdn} -> {target_domain}")
+    return {
+        "record": {
+            "id": str((item or {}).get("id") or rid).strip(),
+            "name": _cf_clean_domain((item or {}).get("name") or fqdn),
+            "label": label,
+            "target": _cf_clean_domain((item or {}).get("content") or target_domain),
+            "ttl": int((item or {}).get("ttl") or ttl),
+            "proxied": bool((item or {}).get("proxied", proxied)),
+            "zone_name": zone_name,
+            "zone_id": zid,
+        }
+    }
+
+
+def mail_cf_dns_delete_batch(service, zone_id: str, record_ids: list[Any]) -> dict[str, Any]:
+    zid = str(zone_id or "").strip()
+    if not zid:
+        raise ValueError("请先选择域名")
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in record_ids or []:
+        rid = str(raw or "").strip()
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        ordered.append(rid)
+    if not ordered:
+        raise ValueError("请先勾选要删除的 DNS 记录")
+
+    ok = 0
+    fail = 0
+    errors: list[dict[str, str]] = []
+    for rid in ordered:
+        try:
+            _cf_request(service, "DELETE", f"/zones/{zid}/dns_records/{rid}", timeout=20)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            errors.append({"id": rid, "error": str(e)})
+
+    service.log(f"[MailFree][Cloudflare] DNS 批量删除: zone={zid} 成功 {ok} 失败 {fail}")
+    return {
+        "zone_id": zid,
+        "ok": ok,
+        "fail": fail,
+        "total": len(ordered),
+        "errors": errors,
+    }
+
+
+def mail_cf_worker_set_mail_domain(service, payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload or {}
+    mail_domain = _cf_clean_domain(data.get("mail_domain") or "")
+    if not mail_domain:
+        raise ValueError("mail_domain 不能为空")
+
+    with service._lock:
+        provider = normalize_mail_provider(service.cfg.get("mail_service_provider") or "mailfree")
+    if provider != "mailfree":
+        raise ValueError("请先将邮箱服务切换为 MailFree，再执行域名同步")
+
+    client = get_mail_client(service)
+    if not hasattr(client, "add_domain"):
+        raise RuntimeError("当前 MailFree 客户端不支持域名同步，请更新程序")
+
+    proxy = mail_proxy(service)
+    try:
+        res = client.add_domain(mail_domain, proxies=proxy)
+    except MailServiceError as e:
+        msg = str(e)
+        low = msg.lower()
+        if "403" in msg or "forbidden" in low:
+            raise RuntimeError(
+                "同步到 MailFree 失败：当前账号无权管理域名，请使用严格管理员账号登录 MailFree。"
+            ) from e
+        raise RuntimeError(f"同步到 MailFree 失败：{msg}") from e
+
+    existed = bool((res or {}).get("existed"))
+    service.log(
+        f"[MailFree][Cloudflare] 已同步域名到 MailFree: {mail_domain}"
+        + ("（已存在）" if existed else "")
+    )
+    return {
+        "ok": True,
+        "mail_domain": mail_domain,
+        "synced": True,
+        "existed": existed,
+    }
 
 
 def record_mail_domain_error(service, domain: str) -> int:
@@ -691,6 +1273,12 @@ def mail_delete_mailboxes(service, addresses: list[Any]) -> dict[str, Any]:
 
 __all__ = [
     "get_mail_client",
+    "mail_cf_dns_create_batch",
+    "mail_cf_dns_delete_batch",
+    "mail_cf_dns_list",
+    "mail_cf_dns_update",
+    "mail_cf_worker_set_mail_domain",
+    "mail_cf_zones",
     "mail_graph_account_files",
     "mail_import_graph_account_file",
     "mail_delete_graph_account_file",

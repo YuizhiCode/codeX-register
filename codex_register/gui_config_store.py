@@ -24,6 +24,7 @@ DEFAULT_CONFIG = {
     "flclash_group": "PROXY",
     "flclash_switch_policy": "round_robin",
     "flclash_switch_wait_sec": 1.2,
+    "flclash_rotate_every": 3,
     "flclash_delay_test_url": "https://www.gstatic.com/generate_204",
     "flclash_delay_timeout_ms": 4000,
     "flclash_delay_max_ms": 1800,
@@ -37,6 +38,11 @@ DEFAULT_CONFIG = {
     "mail_domains": "",
     "freemail_username": "",
     "freemail_password": "",
+    "cf_api_token": "",
+    "cf_account_id": "",
+    "cf_worker_script": "mailfree",
+    "cf_worker_mail_domain_binding": "MAIL_DOMAIN",
+    "cf_dns_target_domain": "",
     "cf_temp_admin_auth": "",
     "cloudmail_api_url": "",
     "cloudmail_admin_email": "",
@@ -131,6 +137,11 @@ def load_config() -> dict[str, Any]:
         cfg["mail_domains"] = env.get("MAIL_DOMAINS", "")
         cfg["freemail_username"] = env.get("FREEMAIL_USERNAME", "")
         cfg["freemail_password"] = env.get("FREEMAIL_PASSWORD", "")
+        cfg["cf_api_token"] = env.get("CF_API_TOKEN", env.get("CLOUDFLARE_API_TOKEN", ""))
+        cfg["cf_account_id"] = env.get("CF_ACCOUNT_ID", env.get("CLOUDFLARE_ACCOUNT_ID", ""))
+        cfg["cf_worker_script"] = env.get("CF_WORKER_SCRIPT", env.get("WORKER_SCRIPT_NAME", "mailfree"))
+        cfg["cf_worker_mail_domain_binding"] = env.get("CF_WORKER_MAIL_DOMAIN_BINDING", "MAIL_DOMAIN")
+        cfg["cf_dns_target_domain"] = env.get("CF_DNS_TARGET_DOMAIN", "")
         cfg["cf_temp_admin_auth"] = env.get("CF_TEMP_ADMIN_AUTH", env.get("ADMIN_AUTH", ""))
         cfg["cloudmail_api_url"] = env.get("CLOUDMAIL_API_URL", env.get("CM_API_URL", ""))
         cfg["cloudmail_admin_email"] = env.get("CLOUDMAIL_ADMIN_EMAIL", env.get("CM_ADMIN_EMAIL", ""))
@@ -141,6 +152,10 @@ def load_config() -> dict[str, Any]:
         cfg["remote_account_provider"] = env.get("REMOTE_ACCOUNT_PROVIDER", cfg.get("remote_account_provider", "sub2api"))
         cfg["cliproxy_api_base"] = env.get("CLIPROXY_API_BASE", env.get("CLIPROXY_MANAGEMENT_API", ""))
         cfg["cliproxy_management_key"] = env.get("CLIPROXY_MANAGEMENT_KEY", env.get("MANAGEMENT_KEY", ""))
+        try:
+            cfg["flclash_rotate_every"] = int(env.get("FLCLASH_ROTATE_EVERY", "3") or 3)
+        except Exception:
+            cfg["flclash_rotate_every"] = 3
         cfg["gmail_imap_user"] = env.get("GMAIL_IMAP_USER", env.get("IMAP_USER", ""))
         cfg["gmail_imap_pass"] = env.get("GMAIL_IMAP_PASS", env.get("IMAP_PASS", ""))
         cfg["gmail_alias_emails"] = env.get("GMAIL_ALIAS_EMAILS", env.get("EMAIL_LIST", ""))

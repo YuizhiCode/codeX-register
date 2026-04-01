@@ -333,6 +333,57 @@ class MailFreeService(MailServiceBase):
         return list(self._domains_cache)
 
     @staticmethod
+    def _normalize_domain_input(raw: Any) -> str:
+        text = str(raw or "").strip().lower()
+        if not text:
+            return ""
+        text = re.sub(r"^[a-z]+://", "", text)
+        text = re.sub(r"^@+", "", text)
+        text = re.sub(r"/+.*$", "", text)
+        text = re.sub(r"\.+$", "", text)
+        return text
+
+    @staticmethod
+    def _is_valid_domain_input(domain: str) -> bool:
+        d = str(domain or "").strip().lower()
+        if not d:
+            return False
+        if len(d) > 253:
+            return False
+        return bool(
+            re.match(
+                r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$",
+                d,
+            )
+        )
+
+    def add_domain(self, domain: str, *, proxies: Any = None) -> dict[str, Any]:
+        dm = self._normalize_domain_input(domain)
+        if not self._is_valid_domain_input(dm):
+            raise MailServiceError("域名格式不正确")
+
+        resp = self._request(
+            "POST",
+            "/api/domains",
+            json_body={"domain": dm},
+            need_auth=True,
+            timeout=20,
+            proxies=proxies,
+        )
+        status = int(resp.status_code or 0)
+        body = _safe_text(resp.text)
+        if 200 <= status < 300:
+            self._domains_cache = None
+            return {"ok": True, "domain": dm, "existed": False}
+
+        low = body.lower()
+        if status == 400 and ("已存在" in body or "already" in low):
+            self._domains_cache = None
+            return {"ok": True, "domain": dm, "existed": True}
+
+        raise MailServiceError(f"新增 MailFree 域名失败 HTTP {status}: {body}")
+
+    @staticmethod
     def _normalize_local_prefix(raw: Any) -> str:
         prefix = str(raw or "").strip()
         if not prefix:

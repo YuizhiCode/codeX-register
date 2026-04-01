@@ -54,6 +54,31 @@ def _err(msg: str) -> None:
     _out(f"[Error] {msg}")
 
 
+_LOG_ONCE_LOCK = threading.Lock()
+_LOG_ONCE_KEYS: set[str] = set()
+
+
+def _log_once_mark(key: str) -> bool:
+    k = str(key or "").strip()
+    if not k:
+        return True
+    with _LOG_ONCE_LOCK:
+        if k in _LOG_ONCE_KEYS:
+            return False
+        _LOG_ONCE_KEYS.add(k)
+        return True
+
+
+def _info_once(key: str, msg: str) -> None:
+    if _log_once_mark(key):
+        _info(msg)
+
+
+def _warn_once(key: str, msg: str) -> None:
+    if _log_once_mark(key):
+        _warn(msg)
+
+
 def _load_dotenv(path: str = ".env") -> None:
     """从 .env 加载键值到 os.environ（不覆盖已有环境变量）。"""
     if not os.path.exists(path):
@@ -1692,8 +1717,12 @@ def get_email_and_token(proxies: Any = None) -> tuple:
 
         if domain_capable:
             allow_domains = [str(x).strip() for x in (MAIL_ALLOWED_DOMAINS or []) if str(x).strip()]
+            allow_sig = ",".join(sorted({str(x).strip().lower() for x in allow_domains if str(x).strip()}))
             if allow_domains:
-                _info(f"已指定注册域名 {len(allow_domains)} 个")
+                _info_once(
+                    f"mail_allow_domains:{provider}:{allow_sig}",
+                    f"已指定注册域名 {len(allow_domains)} 个",
+                )
             random_domain = os.getenv("MAILFREE_RANDOM_DOMAIN", "1").strip().lower() not in {
                 "0",
                 "false",
@@ -1717,7 +1746,10 @@ def get_email_and_token(proxies: Any = None) -> tuple:
                 else 0
             )
             if mailbox_prefix or mailbox_random_len > 0:
-                _info(
+                _info_once(
+                    (
+                        f"mail_local_rule:{provider}:{mailbox_prefix or '-'}:{mailbox_random_len}"
+                    ),
                     "邮箱本地名规则: "
                     f"prefix={mailbox_prefix or '-'}"
                     f", random_len={mailbox_random_len}"
@@ -1747,29 +1779,60 @@ def get_email_and_token(proxies: Any = None) -> tuple:
                     if missing:
                         show = ", ".join(missing[:4])
                         suffix = "..." if len(missing) > 4 else ""
-                        _warn(f"指定域名不可用 {len(missing)} 个: {show}{suffix}")
+                        _warn_once(
+                            f"mailfree_missing_domains:{','.join(sorted([m.lower() for m in missing]))}",
+                            f"指定域名不可用 {len(missing)} 个: {show}{suffix}",
+                        )
                 else:
                     effective_domains = [str(d).strip() for d in domains if str(d).strip()]
 
             if effective_domains:
                 if random_domain:
                     if allow_domains:
-                        _info(f"mailfree 将在已选域名 {len(effective_domains)} 个中随机切换")
+                        _info_once(
+                            (
+                                "mailfree_strategy:"
+                                f"allow_random:{len(effective_domains)}:{','.join(sorted([str(d).lower() for d in effective_domains]))}"
+                            ),
+                            f"mailfree 将在已选域名 {len(effective_domains)} 个中随机切换",
+                        )
                     else:
-                        _info(f"mailfree 可用域名 {len(effective_domains)} 个，注册时随机切换")
+                        _info_once(
+                            (
+                                "mailfree_strategy:"
+                                f"all_random:{len(effective_domains)}:{','.join(sorted([str(d).lower() for d in effective_domains]))}"
+                            ),
+                            f"mailfree 可用域名 {len(effective_domains)} 个，注册时随机切换",
+                        )
                 else:
                     fixed_domain = str(effective_domains[0]).strip()
                     if allow_domains:
-                        _info(
+                        _info_once(
+                            (
+                                "mailfree_strategy:"
+                                f"allow_fixed:{fixed_domain.lower()}:{len(effective_domains)}"
+                            ),
                             f"mailfree 已选域名 {len(effective_domains)} 个，"
                             f"当前固定使用 {fixed_domain}"
                         )
                     else:
-                        _info(f"mailfree 可用域名 {len(effective_domains)} 个，当前固定使用 {fixed_domain}")
+                        _info_once(
+                            (
+                                "mailfree_strategy:"
+                                f"all_fixed:{fixed_domain.lower()}:{len(effective_domains)}"
+                            ),
+                            f"mailfree 可用域名 {len(effective_domains)} 个，当前固定使用 {fixed_domain}",
+                        )
             elif domains:
-                _warn("指定域名均不可用，将由服务端默认域名策略兜底")
+                _warn_once(
+                    f"mailfree_strategy:fallback_allow_empty:{len(domains)}",
+                    "指定域名均不可用，将由服务端默认域名策略兜底",
+                )
             else:
-                _warn("mailfree 未返回可用域名列表，将由服务端默认域名策略兜底")
+                _warn_once(
+                    "mailfree_strategy:fallback_no_domains",
+                    "mailfree 未返回可用域名列表，将由服务端默认域名策略兜底",
+                )
         elif provider == "cloudflare_temp_email":
             cfg_domains = [
                 x

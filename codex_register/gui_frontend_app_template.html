@@ -380,9 +380,9 @@
                         <n-button class="toolbar-btn" :loading="loading.mail_overview || loading.save" @click="refreshMailOverview(true)">保存并刷新</n-button>
                       </div>
                       <div v-if="mailProviderTab === 'cloudflare_temp_email'" class="toolbar" style="margin-top: 10px">
-                        <n-input class="toolbar-path" v-model:value="settingsForm.worker_domain" placeholder="Cloudflare Temp Email 服务地址" />
+                        <n-input class="toolbar-path" v-model:value="settingsForm.cf_temp_base_url" placeholder="Cloudflare Temp Email 服务地址（独立于 MailFree）" />
                         <n-input class="toolbar-path" v-model:value="settingsForm.cf_temp_admin_auth" type="password" show-password-on="click" placeholder="管理员口令（cf_temp_admin_auth）" />
-                        <n-input class="toolbar-path" v-model:value="settingsForm.mail_domains" placeholder="域名池（逗号/空格分隔）" />
+                        <n-input class="toolbar-path" v-model:value="settingsForm.cf_temp_mail_domains" placeholder="域名池（独立于 MailFree，逗号/空格分隔）" />
                         <n-switch v-model:value="settingsForm.mailfree_random_domain" />
                         <span class="meta">随机域名</span>
                         <n-switch v-model:value="settingsForm.mailbox_custom_enabled" />
@@ -625,8 +625,9 @@
                         Gmail 必须开启 IMAP 并使用应用专用密码；支持按别名池自动生成 <code>user+tag@gmail.com</code>。
                       </div>
                       <div v-if="mailProviderTab === 'gmail'" class="meta" style="margin-top: 4px">{{ gmailAliasPreviewText }}</div>
+                      <div v-if="mailProviderTab === 'gmail' && gmailAliasMasterWarningText" class="meta" style="margin-top: 4px; color:#f5a97f">{{ gmailAliasMasterWarningText }}</div>
                       <div v-if="mailProviderTab === 'cloudflare_temp_email'" class="meta" style="margin-top: 6px">
-                        Cloudflare Temp Email 使用 <code>/admin/new_address</code> 与 <code>/admin/mails</code>，需填写管理员口令与域名池。
+                        Cloudflare Temp Email 使用 <code>/admin/new_address</code> 与 <code>/admin/mails</code>，配置与 MailFree 已独立保存。
                       </div>
                       <div v-if="mailProviderTab === 'cloudmail'" class="meta" style="margin-top: 6px">
                         CloudMail 使用管理员 token 创建邮箱并拉取邮件，域名池来自 <code>mail_domains</code>。

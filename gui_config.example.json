@@ -31,6 +31,8 @@
   "mail_domains": "",
   "freemail_username": "",
   "freemail_password": "",
+  "cf_temp_base_url": "",
+  "cf_temp_mail_domains": "",
   "cf_api_token": "",
   "cf_account_id": "",
   "cf_worker_script": "mailfree",

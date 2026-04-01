@@ -38,6 +38,8 @@ DEFAULT_CONFIG = {
     "mail_domains": "",
     "freemail_username": "",
     "freemail_password": "",
+    "cf_temp_base_url": "",
+    "cf_temp_mail_domains": "",
     "cf_api_token": "",
     "cf_account_id": "",
     "cf_worker_script": "mailfree",
@@ -137,6 +139,14 @@ def load_config() -> dict[str, Any]:
         cfg["mail_domains"] = env.get("MAIL_DOMAINS", "")
         cfg["freemail_username"] = env.get("FREEMAIL_USERNAME", "")
         cfg["freemail_password"] = env.get("FREEMAIL_PASSWORD", "")
+        cfg["cf_temp_base_url"] = env.get(
+            "CF_TEMP_BASE_URL",
+            env.get("CF_TEMP_WORKER_DOMAIN", env.get("WORKER_DOMAIN", "")),
+        )
+        cfg["cf_temp_mail_domains"] = env.get(
+            "CF_TEMP_MAIL_DOMAINS",
+            env.get("MAIL_DOMAINS", ""),
+        )
         cfg["cf_api_token"] = env.get("CF_API_TOKEN", env.get("CLOUDFLARE_API_TOKEN", ""))
         cfg["cf_account_id"] = env.get("CF_ACCOUNT_ID", env.get("CLOUDFLARE_ACCOUNT_ID", ""))
         cfg["cf_worker_script"] = env.get("CF_WORKER_SCRIPT", env.get("WORKER_SCRIPT_NAME", "mailfree"))

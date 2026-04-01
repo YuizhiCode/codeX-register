@@ -1571,6 +1571,35 @@ def _email_domain(email: str) -> str:
         return ""
 
 
+def _gmail_canonical_identity(email: str) -> str:
+    target = str(email or "").strip().lower()
+    if not target or "@" not in target:
+        return ""
+    local, domain = target.split("@", 1)
+    local = str(local or "").strip().lower()
+    domain = str(domain or "").strip().lower()
+    if not local or not domain:
+        return ""
+    if domain in {"gmail.com", "googlemail.com"}:
+        local = local.split("+", 1)[0].replace(".", "")
+        domain = "gmail.com"
+    return f"{local}@{domain}" if local and domain else ""
+
+
+def _gmail_unique_master_count(values: list[str]) -> int:
+    seen: set[str] = set()
+    for raw in values or []:
+        item = str(raw or "").strip().lower()
+        if not item:
+            continue
+        if "----" in item:
+            item = str(item.split("----", 1)[0] or "").strip().lower()
+        cid = _gmail_canonical_identity(item)
+        if cid:
+            seen.add(cid)
+    return len(seen)
+
+
 def _mail_service_signature() -> tuple[Any, ...]:
     provider = normalize_mail_provider(MAIL_SERVICE_PROVIDER)
     mail_domains = str(os.getenv("MAIL_DOMAINS", "") or "").strip()
@@ -1861,6 +1890,20 @@ def get_email_and_token(proxies: Any = None) -> tuple:
             _info("Mail-Curl 模式：按邮箱 ID 轮询收件")
         else:
             _info("Gmail 模式：通过 IMAP 别名池接码，忽略 MailFree 域名规则")
+            gmail_user = str(os.getenv("GMAIL_IMAP_USER", "") or "").strip().lower()
+            alias_raw = str(os.getenv("GMAIL_ALIAS_EMAILS", "") or "").strip()
+            alias_pool = (
+                [str(x or "").strip().lower() for x in re.split(r"[\n\r,;\s]+", alias_raw) if str(x or "").strip()]
+                if alias_raw
+                else ([gmail_user] if gmail_user else [])
+            )
+            alias_unique_count = _gmail_unique_master_count(alias_pool)
+            if alias_pool and alias_unique_count <= 1:
+                _warn_once(
+                    f"gmail_alias_single_master:{alias_unique_count}",
+                    "Gmail 别名池仅识别到 1 个唯一主号（点号/+tag/googlemail 视为同源），"
+                    "若该邮箱已注册过可能持续触发 user_already_exists",
+                )
 
         pick_rounds = 5
         if provider == "graph":

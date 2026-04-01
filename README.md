@@ -187,6 +187,8 @@ Cloudflare Token 要求（用于域名配置页读取 Zone 和管理 CNAME）：
 | `worker_domain` | string | `""` | MailFree 服务地址 |
 | `freemail_username` | string | `""` | MailFree 用户名 |
 | `freemail_password` | string | `""` | MailFree 密码 |
+| `cf_temp_base_url` | string | `""` | Cloudflare Temp Email 服务地址（与 MailFree 独立） |
+| `cf_temp_mail_domains` | string | `""` | Cloudflare Temp Email 域名池（与 MailFree 独立） |
 | `cf_api_token` | string | `""` | Cloudflare API Token（权限建议：Zone Read + DNS Read/Edit） |
 | `cf_account_id` | string | `""` | 兼容字段 |
 | `cf_worker_script` | string | `mailfree` | 兼容字段 |

@@ -29,10 +29,19 @@ def mail_proxy(service) -> dict[str, str] | None:
 
 def mail_client_signature(service) -> tuple[Any, ...]:
     provider = normalize_mail_provider(service.cfg.get("mail_service_provider") or "mailfree")
-    domain = str(service.cfg.get("worker_domain") or "").strip()
+    worker_domain = str(service.cfg.get("worker_domain") or "").strip()
+    cf_temp_base_url = str(service.cfg.get("cf_temp_base_url") or "").strip()
+    cf_temp_mail_domains = str(service.cfg.get("cf_temp_mail_domains") or "").strip()
+    if provider == "cloudflare_temp_email" and cf_temp_base_url:
+        domain = cf_temp_base_url
+    else:
+        domain = worker_domain
     if domain and not domain.startswith("http"):
         domain = f"https://{domain}"
-    mail_domains = str(service.cfg.get("mail_domains") or "").strip()
+    if provider == "cloudflare_temp_email" and cf_temp_mail_domains:
+        mail_domains = cf_temp_mail_domains
+    else:
+        mail_domains = str(service.cfg.get("mail_domains") or "").strip()
     graph_accounts_file = str(service.cfg.get("graph_accounts_file") or "").strip()
     graph_tenant = str(service.cfg.get("graph_tenant") or "common").strip()
     graph_fetch_mode = str(service.cfg.get("graph_fetch_mode") or "graph_api").strip()

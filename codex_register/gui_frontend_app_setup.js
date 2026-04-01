@@ -100,6 +100,8 @@
           mail_domains: "",
           freemail_username: "",
           freemail_password: "",
+          cf_temp_base_url: "",
+          cf_temp_mail_domains: "",
           cf_api_token: "",
           cf_account_id: "",
           cf_worker_script: "mailfree",
@@ -657,7 +659,10 @@
           const localPart = `${safePrefix}${previewRandomSuffix(randomLen)}` || "example";
 
           const allow = normalizeDomainList(settingsForm.mail_domain_allowlist || []);
-          const cfgDomains = String(settingsForm.mail_domains || "")
+          const cfgDomainsRaw = mailProviderTab.value === "cloudflare_temp_email"
+            ? settingsForm.cf_temp_mail_domains
+            : settingsForm.mail_domains;
+          const cfgDomains = String(cfgDomainsRaw || "")
             .split(/[\n\r,;\s]+/)
             .map((x) => String(x || "").trim().toLowerCase())
             .filter((x) => !!x);
@@ -704,6 +709,43 @@
             ? "gmail.com / googlemail.com"
             : domain;
           return `示例：${local}+${sampleTag}@${aliasDomain} · IMAP ${server}:${port}`;
+        });
+
+        const gmailAliasMasterWarningText = Vue.computed(() => {
+          const user = String(settingsForm.gmail_imap_user || "").trim().toLowerCase();
+          const aliasRaw = String(settingsForm.gmail_alias_emails || "").trim();
+          const aliases = aliasRaw
+            ? aliasRaw
+              .split(/[\n\r,;\s]+/)
+              .map((x) => String(x || "").trim().toLowerCase())
+              .filter((x) => !!x)
+            : [];
+          const pool = aliases.length ? aliases : (user ? [user] : []);
+          if (!pool.length) return "";
+
+          const canonicalSet = new Set();
+          let validCount = 0;
+          for (const raw of pool) {
+            const item = String(raw || "").split("----", 1)[0].trim().toLowerCase();
+            if (!item || !item.includes("@")) continue;
+            const parts = item.split("@");
+            const local = String(parts[0] || "").trim().toLowerCase();
+            const domain = String(parts[1] || "").trim().toLowerCase();
+            if (!local || !domain) continue;
+            validCount += 1;
+            if (domain === "gmail.com" || domain === "googlemail.com") {
+              const masterLocal = local.split("+", 1)[0].replace(/\./g, "");
+              canonicalSet.add(`${masterLocal}@gmail.com`);
+            } else {
+              canonicalSet.add(`${local}@${domain}`);
+            }
+          }
+
+          if (!validCount || canonicalSet.size > 1) return "";
+          if (validCount <= 1) {
+            return "当前仅配置 1 个 Gmail 主号；若该邮箱已注册过，会直接触发 user_already_exists。";
+          }
+          return "当前别名池看似多个，但本质是同一 Gmail 主号（点号/+tag/googlemail 视为同源），可能持续触发 user_already_exists。";
         });
 
         const selectedMailLabel = Vue.computed(() => {
@@ -1447,6 +1489,8 @@
           settingsForm.mail_domains = String(cfg.mail_domains || "");
           settingsForm.freemail_username = String(cfg.freemail_username || "");
           settingsForm.freemail_password = String(cfg.freemail_password || "");
+          settingsForm.cf_temp_base_url = String(cfg.cf_temp_base_url || cfg.worker_domain || "");
+          settingsForm.cf_temp_mail_domains = String(cfg.cf_temp_mail_domains || cfg.mail_domains || "");
           settingsForm.cf_api_token = String(cfg.cf_api_token || "");
           settingsForm.cf_account_id = String(cfg.cf_account_id || "");
           settingsForm.cf_worker_script = String(cfg.cf_worker_script || "mailfree");
@@ -1531,6 +1575,8 @@
             mail_domains: String(settingsForm.mail_domains || "").trim(),
             freemail_username: String(settingsForm.freemail_username || "").trim(),
             freemail_password: String(settingsForm.freemail_password || "").trim(),
+            cf_temp_base_url: String(settingsForm.cf_temp_base_url || "").trim(),
+            cf_temp_mail_domains: String(settingsForm.cf_temp_mail_domains || "").trim(),
             cf_api_token: String(settingsForm.cf_api_token || "").trim(),
             cf_account_id: String(settingsForm.cf_account_id || "").trim(),
             cf_worker_script: String(settingsForm.cf_worker_script || "mailfree").trim(),
@@ -3869,6 +3915,7 @@
           mailInfoText,
           mailboxPatternPreviewText,
           gmailAliasPreviewText,
+          gmailAliasMasterWarningText,
           mailDetailText,
           logText,
           logScrollContainerRef,

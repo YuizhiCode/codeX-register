@@ -488,6 +488,35 @@ class RegisterService:
         return email.split("@", 1)[1].strip().lower()
 
     @staticmethod
+    def _gmail_canonical_identity(value: str) -> str:
+        email = str(value or "").strip().lower()
+        if not email or "@" not in email:
+            return ""
+        local, domain = email.split("@", 1)
+        local = str(local or "").strip().lower()
+        domain = str(domain or "").strip().lower()
+        if not local or not domain:
+            return ""
+        if domain in {"gmail.com", "googlemail.com"}:
+            local = local.split("+", 1)[0].replace(".", "")
+            domain = "gmail.com"
+        return f"{local}@{domain}" if local and domain else ""
+
+    @classmethod
+    def _gmail_unique_master_count(cls, values: list[str]) -> int:
+        seen: set[str] = set()
+        for raw in values or []:
+            email = str(raw or "").strip().lower()
+            if not email:
+                continue
+            if "----" in email:
+                email = str(email.split("----", 1)[0] or "").strip().lower()
+            cid = cls._gmail_canonical_identity(email)
+            if cid:
+                seen.add(cid)
+        return len(seen)
+
+    @staticmethod
     def _normalize_json_file_notes(values: Any) -> dict[str, str]:
         if not isinstance(values, dict):
             return {}
@@ -990,10 +1019,17 @@ class RegisterService:
 
         provider = normalize_mail_provider(cfg.get("mail_service_provider") or "mailfree")
         worker_domain = str(cfg.get("worker_domain") or "").strip()
+        cf_temp_base_url = str(cfg.get("cf_temp_base_url") or "").strip()
         mail_domains_raw = str(cfg.get("mail_domains") or "").strip()
+        cf_temp_mail_domains_raw = str(cfg.get("cf_temp_mail_domains") or "").strip()
         mail_domains = [
             x
             for x in re.split(r"[\n\r,;\s]+", mail_domains_raw)
+            if str(x or "").strip()
+        ]
+        cf_temp_mail_domains = [
+            x
+            for x in re.split(r"[\n\r,;\s]+", cf_temp_mail_domains_raw)
             if str(x or "").strip()
         ]
         mail_allow_domains = self._normalize_domain_list(cfg.get("mail_domain_allowlist") or [])
@@ -1015,12 +1051,14 @@ class RegisterService:
             if str(x or "").strip()
         ]
         if provider == "cloudflare_temp_email":
-            if not worker_domain:
-                blockers.append("Cloudflare Temp Email 服务地址未填写（worker_domain）")
+            cf_temp_domain = str(cf_temp_base_url or worker_domain).strip()
+            effective_cf_domains = cf_temp_mail_domains if cf_temp_mail_domains else mail_domains
+            if not cf_temp_domain:
+                blockers.append("Cloudflare Temp Email 服务地址未填写（cf_temp_base_url）")
             if not cf_temp_admin_auth:
                 blockers.append("Cloudflare Temp Email 管理员口令未填写（cf_temp_admin_auth）")
-            if not mail_domains and not mail_allow_domains:
-                blockers.append("Cloudflare Temp Email 域名池为空（mail_domains）")
+            if not effective_cf_domains and not mail_allow_domains:
+                blockers.append("Cloudflare Temp Email 域名池为空（cf_temp_mail_domains）")
         elif provider == "mailfree":
             if not worker_domain:
                 blockers.append("邮箱服务地址未填写（worker_domain）")
@@ -1049,6 +1087,13 @@ class RegisterService:
                 blockers.append("Gmail IMAP 应用专用密码未填写（gmail_imap_pass）")
             if not gmail_aliases:
                 warnings.append("Gmail 别名池为空，将默认使用 IMAP 账号自身生成别名")
+            else:
+                unique_master_count = self._gmail_unique_master_count(gmail_aliases)
+                if unique_master_count <= 1:
+                    warnings.append(
+                        "Gmail 别名池当前仅识别到 1 个唯一主号（点号/+tag/googlemail 视为同源），"
+                        "可能持续触发 user_already_exists"
+                    )
         elif provider == "graph":
             if not graph_file:
                 blockers.append("Graph 账号文件未选择（graph_accounts_file）")
@@ -1394,6 +1439,8 @@ class RegisterService:
             "flclash_delay_test_url",
             "worker_domain",
             "mail_domains",
+            "cf_temp_base_url",
+            "cf_temp_mail_domains",
             "freemail_username",
             "freemail_password",
             "cf_api_token",
@@ -1541,6 +1588,17 @@ class RegisterService:
             )
         else:
             cfg["mail_domains"] = ""
+        cf_temp_mail_domains_raw = str(cfg.get("cf_temp_mail_domains") or "").strip()
+        if cf_temp_mail_domains_raw:
+            cfg["cf_temp_mail_domains"] = ",".join(
+                [
+                    str(x or "").strip().lower()
+                    for x in re.split(r"[\n\r,;\s]+", cf_temp_mail_domains_raw)
+                    if str(x or "").strip()
+                ]
+            )
+        else:
+            cfg["cf_temp_mail_domains"] = ""
         cfg["cf_worker_script"] = str(cfg.get("cf_worker_script") or "mailfree").strip() or "mailfree"
         cfg["cf_worker_mail_domain_binding"] = (
             str(cfg.get("cf_worker_mail_domain_binding") or "MAIL_DOMAIN").strip() or "MAIL_DOMAIN"
@@ -1622,11 +1680,25 @@ class RegisterService:
         return self._stop.wait(wait_sec)
 
     def _apply_to_env(self) -> None:
+        provider = normalize_mail_provider(self.cfg.get("mail_service_provider") or "mailfree")
+
         domain = str(self.cfg.get("worker_domain") or "").strip()
+        mail_domains = str(self.cfg.get("mail_domains") or "").strip()
+        cf_temp_base_url = str(self.cfg.get("cf_temp_base_url") or "").strip()
+        cf_temp_mail_domains = str(self.cfg.get("cf_temp_mail_domains") or "").strip()
+
+        if provider == "cloudflare_temp_email":
+            if cf_temp_base_url:
+                domain = cf_temp_base_url
+            if cf_temp_mail_domains:
+                mail_domains = cf_temp_mail_domains
+
         if domain and not domain.startswith("http"):
             domain = f"https://{domain}"
         os.environ["WORKER_DOMAIN"] = domain.rstrip("/")
-        os.environ["MAIL_DOMAINS"] = str(self.cfg.get("mail_domains") or "").strip()
+        os.environ["MAIL_DOMAINS"] = mail_domains
+        os.environ["CF_TEMP_BASE_URL"] = cf_temp_base_url
+        os.environ["CF_TEMP_MAIL_DOMAINS"] = cf_temp_mail_domains
         os.environ["FREEMAIL_USERNAME"] = str(self.cfg.get("freemail_username") or "")
         os.environ["FREEMAIL_PASSWORD"] = str(self.cfg.get("freemail_password") or "")
         os.environ["CF_API_TOKEN"] = str(self.cfg.get("cf_api_token") or "").strip()
@@ -2461,15 +2533,26 @@ class RegisterService:
         try:
             from . import r_with_pwd
 
+            mail_provider = normalize_mail_provider(self.cfg.get("mail_service_provider") or "mailfree")
             domain = str(self.cfg.get("worker_domain") or "").strip()
+            mail_domains_raw = str(self.cfg.get("mail_domains") or "").strip()
+            if mail_provider == "cloudflare_temp_email":
+                cf_domain = str(self.cfg.get("cf_temp_base_url") or "").strip()
+                cf_domains_raw = str(self.cfg.get("cf_temp_mail_domains") or "").strip()
+                if cf_domain:
+                    domain = cf_domain
+                if cf_domains_raw:
+                    mail_domains_raw = cf_domains_raw
             if domain and not domain.startswith("http"):
                 domain = f"https://{domain}"
-            mail_provider = normalize_mail_provider(self.cfg.get("mail_service_provider") or "mailfree")
+
             r_with_pwd.STOP_EVENT = self._stop
             r_with_pwd.WORKER_DOMAIN = domain.rstrip("/")
             r_with_pwd.FREEMAIL_USERNAME = str(self.cfg.get("freemail_username") or "")
             r_with_pwd.FREEMAIL_PASSWORD = str(self.cfg.get("freemail_password") or "")
             r_with_pwd.MAIL_SERVICE_PROVIDER = mail_provider
+            os.environ["WORKER_DOMAIN"] = r_with_pwd.WORKER_DOMAIN
+            os.environ["MAIL_DOMAINS"] = mail_domains_raw
             r_with_pwd.MAIL_ALLOWED_DOMAINS = self._normalize_domain_list(
                 self.cfg.get("mail_domain_allowlist") or []
             )
@@ -2484,7 +2567,6 @@ class RegisterService:
             fp = str(self.cfg.get("freemail_password") or "")
             fp_mask = (fp[:3] + "***") if len(fp) >= 3 else ("***" if fp else "")
             random_domain_on = bool(self.cfg.get("mailfree_random_domain", True))
-            mail_domains_raw = str(self.cfg.get("mail_domains") or "").strip()
             mail_domains_list = [
                 x for x in re.split(r"[\n\r,;\s]+", mail_domains_raw) if str(x or "").strip()
             ]
@@ -2557,12 +2639,18 @@ class RegisterService:
                         if str(x or "").strip()
                     ]
                     alias_count = len(alias_rows) if alias_rows else (1 if gmail_user else 0)
+                    alias_unique_master_count = self._gmail_unique_master_count(alias_rows)
                     self.log(
                         "配置 -> "
                         f"mail={mail_provider}, imap_user={gmail_user}, "
                         f"imap_server={gmail_server}:{gmail_port}, alias_pool={alias_count}, "
                         f"tag_len={gmail_tag_len}, mix_googlemail={'开' if gmail_mix else '关'}"
                     )
+                    if alias_rows and alias_unique_master_count <= 1:
+                        self.log(
+                            "[提示] Gmail 别名池仅识别到 1 个唯一主号（点号/+tag/googlemail 视为同源），"
+                            "可能持续触发 user_already_exists"
+                        )
                 self.log(
                     "配置 -> "
                     f"hero_sms={'开启' if hero_sms_enabled else '关闭'}, "

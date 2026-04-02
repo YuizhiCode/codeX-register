@@ -9,5 +9,9 @@ services:
     environment:
       - HOST=0.0.0.0
       - PORT=8765
+      # 如需代理访问 Google API / Cloudflare API，取消下面的注释并填入代理地址
+      # - HTTP_PROXY=http://host.docker.internal:7890
+      # - HTTPS_PROXY=http://host.docker.internal:7890
+      # - NO_PROXY=localhost,127.0.0.1
     working_dir: /app/data
     restart: unless-stopped

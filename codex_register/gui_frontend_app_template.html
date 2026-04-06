@@ -597,44 +597,72 @@
                         <span class="meta">混用 gmail/googlemail 域名</span>
                       </div>
                       <div v-else-if="mailProviderTab === 'graph'" class="toolbar" style="margin-top: 10px">
+                        <n-select
+                          class="toolbar-select"
+                          v-model:value="settingsForm.graph_accounts_mode"
+                          :options="graphAccountSourceOptions"
+                          placeholder="Graph 账号来源"
+                        />
                         <input
+                          v-if="settingsForm.graph_accounts_mode === 'file'"
                           ref="graphFileInputRef"
                           type="file"
                           accept=".txt,text/plain"
                           style="display: none"
                           @change="onGraphAccountFilePicked"
                         />
-                        <n-select
-                          class="toolbar-select"
-                          v-model:value="settingsForm.graph_accounts_file"
-                          :options="graphAccountFileOptions"
-                          clearable
-                          filterable
-                          placeholder="当前 Graph 账号文件"
-                        />
+                        <template v-if="settingsForm.graph_accounts_mode === 'file'">
+                          <n-select
+                            class="toolbar-select"
+                            v-model:value="settingsForm.graph_accounts_file"
+                            :options="graphAccountFileOptions"
+                            clearable
+                            filterable
+                            placeholder="当前 Graph 账号文件"
+                          />
+                        </template>
+                        <template v-else>
+                          <n-input
+                            class="toolbar-path"
+                            v-model:value="settingsForm.graph_api_base_url"
+                            placeholder="接口地址（如 https://xxx.workers.dev）"
+                          />
+                          <n-input
+                            class="toolbar-path"
+                            v-model:value="settingsForm.graph_api_token"
+                            type="password"
+                            show-password-on="click"
+                            placeholder="接口 token（Bearer）"
+                          />
+                        </template>
                         <n-input
+                          v-if="settingsForm.graph_accounts_mode === 'file'"
                           class="toolbar-path"
                           v-model:value="settingsForm.graph_tenant"
                           placeholder="Tenant（common / organizations / tenant-id）"
                         />
-                        <n-select
-                          class="toolbar-select"
-                          v-model:value="settingsForm.graph_fetch_mode"
-                          :options="graphFetchModeOptions"
-                          placeholder="选择取件模式"
-                        />
-                        <n-switch v-model:value="settingsForm.graph_pre_refresh_before_run" />
-                        <span class="meta">注册前预刷新 token</span>
-                        <n-button class="toolbar-btn" type="primary" :loading="loading.graph_files" @click="pickGraphAccountFile">选择 TXT 文件</n-button>
-                        <n-button
-                          class="toolbar-btn"
-                          type="error"
-                          ghost
-                          :disabled="!settingsForm.graph_accounts_file"
-                          :loading="loading.graph_files"
-                          @click="deleteSelectedGraphAccountFile"
-                        >删除当前文件</n-button>
-                        <n-button class="toolbar-btn" :loading="loading.graph_files" @click="refreshGraphAccountFiles(true)">刷新文件列表</n-button>
+                        <template v-if="settingsForm.graph_accounts_mode === 'file'">
+                          <n-select
+                            class="toolbar-select"
+                            v-model:value="settingsForm.graph_fetch_mode"
+                            :options="graphFetchModeOptions"
+                            placeholder="选择取件模式"
+                          />
+                          <n-switch v-model:value="settingsForm.graph_pre_refresh_before_run" />
+                          <span class="meta">注册前预刷新 token</span>
+                        </template>
+                        <template v-if="settingsForm.graph_accounts_mode === 'file'">
+                          <n-button class="toolbar-btn" type="primary" :loading="loading.graph_files" @click="pickGraphAccountFile">选择 TXT 文件</n-button>
+                          <n-button
+                            class="toolbar-btn"
+                            type="error"
+                            ghost
+                            :disabled="!settingsForm.graph_accounts_file"
+                            :loading="loading.graph_files"
+                            @click="deleteSelectedGraphAccountFile"
+                          >删除当前文件</n-button>
+                          <n-button class="toolbar-btn" :loading="loading.graph_files" @click="refreshGraphAccountFiles(true)">刷新文件列表</n-button>
+                        </template>
                       </div>
                       <div v-else-if="mailProviderTab === 'cf_email_routing'" style="margin-top: 10px">
                         <div class="meta" style="margin-bottom: 8px; font-weight: 500">Cloudflare Email Routing</div>
@@ -710,14 +738,20 @@
                       <div v-if="mailProviderTab === 'luckyous'" class="meta" style="margin-top: 6px">
                         Luckyous API 使用 <code>/api/v1/openapi/order/create</code> 下单并通过 <code>/order/{order_no}/code</code> 轮询验证码。
                       </div>
-                      <div v-if="mailProviderTab === 'graph'" class="meta" style="margin-top: 6px">
+                      <div v-if="mailProviderTab === 'graph' && settingsForm.graph_accounts_mode === 'file'" class="meta" style="margin-top: 6px">
                         文件格式要求：每行必须为 <code>邮箱----密码----client_id----令牌</code>（共 4 段，使用四个中划线分隔）。
                       </div>
-                      <div v-if="mailProviderTab === 'graph'" class="meta" style="margin-top: 4px">
-                        取件模式：Graph API（/me/messages）或 IMAP XOAUTH2（读取 INBOX/Junk）。
+                      <div v-if="mailProviderTab === 'graph' && settingsForm.graph_accounts_mode === 'api'" class="meta" style="margin-top: 6px">
+                        接口模式：仅需填写 <code>graph_api_base_url</code> 与 <code>graph_api_token</code>，账号与邮件由上游 API 提供。
                       </div>
-                      <div v-if="mailProviderTab === 'graph'" class="meta" style="margin-top: 4px">
+                      <div v-if="mailProviderTab === 'graph' && settingsForm.graph_accounts_mode === 'file'" class="meta" style="margin-top: 4px">
+                        取件模式：Graph API 或 IMAP XOAUTH2（接口模式会透传 mode=graph/imap）。
+                      </div>
+                      <div v-if="mailProviderTab === 'graph' && settingsForm.graph_accounts_mode === 'file'" class="meta" style="margin-top: 4px">
                         可切换“注册前预刷新 token”：关闭后可加快启动，但失效账号会在运行中再被淘汰。
+                      </div>
+                      <div v-if="mailProviderTab === 'graph' && settingsForm.graph_accounts_mode === 'api'" class="meta" style="margin-top: 4px">
+                        接口模式默认不做 token 预刷新，也不需要选择取件模式。
                       </div>
                       <div
                         v-if="['mailfree','cloudflare_temp_email','cloudmail'].includes(mailProviderTab) && !(mailProviderTab === 'mailfree' && mailfreePanelTab === 'domain')"

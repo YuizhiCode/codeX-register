@@ -389,7 +389,7 @@ class RegisterService:
             "sms_min_balance_usd": 0.0,
         }
         self._mail_client: Any | None = None
-        self._mail_client_sig: tuple[str, str, str, str, bool, str, str, str] | None = None
+        self._mail_client_sig: tuple[Any, ...] | None = None
 
         self._apply_to_env()
         self.log("Web 控制台已就绪")
@@ -566,6 +566,13 @@ class RegisterService:
         if val in {"cliproxyapi", "cliproxy", "cli_proxy_api", "cpa"}:
             return "cliproxyapi"
         return "sub2api"
+
+    @staticmethod
+    def _normalize_graph_accounts_mode(raw: Any) -> str:
+        val = str(raw or "file").strip().lower()
+        if val in {"api", "http", "interface", "openapi", "open_api", "remote"}:
+            return "api"
+        return "file"
 
     @staticmethod
     def _extract_remote_item_access_token(item: Any) -> str:
@@ -935,7 +942,8 @@ class RegisterService:
             "create_account_failed": "创建账号失败(create_account)",
             "phone_gate": "手机号验证风控(add-phone)",
             "phone_balance_insufficient": "手机号验证失败(HeroSMS余额不足)",
-            "phone_country_blocked": "手机号国家受限(OpenAI不支持)",
+            "phone_country_blocked": "区域不可用(Country/Region not supported)",
+            "region_blocked": "区域不可用(Country/Region not supported)",
             "phone_sms_timeout": "手机号验证码超时(HeroSMS)",
             "registration_disallowed": "registration_disallowed 风控",
             "graph_pool_exhausted": "Microsoft 邮箱账号池已耗尽",
@@ -1044,7 +1052,10 @@ class RegisterService:
         luckyous_api_base = str(cfg.get("luckyous_api_base") or "").strip()
         luckyous_api_key = str(cfg.get("luckyous_api_key") or "").strip()
         luckyous_project_code = str(cfg.get("luckyous_project_code") or "").strip()
+        graph_accounts_mode = self._normalize_graph_accounts_mode(cfg.get("graph_accounts_mode") or "file")
         graph_file = str(cfg.get("graph_accounts_file") or "").strip()
+        graph_api_base_url = str(cfg.get("graph_api_base_url") or "").strip()
+        graph_api_token = str(cfg.get("graph_api_token") or "").strip()
         gmail_user = str(cfg.get("gmail_imap_user") or "").strip()
         gmail_pass = str(cfg.get("gmail_imap_pass") or "").strip()
         gmail_aliases_raw = str(cfg.get("gmail_alias_emails") or "").strip()
@@ -1105,12 +1116,18 @@ class RegisterService:
                         "可能持续触发 user_already_exists"
                     )
         elif provider == "graph":
-            if not graph_file:
-                blockers.append("Graph 账号文件未选择（graph_accounts_file）")
+            if graph_accounts_mode == "api":
+                if not graph_api_base_url:
+                    blockers.append("Graph 接口地址未填写（graph_api_base_url）")
+                if not graph_api_token:
+                    blockers.append("Graph 接口令牌未填写（graph_api_token）")
             else:
-                graph_path = os.path.abspath(os.path.expanduser(graph_file))
-                if not os.path.isfile(graph_path):
-                    blockers.append(f"Graph 账号文件不存在：{graph_file}")
+                if not graph_file:
+                    blockers.append("Graph 账号文件未选择（graph_accounts_file）")
+                else:
+                    graph_path = os.path.abspath(os.path.expanduser(graph_file))
+                    if not os.path.isfile(graph_path):
+                        blockers.append(f"Graph 账号文件不存在：{graph_file}")
 
         if bool(cfg.get("hero_sms_enabled", False)):
             hero_key = str(cfg.get("hero_sms_api_key") or "").strip()
@@ -1471,7 +1488,10 @@ class RegisterService:
             "luckyous_domain",
             "luckyous_variant_mode",
             "luckyous_specified_email",
+            "graph_accounts_mode",
             "graph_accounts_file",
+            "graph_api_base_url",
+            "graph_api_token",
             "graph_tenant",
             "graph_fetch_mode",
             "gmail_imap_user",
@@ -1643,6 +1663,11 @@ class RegisterService:
         cfg["luckyous_domain"] = str(cfg.get("luckyous_domain") or "").strip().lower()
         cfg["luckyous_variant_mode"] = str(cfg.get("luckyous_variant_mode") or "").strip().lower()
         cfg["luckyous_specified_email"] = str(cfg.get("luckyous_specified_email") or "").strip().lower()
+        cfg["graph_accounts_mode"] = self._normalize_graph_accounts_mode(
+            cfg.get("graph_accounts_mode") or "file"
+        )
+        cfg["graph_api_base_url"] = str(cfg.get("graph_api_base_url") or "").strip()
+        cfg["graph_api_token"] = str(cfg.get("graph_api_token") or "").strip()
         graph_mode = str(cfg.get("graph_fetch_mode") or "graph_api").strip().lower()
         if graph_mode not in {"graph_api", "imap_xoauth2"}:
             graph_mode = "graph_api"
@@ -1784,6 +1809,13 @@ class RegisterService:
         )
         os.environ["CLIPROXY_MANAGEMENT_KEY"] = str(self.cfg.get("cliproxy_management_key") or "")
         os.environ["GRAPH_ACCOUNTS_FILE"] = str(self.cfg.get("graph_accounts_file") or "").strip()
+        os.environ["GRAPH_ACCOUNTS_MODE"] = self._normalize_graph_accounts_mode(
+            self.cfg.get("graph_accounts_mode") or "file"
+        )
+        os.environ["GRAPH_API_BASE_URL"] = str(self.cfg.get("graph_api_base_url") or "").strip()
+        os.environ["GRAPH_API_TOKEN"] = str(self.cfg.get("graph_api_token") or "").strip()
+        os.environ["GRAPH_API_URL"] = os.environ["GRAPH_API_BASE_URL"]
+        os.environ["MAIL_API_TOKEN"] = os.environ["GRAPH_API_TOKEN"]
         os.environ["GRAPH_TENANT"] = str(self.cfg.get("graph_tenant") or "common").strip()
         os.environ["GRAPH_FETCH_MODE"] = str(self.cfg.get("graph_fetch_mode") or "graph_api").strip()
         os.environ["GMAIL_IMAP_USER"] = str(self.cfg.get("gmail_imap_user") or "").strip()
@@ -2657,13 +2689,36 @@ class RegisterService:
                     200.0,
                 )
                 if mail_provider == "graph":
-                    graph_file = str(self.cfg.get("graph_accounts_file") or "graph_accounts.txt").strip()
-                    graph_tenant = str(self.cfg.get("graph_tenant") or "common").strip()
-                    self.log(
-                        "配置 -> "
-                        f"mail={mail_provider}, graph_file={graph_file}, tenant={graph_tenant}, "
-                        f"pre_refresh={'开启' if graph_pre_refresh else '关闭'}"
+                    graph_accounts_mode = self._normalize_graph_accounts_mode(
+                        self.cfg.get("graph_accounts_mode") or "file"
                     )
+                    graph_file = str(self.cfg.get("graph_accounts_file") or "graph_accounts.txt").strip()
+                    graph_api_base = str(self.cfg.get("graph_api_base_url") or "").strip()
+                    graph_api_token = str(self.cfg.get("graph_api_token") or "").strip()
+                    token_mask = (
+                        (graph_api_token[:4] + "***")
+                        if len(graph_api_token) >= 4
+                        else ("***" if graph_api_token else "-")
+                    )
+                    graph_tenant = str(self.cfg.get("graph_tenant") or "common").strip()
+                    mode_text = "接口模式" if graph_accounts_mode == "api" else "文件模式"
+                    pre_refresh_text = "接口模式固定关闭" if graph_accounts_mode == "api" else (
+                        "开启" if graph_pre_refresh else "关闭"
+                    )
+                    if graph_accounts_mode == "api":
+                        self.log(
+                            "配置 -> "
+                            f"mail={mail_provider}, mode={mode_text}, "
+                            f"graph_api={graph_api_base or '-'}, token={token_mask}, "
+                            f"pre_refresh={pre_refresh_text}"
+                        )
+                    else:
+                        self.log(
+                            "配置 -> "
+                            f"mail={mail_provider}, mode={mode_text}, "
+                            f"graph_file={graph_file or '-'}, tenant={graph_tenant}, "
+                            f"pre_refresh={pre_refresh_text}"
+                        )
                 elif mail_provider == "cloudflare_temp_email":
                     cf_temp_auth = str(self.cfg.get("cf_temp_admin_auth") or "")
                     cf_mask = (cf_temp_auth[:3] + "***") if len(cf_temp_auth) >= 3 else ("***" if cf_temp_auth else "")
@@ -2831,9 +2886,14 @@ class RegisterService:
                 self.log("代理入口：直连")
 
             outdir = os.getenv("TOKEN_OUTPUT_DIR", "").strip()
+            graph_accounts_mode = self._normalize_graph_accounts_mode(
+                self.cfg.get("graph_accounts_mode") or "file"
+            )
             graph_pre_refresh_before_run = bool(
                 self.cfg.get("graph_pre_refresh_before_run", True)
             )
+            if mail_provider == "graph" and graph_accounts_mode == "api":
+                graph_pre_refresh_before_run = False
 
             if concurrency > 1 and not random_fp_on:
                 self.log(
@@ -2841,9 +2901,12 @@ class RegisterService:
                     "建议开启随机指纹或降低并发"
                 )
             if mail_provider == "graph" and not graph_pre_refresh_before_run:
-                self.log(
-                    "[提示] 已关闭 Graph 注册前 token 预刷新：启动更快，但会更早命中坏号"
-                )
+                if graph_accounts_mode == "api":
+                    self.log("[提示] Graph 接口模式不执行注册前 token 预刷新")
+                else:
+                    self.log(
+                        "[提示] 已关闭 Graph 注册前 token 预刷新：启动更快，但会更早命中坏号"
+                    )
 
             if mail_provider == "graph":
                 with self._lock:
@@ -2906,16 +2969,34 @@ class RegisterService:
                         self._stop.set()
                         return
                 else:
-                    self.log("[Microsoft 邮箱] 已关闭注册前 token 预刷新")
+                    if graph_accounts_mode == "api":
+                        self.log("[Microsoft 邮箱] 接口模式：已跳过注册前 token 预刷新")
+                    else:
+                        self.log("[Microsoft 邮箱] 已关闭注册前 token 预刷新")
 
             graph_accounts_file = str(
                 self.cfg.get("graph_accounts_file") or "graph_accounts.txt"
             ).strip() or "graph_accounts.txt"
             graph_accounts_path = os.path.abspath(os.path.expanduser(graph_accounts_file))
+            graph_accounts_mode = self._normalize_graph_accounts_mode(
+                self.cfg.get("graph_accounts_mode") or "file"
+            )
 
             def _graph_remaining_account_count() -> int:
                 if mail_provider != "graph":
                     return -1
+                if graph_accounts_mode == "api":
+                    try:
+                        gclient = self._get_mail_client()
+                        rows = list(getattr(gclient, "_accounts", []) or [])
+                    except Exception:
+                        return 0
+                    cnt = 0
+                    for row in rows:
+                        email_val = str((row or {}).get("email") or "").strip().lower()
+                        if email_val and "@" in email_val:
+                            cnt += 1
+                    return cnt
                 fp = str(graph_accounts_path or "").strip()
                 if not fp or not os.path.isfile(fp):
                     return 0
@@ -3506,6 +3587,14 @@ class RegisterService:
                                     if err_code == "phone_country_blocked":
                                         self.log(
                                             f"[F{file_no}W{worker_no}] HeroSMS 国家受限，立即停止本轮注册"
+                                        )
+                                        self._stop.set()
+                                        need_retry = False
+                                        retry_reason = ""
+                                        continue
+                                    if err_code == "region_blocked":
+                                        self.log(
+                                            f"[F{file_no}W{worker_no}] OpenAI 区域不可用，立即停止本轮注册"
                                         )
                                         self._stop.set()
                                         need_retry = False

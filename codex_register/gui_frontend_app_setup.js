@@ -120,7 +120,10 @@
           luckyous_domain: "",
           luckyous_variant_mode: "",
           luckyous_specified_email: "",
+          graph_accounts_mode: "file",
           graph_accounts_file: "",
+          graph_api_base_url: "",
+          graph_api_token: "",
           graph_tenant: "common",
           graph_fetch_mode: "graph_api",
           graph_pre_refresh_before_run: true,
@@ -358,6 +361,13 @@
             mailTotal: 0
           },
           mail_curl: {
+            domains: [],
+            mailboxRows: [],
+            selectedMailbox: "",
+            mailRows: [],
+            mailTotal: 0
+          },
+          luckyous: {
             domains: [],
             mailboxRows: [],
             selectedMailbox: "",
@@ -1009,6 +1019,19 @@
           { label: "IMAP XOAUTH2 取件", value: "imap_xoauth2" }
         ];
 
+        const graphAccountSourceOptions = [
+          { label: "文件模式", value: "file" },
+          { label: "接口模式", value: "api" }
+        ];
+
+        function normalizeGraphAccountsMode(raw) {
+          const val = String(raw || "file").trim().toLowerCase();
+          if (["api", "http", "interface", "openapi", "open_api", "remote"].includes(val)) {
+            return "api";
+          }
+          return "file";
+        }
+
         const remoteAccountProviderOptions = [
           { label: "Sub2API", value: "sub2api" },
           { label: "CLIProxyAPI", value: "cliproxyapi" }
@@ -1536,7 +1559,10 @@
           settingsForm.luckyous_domain = String(cfg.luckyous_domain || "");
           settingsForm.luckyous_variant_mode = String(cfg.luckyous_variant_mode || "");
           settingsForm.luckyous_specified_email = String(cfg.luckyous_specified_email || "");
+          settingsForm.graph_accounts_mode = normalizeGraphAccountsMode(cfg.graph_accounts_mode || "file");
           settingsForm.graph_accounts_file = String(cfg.graph_accounts_file || "");
+          settingsForm.graph_api_base_url = String(cfg.graph_api_base_url || "");
+          settingsForm.graph_api_token = String(cfg.graph_api_token || "");
           settingsForm.graph_tenant = String(cfg.graph_tenant || "common");
           settingsForm.graph_fetch_mode = String(cfg.graph_fetch_mode || "graph_api");
           settingsForm.graph_pre_refresh_before_run = cfg.graph_pre_refresh_before_run !== false;
@@ -1634,7 +1660,10 @@
             luckyous_domain: String(settingsForm.luckyous_domain || "").trim(),
             luckyous_variant_mode: String(settingsForm.luckyous_variant_mode || "").trim(),
             luckyous_specified_email: String(settingsForm.luckyous_specified_email || "").trim(),
+            graph_accounts_mode: normalizeGraphAccountsMode(settingsForm.graph_accounts_mode || "file"),
             graph_accounts_file: String(settingsForm.graph_accounts_file || "").trim(),
+            graph_api_base_url: String(settingsForm.graph_api_base_url || "").trim(),
+            graph_api_token: String(settingsForm.graph_api_token || "").trim(),
             graph_tenant: String(settingsForm.graph_tenant || "common").trim(),
             graph_fetch_mode: String(settingsForm.graph_fetch_mode || "graph_api").trim(),
             graph_pre_refresh_before_run: !!settingsForm.graph_pre_refresh_before_run,
@@ -2766,7 +2795,16 @@
 
         function snapshotMailViewToCache() {
           const key = currentMailProviderKey();
-          const target = mailViewCache[key];
+          const target = mailViewCache[key] || {
+            domains: [],
+            mailboxRows: [],
+            selectedMailbox: "",
+            mailRows: [],
+            mailTotal: 0
+          };
+          if (!mailViewCache[key]) {
+            mailViewCache[key] = target;
+          }
           target.domains = Array.isArray(mailDomains.value) ? [...mailDomains.value] : [];
           target.mailboxRows = Array.isArray(mailboxRows.value)
             ? mailboxRows.value.map((x) => Object.assign({}, x))
@@ -2780,7 +2818,16 @@
 
         function restoreMailViewFromCache(provider) {
           const key = normalizeMailProvider(provider || "mailfree");
-          const source = mailViewCache[key];
+          const source = mailViewCache[key] || {
+            domains: [],
+            mailboxRows: [],
+            selectedMailbox: "",
+            mailRows: [],
+            mailTotal: 0
+          };
+          if (!mailViewCache[key]) {
+            mailViewCache[key] = source;
+          }
           mailDomains.value = Array.isArray(source.domains) ? [...source.domains] : [];
           mailboxRows.value = Array.isArray(source.mailboxRows)
             ? source.mailboxRows.map((x) => Object.assign({}, x))
@@ -2897,6 +2944,10 @@
         }
 
         async function refreshGraphAccountFiles(showError = false) {
+          if (normalizeGraphAccountsMode(settingsForm.graph_accounts_mode) !== "file") {
+            graphAccountFileOptions.value = [];
+            return;
+          }
           loading.graph_files = true;
           try {
             const data = await apiRequest("/api/mail/graph-account-files");
@@ -2915,6 +2966,10 @@
         }
 
         function pickGraphAccountFile() {
+          if (normalizeGraphAccountsMode(settingsForm.graph_accounts_mode) !== "file") {
+            message.warning("接口模式无需选择账号文件");
+            return;
+          }
           const el = graphFileInputRef.value;
           if (!el) {
             message.error("文件选择器不可用");
@@ -2925,6 +2980,9 @@
         }
 
         async function onGraphAccountFilePicked(e) {
+          if (normalizeGraphAccountsMode(settingsForm.graph_accounts_mode) !== "file") {
+            return;
+          }
           const files = (e && e.target && e.target.files) ? e.target.files : null;
           if (!files || !files.length) return;
           const file = files[0];
@@ -2954,6 +3012,10 @@
         }
 
         async function deleteSelectedGraphAccountFile() {
+          if (normalizeGraphAccountsMode(settingsForm.graph_accounts_mode) !== "file") {
+            message.warning("接口模式没有本地账号文件可删除");
+            return;
+          }
           const target = String(settingsForm.graph_accounts_file || "").trim();
           if (!target) {
             message.warning("请先选择要删除的 Graph 账号文件");
@@ -2987,7 +3049,7 @@
             mailfreePanelTab.value = "basic";
           }
           restoreMailViewFromCache(mailProviderTab.value);
-          if (mailProviderTab.value === "graph") {
+          if (mailProviderTab.value === "graph" && normalizeGraphAccountsMode(settingsForm.graph_accounts_mode) === "file") {
             refreshGraphAccountFiles(false);
           }
           if (mailProviderTab.value === "mailfree" && mailfreePanelTab.value === "domain") {
@@ -3823,7 +3885,10 @@
             return;
           }
           if (tab === "mail") {
-            if (normalizeMailProvider(mailProviderTab.value) === "graph") {
+            if (
+              normalizeMailProvider(mailProviderTab.value) === "graph"
+              && normalizeGraphAccountsMode(settingsForm.graph_accounts_mode) === "file"
+            ) {
               await refreshGraphAccountFiles(false);
             }
             await loadMailDomainStats();
@@ -3844,6 +3909,22 @@
             }
           }
         });
+
+        Vue.watch(
+          () => normalizeGraphAccountsMode(settingsForm.graph_accounts_mode || "file"),
+          async (mode, oldMode) => {
+            if (mode === oldMode) return;
+            if (mode === "api") {
+              settingsForm.graph_fetch_mode = "graph_api";
+              settingsForm.graph_pre_refresh_before_run = false;
+              graphAccountFileOptions.value = [];
+              return;
+            }
+            if (mailProviderTab.value === "graph") {
+              await refreshGraphAccountFiles(false);
+            }
+          }
+        );
 
         Vue.watch(
           () => String(settingsForm.hero_sms_service || "").trim(),
@@ -3981,6 +4062,7 @@
           flclashProbeSummary,
           flclashPolicyOptions,
           graphFetchModeOptions,
+          graphAccountSourceOptions,
           remoteAccountProviderOptions,
           flclashProbeColumns,
           jsonColumns,

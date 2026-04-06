@@ -59,7 +59,10 @@ DEFAULT_CONFIG = {
     "luckyous_variant_mode": "",
     "luckyous_specified_email": "",
     "mail_service_provider": "mailfree",
+    "graph_accounts_mode": "file",
     "graph_accounts_file": "",
+    "graph_api_base_url": "",
+    "graph_api_token": "",
     "graph_tenant": "common",
     "graph_fetch_mode": "graph_api",
     "graph_pre_refresh_before_run": True,
@@ -181,7 +184,16 @@ def load_config() -> dict[str, Any]:
         cfg["luckyous_variant_mode"] = env.get("LUCKYOUS_VARIANT_MODE", "")
         cfg["luckyous_specified_email"] = env.get("LUCKYOUS_SPECIFIED_EMAIL", "")
         cfg["mail_service_provider"] = mode
+        cfg["graph_accounts_mode"] = env.get("GRAPH_ACCOUNTS_MODE", "file")
         cfg["remote_account_provider"] = env.get("REMOTE_ACCOUNT_PROVIDER", cfg.get("remote_account_provider", "sub2api"))
+        cfg["graph_api_base_url"] = env.get(
+            "GRAPH_API_BASE_URL",
+            env.get("GRAPH_API_URL", ""),
+        )
+        cfg["graph_api_token"] = env.get(
+            "GRAPH_API_TOKEN",
+            env.get("MAIL_API_TOKEN", ""),
+        )
         cfg["cliproxy_api_base"] = env.get("CLIPROXY_API_BASE", env.get("CLIPROXY_MANAGEMENT_API", ""))
         cfg["cliproxy_management_key"] = env.get("CLIPROXY_MANAGEMENT_KEY", env.get("MANAGEMENT_KEY", ""))
         try:

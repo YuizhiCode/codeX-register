@@ -135,6 +135,10 @@ class HeroSmsCountryBlockedError(RuntimeError):
     """HeroSMS 国家被策略过滤时触发的中断异常。"""
 
 
+class RegionBlockedError(RuntimeError):
+    """OpenAI 返回地区不可用时触发的中断异常。"""
+
+
 def _stop_requested() -> bool:
     evt = STOP_EVENT
     if evt is None:
@@ -283,6 +287,29 @@ def _mark_graph_bad_email(email: str, reason: str = "") -> None:
             _warn(f"Graph 账号已删除: {target}")
         else:
             _warn(f"Graph 账号已标记不可用: {target}")
+
+
+def _mark_graph_registered_email(
+    email: str,
+    *,
+    proxies: Any = None,
+    remark: str = "已注册",
+) -> bool:
+    target = str(email or "").strip().lower()
+    if not target or "@" not in target:
+        return False
+    try:
+        client = _get_mail_service_client()
+        mark_fn = getattr(client, "mark_account_registered", None)
+        if not callable(mark_fn):
+            return False
+        ok = bool(mark_fn(target, remark=remark, proxies=proxies))
+        if ok:
+            _info(f"Graph 账号备注已更新: {target} -> {remark}")
+        return ok
+    except Exception as e:
+        _warn(f"Graph 账号备注更新失败: {target} -> {e}")
+        return False
 
 
 _HERO_SMS_SERVICE_CACHE: str = ""
@@ -1027,7 +1054,25 @@ def _is_hero_sms_country_blocked_issue(reason: str) -> bool:
     low = str(reason or "").strip().lower()
     if not low:
         return False
-    return "country_blocked" in low or "国家受限" in low
+    return (
+        "country_blocked" in low
+        or "国家受限" in low
+        or "unsupported_country_region_territory" in low
+        or "country, region, or territory" in low
+        or "not supported in your country" in low
+    )
+
+
+def _is_region_blocked_issue(reason: str) -> bool:
+    low = str(reason or "").strip().lower()
+    if not low:
+        return False
+    return (
+        "unsupported_country_region_territory" in low
+        or "country, region, or territory not supported" in low
+        or "country, region, or territory" in low
+        or "request_forbidden" in low
+    )
 
 
 def _hero_sms_get_number(
@@ -1259,17 +1304,48 @@ def _try_verify_phone_via_hero_sms(
                 except Exception:
                     sj = None
                 if isinstance(sj, dict):
+                    err_code = str(sj.get("error_code") or "").strip()
+                    err_msg = str(sj.get("message") or "").strip()
+                    err_v = sj.get("error")
+                    if isinstance(err_v, dict):
+                        err_code = str(err_v.get("code") or err_code).strip()
+                        err_msg = str(err_v.get("message") or err_msg).strip()
+                    elif isinstance(err_v, str) and not err_code:
+                        err_code = str(err_v).strip()
+
                     if sj.get("success") is False:
+                        reason_text = str(err_msg or err_code or sj)[:280]
+                        if _is_hero_sms_country_blocked_issue(f"{err_code} {err_msg}"):
+                            fail_reason = (
+                                f"COUNTRY_BLOCKED: {err_code or 'unsupported_country_region_territory'}"
+                                f" {err_msg}".strip()
+                            )
+                        else:
+                            fail_reason = f"发送手机验证码失败: {reason_text}"
                         _warn(
                             f"{source} add-phone/send 业务失败: "
-                            f"{str(sj.get('message') or sj.get('error') or sj)[:280]}"
+                            f"{reason_text}"
                         )
-                    err_v = sj.get("error")
+                        return False, "", fail_reason
+
                     if err_v and sj.get("success") is not False:
-                        _warn(f"{source} add-phone/send 返回含 error 字段: {str(err_v)[:240]}")
+                        reason_text = str(err_msg or err_code or err_v)[:280]
+                        if _is_hero_sms_country_blocked_issue(f"{err_code} {err_msg}"):
+                            fail_reason = (
+                                f"COUNTRY_BLOCKED: {err_code or 'unsupported_country_region_territory'}"
+                                f" {err_msg}".strip()
+                            )
+                        else:
+                            fail_reason = f"发送手机验证码失败: {reason_text}"
+                        _warn(f"{source} add-phone/send 返回含 error 字段: {reason_text}")
+                        return False, "", fail_reason
             if send_resp.status_code != 200:
-                fail_reason = f"发送手机验证码失败: HTTP {send_resp.status_code}"
-                _warn(f"{source} {fail_reason} | {str(send_resp.text or '')[:240]}")
+                fail_body = str(send_resp.text or "")
+                if _is_hero_sms_country_blocked_issue(fail_body):
+                    fail_reason = f"COUNTRY_BLOCKED: {fail_body[:240]}"
+                else:
+                    fail_reason = f"发送手机验证码失败: HTTP {send_resp.status_code}"
+                _warn(f"{source} {fail_reason} | {fail_body[:240]}")
                 return False, "", fail_reason
 
             sms_code = _hero_sms_poll_code(activation_id, proxies)
@@ -1299,8 +1375,12 @@ def _try_verify_phone_via_hero_sms(
             )
             _info(f"{source} phone-otp/validate HTTP {verify_resp.status_code}")
             if verify_resp.status_code != 200:
-                fail_reason = f"手机验证码校验失败: HTTP {verify_resp.status_code}"
-                _warn(f"{source} {fail_reason} | {str(verify_resp.text or '')[:240]}")
+                verify_body = str(verify_resp.text or "")
+                if _is_hero_sms_country_blocked_issue(verify_body):
+                    fail_reason = f"COUNTRY_BLOCKED: {verify_body[:240]}"
+                else:
+                    fail_reason = f"手机验证码校验失败: HTTP {verify_resp.status_code}"
+                _warn(f"{source} {fail_reason} | {verify_body[:240]}")
                 return False, "", fail_reason
 
             if close_on_success:
@@ -1620,6 +1700,17 @@ def _mail_service_signature() -> tuple[Any, ...]:
     luckyous_variant_mode = str(os.getenv("LUCKYOUS_VARIANT_MODE", "") or "").strip().lower()
     luckyous_specified_email = str(os.getenv("LUCKYOUS_SPECIFIED_EMAIL", "") or "").strip().lower()
     graph_accounts_file = str(os.getenv("GRAPH_ACCOUNTS_FILE", "") or "").strip()
+    graph_accounts_mode = str(os.getenv("GRAPH_ACCOUNTS_MODE", "file") or "file").strip().lower()
+    if graph_accounts_mode not in {"file", "api"}:
+        graph_accounts_mode = "file"
+    graph_api_base_url = str(
+        os.getenv("GRAPH_API_BASE_URL", os.getenv("GRAPH_API_URL", ""))
+        or ""
+    ).strip()
+    graph_api_token = str(
+        os.getenv("GRAPH_API_TOKEN", os.getenv("MAIL_API_TOKEN", ""))
+        or ""
+    ).strip()
     graph_tenant = str(os.getenv("GRAPH_TENANT", "common") or "common").strip()
     graph_fetch_mode = str(os.getenv("GRAPH_FETCH_MODE", "graph_api") or "graph_api").strip()
     gmail_imap_user = str(os.getenv("GMAIL_IMAP_USER", "") or "").strip()
@@ -1666,6 +1757,9 @@ def _mail_service_signature() -> tuple[Any, ...]:
         luckyous_variant_mode,
         luckyous_specified_email,
         graph_accounts_file,
+        graph_accounts_mode,
+        graph_api_base_url,
+        graph_api_token,
         graph_tenant,
         graph_fetch_mode,
         gmail_imap_user,
@@ -1724,6 +1818,9 @@ def _get_mail_service_client():
         luckyous_variant_mode,
         luckyous_specified_email,
         graph_accounts_file,
+        graph_accounts_mode,
+        graph_api_base_url,
+        graph_api_token,
         graph_tenant,
         graph_fetch_mode,
         gmail_imap_user,
@@ -1766,6 +1863,11 @@ def _get_mail_service_client():
     os.environ["LUCKYOUS_VARIANT_MODE"] = luckyous_variant_mode
     os.environ["LUCKYOUS_SPECIFIED_EMAIL"] = luckyous_specified_email
     os.environ["GRAPH_ACCOUNTS_FILE"] = graph_accounts_file
+    os.environ["GRAPH_ACCOUNTS_MODE"] = graph_accounts_mode
+    os.environ["GRAPH_API_BASE_URL"] = graph_api_base_url
+    os.environ["GRAPH_API_TOKEN"] = graph_api_token
+    os.environ["GRAPH_API_URL"] = graph_api_base_url
+    os.environ["MAIL_API_TOKEN"] = graph_api_token
     os.environ["GRAPH_TENANT"] = graph_tenant
     os.environ["GRAPH_FETCH_MODE"] = graph_fetch_mode
     os.environ["GMAIL_IMAP_USER"] = gmail_imap_user
@@ -1798,6 +1900,8 @@ def get_email_and_token(proxies: Any = None) -> tuple:
     try:
         client = _get_mail_service_client()
         provider = normalize_mail_provider(MAIL_SERVICE_PROVIDER)
+        graph_accounts_mode = str(os.getenv("GRAPH_ACCOUNTS_MODE", "file") or "file").strip().lower()
+        graph_api_mode = provider == "graph" and graph_accounts_mode == "api"
         allow_domains: List[str] = []
         random_domain = True
         mailbox_prefix = ""
@@ -1945,7 +2049,10 @@ def get_email_and_token(proxies: Any = None) -> tuple:
                 f"随机域名={'开' if random_domain else '关'}"
             )
         elif provider == "graph":
-            _info("Graph 模式：忽略 MailFree 域名/前缀规则，直接从账号池取邮箱")
+            if graph_api_mode:
+                _info("Graph 接口模式：从接口账号池取邮箱（跳过 token 探活）")
+            else:
+                _info("Graph 模式：忽略 MailFree 域名/前缀规则，直接从账号池取邮箱")
         elif provider == "mail_curl":
             _info("Mail-Curl 模式：按邮箱 ID 轮询收件")
         elif provider == "cf_email_routing":
@@ -1987,7 +2094,7 @@ def get_email_and_token(proxies: Any = None) -> tuple:
 
         pick_rounds = 5
         if provider == "graph":
-            pick_rounds = 30
+            pick_rounds = 8 if graph_api_mode else 30
         for _ in range(pick_rounds):
             _raise_if_stopped()
             try:
@@ -2001,14 +2108,20 @@ def get_email_and_token(proxies: Any = None) -> tuple:
             except MailServiceError as e:
                 err_text = str(e)
                 _warn(f"临时邮箱生成失败，准备重试: {err_text}")
-                if provider == "graph" and (
-                    "graph 账号池为空" in err_text.lower()
-                    or "graph 账号文件为空" in err_text.lower()
-                    or "graph 账号文件不存在" in err_text.lower()
-                ):
-                    _set_mailbox_init_error("graph_pool_exhausted", err_text)
-                    _err("Graph 账号池已耗尽，停止本轮注册")
-                    return "", ""
+                if provider == "graph":
+                    low = err_text.lower()
+                    fatal = (
+                        "graph 账号池为空" in low
+                        or "graph 账号文件为空" in low
+                        or "graph 账号文件不存在" in low
+                        or "graph 接口模式无法获取账号列表" in low
+                        or "graph 接口模式鉴权失败" in low
+                        or "graph 接口账号池为空" in low
+                    )
+                    if fatal:
+                        _set_mailbox_init_error("graph_pool_exhausted", err_text)
+                        _err("Graph 账号池不可用，停止本轮注册")
+                        return "", ""
                 email = ""
             if email:
                 _raise_if_stopped()
@@ -2016,17 +2129,20 @@ def get_email_and_token(proxies: Any = None) -> tuple:
                     _warn(f"跳过已标记不可用 Graph 邮箱: {email}")
                     continue
                 if provider == "graph":
-                    try:
-                        refresh_res = client.refresh_mailbox_token(email, proxies=proxies)
-                        token_hint = str((refresh_res or {}).get("token_prefix") or "").strip()
-                        if token_hint:
-                            _info(f"Graph 邮箱令牌已刷新: {email} · {token_hint}")
-                        else:
-                            _info(f"Graph 邮箱令牌已刷新: {email}")
-                    except Exception as e:
-                        _warn(f"Graph 邮箱令牌刷新失败，剔除后重试: {email} -> {e}")
-                        _mark_graph_bad_email(email, "token_refresh_failed")
-                        continue
+                    if graph_api_mode:
+                        _info(f"Graph 接口邮箱已分配: {email}")
+                    else:
+                        try:
+                            refresh_res = client.refresh_mailbox_token(email, proxies=proxies)
+                            token_hint = str((refresh_res or {}).get("token_prefix") or "").strip()
+                            if token_hint:
+                                _info(f"Graph 邮箱令牌已刷新: {email} · {token_hint}")
+                            else:
+                                _info(f"Graph 邮箱令牌已刷新: {email}")
+                        except Exception as e:
+                            _warn(f"Graph 邮箱令牌刷新失败，剔除后重试: {email} -> {e}")
+                            _mark_graph_bad_email(email, "token_refresh_failed")
+                            continue
                 return email, email
 
         _err("临时邮箱创建失败")
@@ -2042,7 +2158,14 @@ def get_email_and_token(proxies: Any = None) -> tuple:
         return "", ""
 
 
-def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
+def get_oai_code(
+    token: str,
+    email: str,
+    proxies: Any = None,
+    *,
+    poll_rounds: int | None = None,
+    poll_interval: float | None = None,
+) -> str:
     """轮询 Worker 邮箱取 OpenAI 6 位码；邮件按 id 降序优先看较新。"""
     _ = token
     _raise_if_stopped()
@@ -2053,8 +2176,14 @@ def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
         return ""
 
     _out(f"[*] 正在等待邮箱 {email} 的验证码...", end="", flush=True)
-    poll_rounds = _env_int("OTP_POLL_MAX_ROUNDS", 40, 5, 300)
-    poll_interval = _env_float("OTP_POLL_INTERVAL_SEC", 3.0, 0.2, 15.0)
+    if poll_rounds is None:
+        poll_rounds = _env_int("OTP_POLL_MAX_ROUNDS", 40, 5, 300)
+    else:
+        poll_rounds = max(1, min(300, int(poll_rounds)))
+    if poll_interval is None:
+        poll_interval = _env_float("OTP_POLL_INTERVAL_SEC", 3.0, 0.2, 15.0)
+    else:
+        poll_interval = max(0.2, min(15.0, float(poll_interval)))
 
     def _progress_tick() -> None:
         _raise_if_stopped()
@@ -2073,6 +2202,58 @@ def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
 
     _out("\n[*] 超时，未收到验证码")
     return ""
+
+
+def get_oai_code_with_single_resend(
+    token: str,
+    email: str,
+    proxies: Any = None,
+    *,
+    resend_once_cb: Any = None,
+    scene: str = "OTP",
+) -> str:
+    """先短轮询；每 10 秒收不到就重发，达到上限后再常规轮询。"""
+    first_wait_sec = _env_float("OTP_RESEND_WAIT_SEC", 10.0, 2.0, 60.0)
+    first_interval = _env_float("OTP_RESEND_POLL_INTERVAL_SEC", 1.0, 0.2, 5.0)
+    max_resend_times = _env_int("OTP_RESEND_MAX_TIMES", 3, 0, 10)
+    resend_gap_sec = _env_float("OTP_RESEND_GAP_SEC", 0.8, 0.0, 10.0)
+    quick_rounds = max(1, int((first_wait_sec / max(0.2, first_interval)) + 0.999))
+
+    for resend_idx in range(max_resend_times + 1):
+        code = get_oai_code(
+            token,
+            email,
+            proxies,
+            poll_rounds=quick_rounds,
+            poll_interval=first_interval,
+        )
+        if code:
+            return code
+
+        if resend_idx >= max_resend_times:
+            break
+
+        _warn(
+            f"{scene} {int(first_wait_sec)} 秒内未收到验证码，"
+            f"尝试重发第 {resend_idx + 1}/{max_resend_times} 次"
+        )
+        if callable(resend_once_cb):
+            try:
+                resent_ok = bool(resend_once_cb())
+                if resent_ok:
+                    _info(f"{scene} 重发成功，继续等待验证码")
+                else:
+                    _warn(f"{scene} 重发返回异常，继续等待验证码")
+            except Exception as e:
+                _warn(f"{scene} 重发请求异常: {e}")
+
+        if resend_gap_sec > 0 and _sleep_interruptible(resend_gap_sec):
+            raise UserStoppedError("stopped_by_user")
+
+    if max_resend_times > 0:
+        _warn(f"{scene} 已达到最大重发次数({max_resend_times})，继续常规等待")
+
+    return get_oai_code(token, email, proxies)
 
 
 # --- OAuth2 / PKCE 与 token 交换 ---
@@ -2837,6 +3018,8 @@ def _login_via_password_and_finish_oauth(
     password: str,
     dev_token: str,
     proxies: Any,
+    *,
+    mark_bad_email_on_invalid_pwd: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
     手机号页或无 OAuth 完成时的补救登录。
@@ -2854,18 +3037,150 @@ def _login_via_password_and_finish_oauth(
     _apply_session_fingerprint(s, fp)
     _info(f"登录指纹: {fp.get('label', '-')}")
 
-    _, current_url = _follow_redirect_chain(s, oauth.auth_url, proxies)
-    if "code=" in current_url and "state=" in current_url:
+    def _submit_callback_or_none(callback_url: str, success_msg: str = "") -> Optional[Dict[str, Any]]:
         try:
-            return submit_callback_url(
-                callback_url=current_url,
+            account_obj = submit_callback_url(
+                callback_url=callback_url,
                 code_verifier=oauth.code_verifier,
                 redirect_uri=oauth.redirect_uri,
                 expected_state=oauth.state,
             )
+            if success_msg:
+                _info(success_msg)
+            return account_obj
         except Exception as e:
-            _err(f"交换 token 失败: {e}")
+            msg = str(e)
+            _err(f"交换 token 失败: {msg}")
+            if _is_region_blocked_issue(msg):
+                raise RegionBlockedError(msg)
             return None
+
+    def _try_login_via_email_otp_api(referer_hint: str) -> Optional[Dict[str, Any]]:
+        _info("改走验证码登录接口(email-otp)")
+        ref = str(referer_hint or "").strip()
+        if not ref.startswith("http"):
+            ref = "https://auth.openai.com/email-verification"
+        ref_candidates = [
+            ref,
+            "https://auth.openai.com/email-verification",
+            "https://auth.openai.com/log-in/password",
+            "https://auth.openai.com/login/password",
+        ]
+        dedup_refs = [
+            x for x in dict.fromkeys([str(v or "").strip() for v in ref_candidates]).keys() if x
+        ]
+
+        def _send_login_otp_once() -> Any:
+            last_resp = None
+            for ref_item in dedup_refs:
+                hdrs: Dict[str, str] = {
+                    "referer": ref_item,
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                }
+                st = _build_sentinel_for_session(s, "authorize_continue", proxies)
+                if st:
+                    hdrs["openai-sentinel-token"] = st
+                resp = _post_with_retry(
+                    s,
+                    "https://auth.openai.com/api/accounts/email-otp/send",
+                    headers=hdrs,
+                    json_body={},
+                    proxies=proxies,
+                    timeout=30,
+                    retries=1,
+                )
+                last_resp = resp
+                if resp.status_code == 200:
+                    return resp
+            return last_resp
+
+        try:
+            otp_send_resp = _send_login_otp_once()
+        except UserStoppedError:
+            raise
+        except Exception as e:
+            _warn(f"验证码登录 OTP 发送请求异常: {e}")
+            return None
+        _info(f"验证码登录 OTP 发送 HTTP {otp_send_resp.status_code}")
+        if otp_send_resp.status_code != 200:
+            _warn(f"验证码登录 OTP 发送失败: {otp_send_resp.text[:300]}")
+            return None
+
+        def _resend_login_otp_once() -> bool:
+            resend_resp = _send_login_otp_once()
+            _info(f"验证码登录 OTP 重发 HTTP {resend_resp.status_code}")
+            if resend_resp.status_code != 200:
+                _warn(f"验证码登录 OTP 重发异常: {resend_resp.text[:300]}")
+            return resend_resp.status_code == 200
+
+        code = get_oai_code_with_single_resend(
+            dev_token,
+            email,
+            proxies,
+            resend_once_cb=_resend_login_otp_once,
+            scene="验证码登录 OTP",
+        )
+        if not code:
+            _err("验证码登录流程未收到邮箱验证码")
+            return None
+
+        validate_headers: Dict[str, str] = {
+            "referer": "https://auth.openai.com/email-verification",
+            "accept": "application/json",
+            "content-type": "application/json",
+        }
+        validate_sentinel = _build_sentinel_for_session(s, "authorize_continue", proxies)
+        if validate_sentinel:
+            validate_headers["openai-sentinel-token"] = validate_sentinel
+        try:
+            validate_resp = _post_with_retry(
+                s,
+                "https://auth.openai.com/api/accounts/email-otp/validate",
+                headers=validate_headers,
+                json_body={"code": code},
+                proxies=proxies,
+                timeout=30,
+                retries=2,
+            )
+        except UserStoppedError:
+            raise
+        except Exception as e:
+            _warn(f"验证码登录 OTP 校验请求异常: {e}")
+            return None
+        _info(f"验证码登录 OTP 校验 HTTP {validate_resp.status_code}")
+        if validate_resp.status_code != 200:
+            _warn(f"验证码登录 OTP 校验失败: {validate_resp.text[:400]}")
+            return None
+
+        try:
+            vj = validate_resp.json() or {}
+        except Exception:
+            vj = {}
+        otp_next = _extract_next_url(vj).strip() or str(vj.get("continue_url") or "").strip()
+        otp_url = otp_next or ref
+        if otp_url and not otp_url.startswith("http"):
+            otp_url = f"https://auth.openai.com{otp_url}" if otp_url.startswith("/") else otp_url
+        if otp_url:
+            _, otp_url = _follow_redirect_chain(s, otp_url, proxies)
+
+        solved, otp_url, _ = _handle_add_phone_challenge(
+            s,
+            current_url=otp_url,
+            proxies=proxies,
+            email=email,
+            hint_url=otp_url,
+            scene="验证码登录 OTP 后",
+        )
+        if not solved:
+            return None
+        if "code=" in otp_url and "state=" in otp_url:
+            return _submit_callback_or_none(otp_url, success_msg="OAuth 换 token 成功（验证码登录）")
+        return None
+
+    _, current_url = _follow_redirect_chain(s, oauth.auth_url, proxies)
+    if "code=" in current_url and "state=" in current_url:
+        return _submit_callback_or_none(current_url)
 
     did = s.cookies.get("oai-did")
     _info(f"Device ID: {did}")
@@ -2911,18 +3226,7 @@ def _login_via_password_and_finish_oauth(
 
     _, current_url = _follow_redirect_chain(s, password_page_url, proxies)
     if "code=" in current_url and "state=" in current_url:
-        try:
-            account = submit_callback_url(
-                callback_url=current_url,
-                code_verifier=oauth.code_verifier,
-                redirect_uri=oauth.redirect_uri,
-                expected_state=oauth.state,
-            )
-            _info("OAuth 换 token 成功（授权链已带 callback）")
-            return account
-        except Exception as e:
-            _err(f"交换 token 失败: {e}")
-            return None
+        return _submit_callback_or_none(current_url, success_msg="OAuth 换 token 成功（授权链已带 callback）")
 
     try:
         pre_pwd = _session_get_with_tls_retry(
@@ -2976,13 +3280,18 @@ def _login_via_password_and_finish_oauth(
             break
 
     if not password_resp or password_resp.status_code != 200:
+        _warn("password/verify 未通过，尝试验证码登录接口")
+        otp_login_account = _try_login_via_email_otp_api(current_url)
+        if otp_login_account:
+            return otp_login_account
+
         # 该登录链路下 authorize/continue 不接受 password 参数，继续重试只会产生 unknown_parameter 噪音。
-        # 因此直接按密码登录失败返回，由上层决定换号补位。
+        # 已尝试验证码接口后仍失败，按密码登录失败返回，由上层决定补位。
         snippet = (
             (password_resp.text[:500] if password_resp is not None else "")
             or "无响应"
         )
-        if "invalid_username_or_password" in snippet.lower():
+        if mark_bad_email_on_invalid_pwd and "invalid_username_or_password" in snippet.lower():
             _mark_graph_bad_email(email, "invalid_username_or_password")
         _err(f"登录密码步骤失败: {snippet}")
         return None
@@ -3017,18 +3326,7 @@ def _login_via_password_and_finish_oauth(
     if not solved:
         return None
     if "code=" in current_url and "state=" in current_url:
-        try:
-            account = submit_callback_url(
-                callback_url=current_url,
-                code_verifier=oauth.code_verifier,
-                redirect_uri=oauth.redirect_uri,
-                expected_state=oauth.state,
-            )
-            _info("OAuth 换 token 成功")
-            return account
-        except Exception as e:
-            _err(f"交换 token 失败: {e}")
-            return None
+        return _submit_callback_or_none(current_url, success_msg="OAuth 换 token 成功")
 
     if current_url.rstrip("/").endswith(
         "/email-verification"
@@ -3052,7 +3350,32 @@ def _login_via_password_and_finish_oauth(
             _err(f"登录 OTP 发送失败: {otp_resp.text[:300]}")
             return None
 
-        code = get_oai_code(dev_token, email, proxies)
+        def _resend_login_otp_once() -> bool:
+            resend_resp = _post_with_retry(
+                s,
+                "https://auth.openai.com/api/accounts/email-otp/send",
+                headers={
+                    "referer": current_url,
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                json_body={},
+                proxies=proxies,
+                timeout=30,
+                retries=1,
+            )
+            _info(f"登录 OTP 重发 HTTP {resend_resp.status_code}")
+            if resend_resp.status_code != 200:
+                _warn(f"登录 OTP 重发异常: {resend_resp.text[:300]}")
+            return resend_resp.status_code == 200
+
+        code = get_oai_code_with_single_resend(
+            dev_token,
+            email,
+            proxies,
+            resend_once_cb=_resend_login_otp_once,
+            scene="登录 OTP",
+        )
         if not code:
             _err("登录流程未收到邮箱验证码")
             return None
@@ -3102,18 +3425,7 @@ def _login_via_password_and_finish_oauth(
         if not solved:
             return None
         if "code=" in current_url and "state=" in current_url:
-            try:
-                account = submit_callback_url(
-                    callback_url=current_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
-                _info("OAuth 换 token 成功（登录 OTP 后）")
-                return account
-            except Exception as e:
-                _err(f"交换 token 失败: {e}")
-                return None
+            return _submit_callback_or_none(current_url, success_msg="OAuth 换 token 成功（登录 OTP 后）")
 
     solved, current_url, _ = _handle_add_phone_challenge(
         s,
@@ -3211,18 +3523,7 @@ def _login_via_password_and_finish_oauth(
             break
         next_url = urllib.parse.urljoin(current_url, location)
         if "code=" in next_url and "state=" in next_url:
-            try:
-                account = submit_callback_url(
-                    callback_url=next_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
-                _info("OAuth 换 token 成功")
-                return account
-            except Exception as e:
-                _err(f"交换 token 失败: {e}")
-                return None
+            return _submit_callback_or_none(next_url, success_msg="OAuth 换 token 成功")
         current_url = next_url
 
     _err("登录重定向链未出现带 code 的 callback")
@@ -3316,8 +3617,30 @@ def run(proxy: Optional[str]):
             loc_re = re.search(r"^loc=(.+)$", trace, re.MULTILINE)
             loc = loc_re.group(1) if loc_re else None
             _info(f"当前 IP 地区: {loc}")
-            if loc in ("CN", "HK"):
+            oai_loc = None
+            try:
+                oai_trace = _session_get_with_tls_retry(
+                    s,
+                    "https://auth.openai.com/cdn-cgi/trace",
+                    proxies=proxies,
+                    allow_redirects=True,
+                    timeout=15,
+                ).text
+                oai_loc_re = re.search(r"^loc=(.+)$", oai_trace, re.MULTILINE)
+                oai_loc = oai_loc_re.group(1) if oai_loc_re else None
+                if oai_loc:
+                    _info(f"OpenAI 入口地区: {oai_loc}")
+            except Exception:
+                oai_loc = None
+
+            if loc in ("CN", "HK") or oai_loc in ("CN", "HK"):
                 raise RuntimeError("当前出口地区不可用，请更换代理")
+            if loc and oai_loc and loc != oai_loc:
+                _warn(
+                    "地区检测存在差异："
+                    f"cloudflare={loc}, openai={oai_loc}，"
+                    "后续仍可能触发区域限制"
+                )
         except UserStoppedError:
             raise
         except Exception as e:
@@ -3432,13 +3755,70 @@ def run(proxy: Optional[str]):
             _err(f"user/register 失败: {pwd_resp.text[:400]}")
             provider = normalize_mail_provider(MAIL_SERVICE_PROVIDER)
             fail_text = str(pwd_resp.text or "")
+            fail_text_low = fail_text.lower()
             if (
                 provider == "graph"
                 and pwd_resp.status_code == 400
-                and "Failed to register username" in fail_text
+                and "failed to register username" in fail_text_low
             ):
-                _mark_graph_bad_email(email, "疑似已使用/不可注册")
-            return _fail("", "register_password_failed", f"HTTP {pwd_resp.status_code}")
+                _mark_graph_registered_email(email, proxies=proxies, remark="已注册")
+                _warn("检测到邮箱疑似已注册，尝试直接登录换取 token")
+                login_pw_candidates: list[str] = []
+                if password:
+                    login_pw_candidates.append(password)
+                graph_pwd = _graph_password_for_email(email)
+                if graph_pwd and graph_pwd not in login_pw_candidates:
+                    login_pw_candidates.append(graph_pwd)
+
+                for idx, login_pwd in enumerate(login_pw_candidates, start=1):
+                    if not login_pwd:
+                        continue
+                    if login_pwd != password:
+                        _info(f"补救登录密码源 #{idx}: graph_accounts")
+                    try:
+                        account = _login_via_password_and_finish_oauth(
+                            email,
+                            login_pwd,
+                            dev_token,
+                            proxies,
+                            mark_bad_email_on_invalid_pwd=False,
+                        )
+                    except HeroSmsBalanceLowError as e:
+                        return _fail(
+                            password,
+                            "phone_balance_insufficient",
+                            str(e or "HeroSMS 余额不足")[:220],
+                        )
+                    except RegionBlockedError as e:
+                        return _fail(
+                            password,
+                            "region_blocked",
+                            str(e or "区域不可用")[:220],
+                        )
+                    except HeroSmsCountryBlockedError as e:
+                        return _fail(
+                            password,
+                            "phone_country_blocked",
+                            str(e or "区域不可用")[:220],
+                        )
+                    except HeroSmsCodeTimeoutError as e:
+                        return _fail(
+                            password,
+                            "phone_sms_timeout",
+                            str(e or "接码超时")[:220],
+                        )
+
+                    if account:
+                        _mark_graph_bad_email(email, "注册成功后已消费")
+                        return _ok(account, login_pwd)
+
+                _warn("该邮箱疑似已注册但登录换 token 失败：保留账号，不删除")
+                return _fail(
+                    password,
+                    "register_password_failed",
+                    f"HTTP {pwd_resp.status_code}; existing_account_login_failed",
+                )
+            return _fail(password, "register_password_failed", f"HTTP {pwd_resp.status_code}")
 
         try:
             register_json = pwd_resp.json()
@@ -3483,7 +3863,32 @@ def run(proxy: Optional[str]):
             except Exception as e:
                 _warn(f"OTP 发送请求异常: {e}")
 
-            code = get_oai_code(dev_token, email, proxies)
+            def _resend_register_otp_once() -> bool:
+                resend_resp = _post_with_retry(
+                    s,
+                    send_otp_url,
+                    headers={
+                        "referer": "https://auth.openai.com/create-account/password",
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                        "openai-sentinel-token": sentinel,
+                    },
+                    proxies=proxies,
+                    timeout=30,
+                    retries=1,
+                )
+                _info(f"OTP 重发 HTTP {resend_resp.status_code}")
+                if resend_resp.status_code != 200:
+                    _warn(f"OTP 重发异常: {resend_resp.text[:300]}")
+                return resend_resp.status_code == 200
+
+            code = get_oai_code_with_single_resend(
+                dev_token,
+                email,
+                proxies,
+                resend_once_cb=_resend_register_otp_once,
+                scene="注册 OTP",
+            )
             if not code:
                 return _fail(password, "otp_timeout", "未收到验证码")
 
@@ -3564,9 +3969,17 @@ def run(proxy: Optional[str]):
 
         if create_account_status != 200:
             fail_body = create_account_resp.text or ""
+            fail_body_low = fail_body.lower()
             if "registration_disallowed" in fail_body:
                 _warn(
                     "registration_disallowed（风控/频控）：建议拉长冷却、换 IP 或减少并发"
+                )
+            if _is_hero_sms_country_blocked_issue(fail_body_low):
+                _warn("检测到地区/国家不受支持（unsupported_country_region_territory）")
+                return _fail(
+                    password,
+                    "region_blocked",
+                    str(fail_body or "Country/Region not supported")[:220],
                 )
             _err(f"create_account 失败: {fail_body[:500]}")
             if "registration_disallowed" in fail_body and email_domain:
@@ -3618,6 +4031,12 @@ def run(proxy: Optional[str]):
                         "phone_balance_insufficient",
                         str(e or "HeroSMS 余额不足")[:220],
                     )
+                except RegionBlockedError as e:
+                    return _fail(
+                        password,
+                        "region_blocked",
+                        str(e or "区域不可用")[:220],
+                    )
                 except HeroSmsCountryBlockedError as e:
                     return _fail(
                         password,
@@ -3656,16 +4075,24 @@ def run(proxy: Optional[str]):
                 if follow_url:
                     workspace_hint_url = follow_url
                 if "code=" in follow_url and "state=" in follow_url:
-                    account = submit_callback_url(
-                        callback_url=follow_url,
-                        code_verifier=oauth.code_verifier,
-                        redirect_uri=oauth.redirect_uri,
-                        expected_state=oauth.state,
-                    )
+                    try:
+                        account = submit_callback_url(
+                            callback_url=follow_url,
+                            code_verifier=oauth.code_verifier,
+                            redirect_uri=oauth.redirect_uri,
+                            expected_state=oauth.state,
+                        )
+                    except Exception as e:
+                        msg = str(e)
+                        if _is_region_blocked_issue(msg):
+                            raise RegionBlockedError(msg)
+                        raise
                     _mark_graph_bad_email(email, "注册成功后已消费")
                     return _ok(account, password)
             except UserStoppedError:
                 raise
+            except RegionBlockedError as e:
+                return _fail(password, "region_blocked", str(e)[:220])
             except Exception as e:
                 _warn(f"访问 create_account continue_url: {e}")
 
@@ -3707,6 +4134,12 @@ def run(proxy: Optional[str]):
                     password,
                     "phone_balance_insufficient",
                     str(e or "HeroSMS 余额不足")[:220],
+                )
+            except RegionBlockedError as e:
+                return _fail(
+                    password,
+                    "region_blocked",
+                    str(e or "区域不可用")[:220],
                 )
             except HeroSmsCountryBlockedError as e:
                 return _fail(
@@ -3780,12 +4213,18 @@ def run(proxy: Optional[str]):
 
             next_url = urllib.parse.urljoin(current_url, location)
             if "code=" in next_url and "state=" in next_url:
-                account = submit_callback_url(
-                    callback_url=next_url,
-                    code_verifier=oauth.code_verifier,
-                    redirect_uri=oauth.redirect_uri,
-                    expected_state=oauth.state,
-                )
+                try:
+                    account = submit_callback_url(
+                        callback_url=next_url,
+                        code_verifier=oauth.code_verifier,
+                        redirect_uri=oauth.redirect_uri,
+                        expected_state=oauth.state,
+                    )
+                except Exception as e:
+                    msg = str(e)
+                    if _is_region_blocked_issue(msg):
+                        return _fail(password, "region_blocked", msg[:220])
+                    raise
                 _mark_graph_bad_email(email, "注册成功后已消费")
                 return _ok(account, password)
             current_url = next_url
@@ -3796,6 +4235,8 @@ def run(proxy: Optional[str]):
     except UserStoppedError:
         _warn("检测到停止指令，终止当前注册流程")
         return _fail("", "stopped_by_user", "用户停止任务")
+    except RegionBlockedError as e:
+        return _fail("", "region_blocked", str(e)[:220])
     except HeroSmsBalanceLowError as e:
         return _fail("", "phone_balance_insufficient", str(e)[:220])
     except HeroSmsCountryBlockedError as e:
@@ -3871,6 +4312,9 @@ def main() -> None:
                 break
             if str(meta.get("error_code") or "").strip().lower() == "phone_country_blocked":
                 _err("HeroSMS 国家受限，停止后续注册")
+                break
+            if str(meta.get("error_code") or "").strip().lower() == "region_blocked":
+                _err("OpenAI 区域不可用，停止后续注册")
                 break
 
             if account_data and isinstance(account_data, dict):

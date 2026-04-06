@@ -43,6 +43,11 @@ def mail_client_signature(service) -> tuple[Any, ...]:
     else:
         mail_domains = str(service.cfg.get("mail_domains") or "").strip()
     graph_accounts_file = str(service.cfg.get("graph_accounts_file") or "").strip()
+    graph_accounts_mode = str(service.cfg.get("graph_accounts_mode") or "file").strip().lower()
+    if graph_accounts_mode not in {"file", "api"}:
+        graph_accounts_mode = "file"
+    graph_api_base_url = str(service.cfg.get("graph_api_base_url") or "").strip()
+    graph_api_token = str(service.cfg.get("graph_api_token") or "").strip()
     graph_tenant = str(service.cfg.get("graph_tenant") or "common").strip()
     graph_fetch_mode = str(service.cfg.get("graph_fetch_mode") or "graph_api").strip()
     cf_temp_admin_auth = str(service.cfg.get("cf_temp_admin_auth") or "")
@@ -86,6 +91,9 @@ def mail_client_signature(service) -> tuple[Any, ...]:
         luckyous_variant_mode,
         luckyous_specified_email,
         graph_accounts_file,
+        graph_accounts_mode,
+        graph_api_base_url,
+        graph_api_token,
         graph_tenant,
         graph_fetch_mode,
         gmail_imap_user,
@@ -127,6 +135,9 @@ def get_mail_client(service):
         luckyous_variant_mode,
         luckyous_specified_email,
         graph_accounts_file,
+        graph_accounts_mode,
+        graph_api_base_url,
+        graph_api_token,
         graph_tenant,
         graph_fetch_mode,
         gmail_imap_user,
@@ -153,6 +164,11 @@ def get_mail_client(service):
     os.environ["LUCKYOUS_VARIANT_MODE"] = luckyous_variant_mode
     os.environ["LUCKYOUS_SPECIFIED_EMAIL"] = luckyous_specified_email
     os.environ["GRAPH_ACCOUNTS_FILE"] = graph_accounts_file
+    os.environ["GRAPH_ACCOUNTS_MODE"] = graph_accounts_mode
+    os.environ["GRAPH_API_BASE_URL"] = graph_api_base_url
+    os.environ["GRAPH_API_TOKEN"] = graph_api_token
+    os.environ["GRAPH_API_URL"] = graph_api_base_url
+    os.environ["MAIL_API_TOKEN"] = graph_api_token
     os.environ["GRAPH_TENANT"] = graph_tenant
     os.environ["GRAPH_FETCH_MODE"] = graph_fetch_mode
     os.environ["GMAIL_IMAP_USER"] = gmail_imap_user

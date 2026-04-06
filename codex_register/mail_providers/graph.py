@@ -13,6 +13,15 @@ def build_graph_service(
 ):
     return MicrosoftGraphService(
         accounts_file=str(os.getenv("GRAPH_ACCOUNTS_FILE", "") or ""),
+        accounts_mode=str(os.getenv("GRAPH_ACCOUNTS_MODE", "file") or "file"),
+        api_base_url=str(
+            os.getenv("GRAPH_API_BASE_URL", os.getenv("GRAPH_API_URL", ""))
+            or ""
+        ),
+        api_token=str(
+            os.getenv("GRAPH_API_TOKEN", os.getenv("MAIL_API_TOKEN", ""))
+            or ""
+        ),
         tenant=str(os.getenv("GRAPH_TENANT", "common") or "common"),
         fetch_mode=str(os.getenv("GRAPH_FETCH_MODE", "graph_api") or "graph_api"),
         verify_ssl=verify_ssl,

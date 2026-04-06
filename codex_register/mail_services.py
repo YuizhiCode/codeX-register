@@ -2121,12 +2121,18 @@ class MicrosoftGraphService(MailServiceBase):
         self,
         *,
         accounts_file: str,
+        accounts_mode: str = "file",
+        api_base_url: str = "",
+        api_token: str = "",
         tenant: str,
         fetch_mode: str,
         verify_ssl: bool,
         logger: Callable[[str], None] | None = None,
     ) -> None:
         self.accounts_file = str(accounts_file or "").strip() or "graph_accounts.txt"
+        self.accounts_mode = self._normalize_accounts_mode(accounts_mode)
+        self.api_base_url = self._normalize_api_base_url(api_base_url)
+        self.api_token = str(api_token or "").strip()
         self.tenant = str(tenant or "").strip() or "common"
         mode = str(fetch_mode or "").strip().lower()
         if mode not in {"graph_api", "imap_xoauth2"}:
@@ -2136,14 +2142,498 @@ class MicrosoftGraphService(MailServiceBase):
         self._logger = logger
         self._accounts: list[dict[str, Any]] = []
         self._next_idx = 0
-        self._load_accounts()
+        self._api_last_sync_at = 0.0
+        self._api_sync_interval = 45.0
+        self._api_account_id_map: dict[str, str] = {}
+        self._api_message_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        self._api_removed_accounts: set[str] = set()
+        self._api_accounts_discovered_by_scan = False
+        try:
+            scan_max = int(str(os.getenv("GRAPH_API_SCAN_MAX_ID", "80") or "80").strip())
+        except Exception:
+            scan_max = 80
+        try:
+            scan_miss = int(str(os.getenv("GRAPH_API_SCAN_MISS_LIMIT", "12") or "12").strip())
+        except Exception:
+            scan_miss = 12
+        try:
+            scan_timeout = float(
+                str(os.getenv("GRAPH_API_SCAN_REQ_TIMEOUT", "4") or "4").strip()
+            )
+        except Exception:
+            scan_timeout = 4.0
+        try:
+            scan_budget = float(
+                str(os.getenv("GRAPH_API_SCAN_BUDGET_SEC", "12") or "12").strip()
+            )
+        except Exception:
+            scan_budget = 12.0
+        self._api_scan_max_id = max(20, min(5000, scan_max))
+        self._api_scan_miss_limit = max(5, min(500, scan_miss))
+        self._api_scan_req_timeout = max(3.0, min(20.0, scan_timeout))
+        self._api_scan_budget_sec = max(5.0, min(120.0, scan_budget))
+        if self.accounts_mode == "file":
+            self._load_accounts()
         self._accounts_lock = None
 
     def _log(self, msg: str) -> None:
         if self._logger:
             self._logger(msg)
 
-    def _load_accounts(self) -> None:
+    @staticmethod
+    def _normalize_accounts_mode(raw_mode: Any) -> str:
+        val = str(raw_mode or "").strip().lower()
+        if val in {"api", "http", "interface", "openapi", "open_api", "remote"}:
+            return "api"
+        return "file"
+
+    @staticmethod
+    def _normalize_api_base_url(raw_url: Any) -> str:
+        text = str(raw_url or "").strip()
+        if not text:
+            return ""
+        if not re.match(r"^https?://", text, flags=re.IGNORECASE):
+            text = f"https://{text}"
+        return text.rstrip("/")
+
+    def _graph_api_mail_mode(self) -> str:
+        return "imap" if self.fetch_mode == "imap_xoauth2" else "graph"
+
+    @staticmethod
+    def _api_message_id(mailbox: str, message_id: str) -> str:
+        mb = urllib.parse.quote(str(mailbox or "").strip().lower(), safe="")
+        mid = urllib.parse.quote(str(message_id or "").strip(), safe="")
+        return f"open:{mb}:{mid}"
+
+    @staticmethod
+    def _parse_api_message_id(raw_id: str) -> tuple[str, str]:
+        target = str(raw_id or "").strip()
+        parts = target.split(":", 2)
+        if len(parts) != 3 or parts[0] != "open":
+            raise MailServiceError("Graph 接口邮件 ID 格式无效")
+        mailbox = urllib.parse.unquote(str(parts[1] or "").strip())
+        message_id = urllib.parse.unquote(str(parts[2] or "").strip())
+        if not mailbox or "@" not in mailbox:
+            raise MailServiceError("Graph 接口邮件 ID 缺少邮箱地址")
+        if not message_id:
+            raise MailServiceError("Graph 接口邮件 ID 缺少 message_id")
+        return mailbox.lower(), message_id
+
+    def _api_headers(self) -> dict[str, str]:
+        token = str(self.api_token or "").strip()
+        headers = {
+            "Accept": "application/json",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["x-mail-api-token"] = token
+            headers["x-api-token"] = token
+            headers["x-ingest-token"] = token
+        return headers
+
+    @staticmethod
+    def _api_error_message(payload: Any, text: str = "") -> str:
+        if isinstance(payload, dict):
+            for key in ("message", "error", "msg", "detail"):
+                val = str(payload.get(key) or "").strip()
+                if val:
+                    return val
+        return str(text or "").strip()
+
+    @classmethod
+    def _is_api_token_invalid(cls, status: int, payload: Any, text: str = "") -> bool:
+        if int(status or 0) not in {401, 403}:
+            return False
+        msg = cls._api_error_message(payload, text)
+        low = msg.lower()
+        keywords = [
+            "开放接口令牌无效",
+            "令牌无效",
+            "token 无效",
+            "token invalid",
+            "invalid token",
+            "bad token",
+            "api token",
+            "mail_api_token",
+        ]
+        return any(k in low for k in [x.lower() for x in keywords])
+
+    @classmethod
+    def _is_api_login_required(cls, status: int, payload: Any, text: str = "") -> bool:
+        if int(status or 0) not in {401, 403}:
+            return False
+        msg = cls._api_error_message(payload, text)
+        low = msg.lower()
+        keywords = [
+            "未登录",
+            "登录已过期",
+            "login",
+            "not logged",
+            "session",
+            "cookie",
+            "unauthorized",
+            "forbidden",
+        ]
+        return any(k in low for k in [x.lower() for x in keywords])
+
+    def _api_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        proxies: Any = None,
+        timeout: int = 25,
+    ) -> tuple[int, Any, str]:
+        if self.accounts_mode != "api":
+            raise MailServiceError("当前 Graph 账号模式不是接口模式")
+        if not self.api_base_url:
+            raise MailServiceError("请先填写 Graph 接口地址（graph_api_base_url）")
+        if not self.api_token:
+            raise MailServiceError("请先填写 Graph 接口令牌（graph_api_token）")
+
+        p = str(path or "").strip()
+        if not p:
+            raise MailServiceError("Graph 接口请求路径不能为空")
+        if p.startswith("http://") or p.startswith("https://"):
+            url = p
+        else:
+            if not p.startswith("/"):
+                p = f"/{p}"
+            url = f"{self.api_base_url}{p}"
+
+        def _send(req_params: dict[str, Any] | None) -> tuple[int, Any, str]:
+            try:
+                resp = requests.request(
+                    method=method,
+                    url=url,
+                    params=req_params,
+                    json=json_body,
+                    headers=self._api_headers(),
+                    proxies=proxies,
+                    impersonate="chrome",
+                    verify=self.verify_ssl,
+                    timeout=max(10, int(timeout)),
+                )
+            except Exception as e:
+                raise MailServiceError(f"Graph 接口请求失败: {e}") from e
+
+            status = int(resp.status_code or 0)
+            text = _safe_text(getattr(resp, "text", ""), limit=800)
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+            return status, payload, text
+
+        base_params = dict(params or {})
+        status, payload, text = _send(base_params or None)
+        if status in {401, 403}:
+            low_keys = {str(k or "").strip().lower() for k in base_params.keys()}
+            if "token" not in low_keys:
+                retry_params = dict(base_params)
+                retry_params["token"] = self.api_token
+                retry_status, retry_payload, retry_text = _send(retry_params)
+                if (200 <= retry_status < 300) or self._is_api_token_invalid(
+                    retry_status,
+                    retry_payload,
+                    retry_text,
+                ):
+                    return retry_status, retry_payload, retry_text
+        return status, payload, text
+
+    @staticmethod
+    def _extract_sender_text(raw_sender: Any) -> str:
+        if isinstance(raw_sender, dict):
+            email_addr = raw_sender.get("emailAddress")
+            if isinstance(email_addr, dict):
+                name = str(email_addr.get("name") or "").strip()
+                addr = str(email_addr.get("address") or "").strip()
+                if name and addr:
+                    return f"{name} <{addr}>"
+                return addr or name
+            name = str(raw_sender.get("name") or "").strip()
+            addr = str(raw_sender.get("address") or raw_sender.get("email") or "").strip()
+            if name and addr:
+                return f"{name} <{addr}>"
+            return addr or name
+        return str(raw_sender or "").strip()
+
+    @staticmethod
+    def _strip_html_text(raw_html: Any) -> str:
+        text = str(raw_html or "")
+        text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return " ".join(text.split())
+
+    def _extract_api_messages(self, payload: Any) -> list[dict[str, Any]]:
+        arrays: list[Any] = []
+        if isinstance(payload, list):
+            arrays.append(payload)
+        elif isinstance(payload, dict):
+            for key in ("messages", "items", "value", "results", "rows", "list", "data"):
+                val = payload.get(key)
+                if isinstance(val, list):
+                    arrays.append(val)
+                elif isinstance(val, dict):
+                    for sub in ("messages", "items", "value", "results", "rows", "list"):
+                        sub_val = val.get(sub)
+                        if isinstance(sub_val, list):
+                            arrays.append(sub_val)
+        if not arrays:
+            return []
+
+        out: list[dict[str, Any]] = []
+        for arr in arrays:
+            for it in arr:
+                if isinstance(it, dict):
+                    out.append(it)
+            if out:
+                break
+        return out
+
+    def _extract_api_accounts(self, payload: Any) -> list[dict[str, Any]]:
+        arrays: list[Any] = []
+        if isinstance(payload, list):
+            arrays.append(payload)
+        elif isinstance(payload, dict):
+            for key in ("items", "accounts", "value", "results", "rows", "list", "data"):
+                val = payload.get(key)
+                if isinstance(val, list):
+                    arrays.append(val)
+                elif isinstance(val, dict):
+                    for sub in ("items", "accounts", "value", "results", "rows", "list"):
+                        sub_val = val.get(sub)
+                        if isinstance(sub_val, list):
+                            arrays.append(sub_val)
+        if not arrays:
+            return []
+        out: list[dict[str, Any]] = []
+        for arr in arrays:
+            for it in arr:
+                if isinstance(it, dict):
+                    out.append(it)
+            if out:
+                break
+        return out
+
+    @staticmethod
+    def _normalize_api_account(item: dict[str, Any]) -> dict[str, Any] | None:
+        account = str(
+            item.get("account")
+            or item.get("email")
+            or item.get("address")
+            or item.get("mailbox")
+            or ""
+        ).strip().lower()
+        if "<" in account and ">" in account:
+            m = re.search(r"<([^>]+@[^>]+)>", account)
+            if m:
+                account = str(m.group(1) or "").strip().lower()
+        if not account or "@" not in account:
+            return None
+
+        account_id = str(
+            item.get("id")
+            or item.get("account_id")
+            or item.get("accountId")
+            or ""
+        ).strip()
+        return {
+            "email": account,
+            "password": str(item.get("password") or "").strip(),
+            "client_id": str(item.get("client_id") or item.get("clientId") or "").strip(),
+            "refresh_token": str(item.get("refresh_token") or item.get("refreshToken") or "").strip(),
+            "access_token": "",
+            "access_expire_at": 0.0,
+            "account_id": account_id,
+            "remark": str(item.get("remark") or item.get("note") or "").strip(),
+        }
+
+    @staticmethod
+    def _api_open_messages_account_from_payload(payload: Any) -> str:
+        boxes: list[dict[str, Any]] = []
+        if isinstance(payload, dict):
+            boxes.append(payload)
+            data = payload.get("data")
+            if isinstance(data, dict):
+                boxes.append(data)
+
+        for box in boxes:
+            for key in ("account", "email", "address", "mailbox"):
+                val = str(box.get(key) or "").strip().lower()
+                if "<" in val and ">" in val:
+                    m = re.search(r"<([^>]+@[^>]+)>", val)
+                    if m:
+                        val = str(m.group(1) or "").strip().lower()
+                if val and "@" in val:
+                    return val
+        return ""
+
+    def _discover_api_accounts_by_id_scan(self, *, proxies: Any = None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        miss_streak = 0
+        mode = self._graph_api_mail_mode()
+        start_at = time.time()
+        timeout_s = max(3, int(round(self._api_scan_req_timeout)))
+
+        for aid in range(1, self._api_scan_max_id + 1):
+            if (time.time() - start_at) >= self._api_scan_budget_sec:
+                break
+
+            hit = False
+            any_non_404 = False
+
+            status, payload, text = self._api_request(
+                "POST",
+                "/api/open/messages",
+                json_body={"id": aid},
+                proxies=proxies,
+                timeout=timeout_s,
+            )
+            if self._is_api_token_invalid(status, payload, text):
+                raise MailServiceError(
+                    "Graph 接口模式鉴权失败：开放接口 token 无效。"
+                    "请填写上游 MAIL_API_TOKEN（不是后台登录密码）。"
+                )
+
+            if status != 404:
+                any_non_404 = True
+            if 200 <= status < 300:
+                email_val = self._api_open_messages_account_from_payload(payload)
+                if email_val and (email_val not in seen) and (email_val not in self._api_removed_accounts):
+                    seen.add(email_val)
+                    rows.append(
+                        {
+                            "email": email_val,
+                            "password": "",
+                            "client_id": "",
+                            "refresh_token": "",
+                            "access_token": "",
+                            "access_expire_at": 0.0,
+                            "account_id": str(aid),
+                        }
+                    )
+                hit = True
+            else:
+                msg = self._api_error_message(payload, text).lower()
+                if (status in {400, 422}) and ("mode" in msg):
+                    s2, p2, t2 = self._api_request(
+                        "POST",
+                        "/api/open/messages",
+                        json_body={"id": aid, "mode": mode},
+                        proxies=proxies,
+                        timeout=timeout_s,
+                    )
+                    if self._is_api_token_invalid(s2, p2, t2):
+                        raise MailServiceError(
+                            "Graph 接口模式鉴权失败：开放接口 token 无效。"
+                            "请填写上游 MAIL_API_TOKEN（不是后台登录密码）。"
+                        )
+                    if s2 != 404:
+                        any_non_404 = True
+                    if 200 <= s2 < 300:
+                        email_val = self._api_open_messages_account_from_payload(p2)
+                        if email_val and (email_val not in seen) and (email_val not in self._api_removed_accounts):
+                            seen.add(email_val)
+                            rows.append(
+                                {
+                                    "email": email_val,
+                                    "password": "",
+                                    "client_id": "",
+                                    "refresh_token": "",
+                                    "access_token": "",
+                                    "access_expire_at": 0.0,
+                                    "account_id": str(aid),
+                                }
+                            )
+                        hit = True
+
+            if hit:
+                miss_streak = 0
+            else:
+                if (not any_non_404) and (not rows):
+                    break
+                miss_streak += 1
+                if miss_streak >= self._api_scan_miss_limit:
+                    break
+
+        return rows
+
+    def _load_accounts_from_api(self, *, proxies: Any = None) -> list[dict[str, Any]]:
+        pre_status, pre_payload, pre_text = self._api_request(
+            "POST",
+            "/api/open/messages",
+            json_body={"id": 1},
+            proxies=proxies,
+            timeout=max(5, int(round(self._api_scan_req_timeout))),
+        )
+        if self._is_api_token_invalid(pre_status, pre_payload, pre_text):
+            raise MailServiceError(
+                "Graph 接口模式鉴权失败：开放接口 token 无效。"
+                "请填写上游 MAIL_API_TOKEN（不是后台登录密码）。"
+            )
+
+        paths = [
+            "/api/open/accounts",
+            "/api/open/accounts/list",
+            "/api/open/accounts/all",
+            "/api/open/mailboxes",
+            "/api/open/mailbox/list",
+        ]
+        last_err = ""
+        for path in paths:
+            status, payload, text = self._api_request("GET", path, proxies=proxies, timeout=30)
+            if status == 404:
+                continue
+            if not (200 <= status < 300):
+                err_detail = self._api_error_message(payload, text)
+                if self._is_api_token_invalid(status, payload, text):
+                    raise MailServiceError(
+                        "Graph 接口模式鉴权失败：开放接口 token 无效。"
+                        "请填写上游 MAIL_API_TOKEN（不是后台登录密码）。"
+                    )
+                last_err = f"{path} HTTP {status}: {err_detail or text}"
+                if self._is_api_login_required(status, payload, text):
+                    break
+                continue
+
+            rows: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for item in self._extract_api_accounts(payload):
+                row = self._normalize_api_account(item)
+                if not row:
+                    continue
+                email_val = str(row.get("email") or "").strip().lower()
+                if not email_val or email_val in seen:
+                    continue
+                if email_val in self._api_removed_accounts:
+                    continue
+                seen.add(email_val)
+                rows.append(row)
+
+            if rows:
+                self._api_accounts_discovered_by_scan = False
+                return rows
+            last_err = f"{path} 返回成功但未包含可用账号列表"
+
+        scanned_rows = self._discover_api_accounts_by_id_scan(proxies=proxies)
+        if scanned_rows:
+            self._api_accounts_discovered_by_scan = True
+            return scanned_rows
+
+        raise MailServiceError(
+            "Graph 接口模式无法获取账号列表："
+            "上游未开放账号列表接口，且通过账号 ID 扫描未发现可用账号。"
+            f"（扫描范围 1..{self._api_scan_max_id}，连续空洞阈值 {self._api_scan_miss_limit}，"
+            f"单次扫描预算 {int(self._api_scan_budget_sec)}s）"
+            f"{('；最后错误: ' + last_err) if last_err else ''}"
+        )
+
+    def _load_accounts_from_file(self) -> list[dict[str, Any]]:
         path = os.path.abspath(os.path.expanduser(self.accounts_file))
         self._accounts_file_path = path
         if not os.path.isfile(path):
@@ -2178,11 +2668,50 @@ class MicrosoftGraphService(MailServiceBase):
                     )
         except Exception as e:
             raise MailServiceError(f"读取 Graph 账号文件失败: {e}") from e
+        return rows
+
+    def _sync_api_account_index(self) -> None:
+        mp: dict[str, str] = {}
+        for acc in self._accounts:
+            email_val = str((acc or {}).get("email") or "").strip().lower()
+            aid = str((acc or {}).get("account_id") or "").strip()
+            if email_val and aid:
+                mp[email_val] = aid
+        self._api_account_id_map = mp
+
+    def _refresh_api_accounts_if_needed(self, *, proxies: Any = None, force: bool = False) -> None:
+        if self.accounts_mode != "api":
+            return
+        now = time.time()
+        interval = float(self._api_sync_interval)
+        if self._api_accounts_discovered_by_scan:
+            interval = max(interval, 300.0)
+        if (not force) and self._accounts and (now - self._api_last_sync_at) < interval:
+            return
+        rows = self._load_accounts_from_api(proxies=proxies)
+        if not rows:
+            raise MailServiceError("Graph 接口账号池为空，无法继续")
+        self._accounts = rows
+        self._api_last_sync_at = now
+        self._sync_api_account_index()
+
+    def _load_accounts(self) -> None:
+        if self.accounts_mode == "api":
+            self._accounts = self._load_accounts_from_api(proxies=None)
+            if not self._accounts:
+                raise MailServiceError("Graph 接口账号池为空")
+            self._api_last_sync_at = time.time()
+            self._sync_api_account_index()
+            return
+
+        rows = self._load_accounts_from_file()
         if not rows:
             raise MailServiceError("Graph 账号文件为空或格式无效")
         self._accounts = rows
 
     def _save_accounts_refresh_tokens(self) -> None:
+        if self.accounts_mode == "api":
+            return
         fp = str(getattr(self, "_accounts_file_path", "") or "").strip()
         if not fp:
             return
@@ -2209,6 +2738,8 @@ class MicrosoftGraphService(MailServiceBase):
         target = str(email_addr or "").strip().lower()
         if not target or "@" not in target:
             return False
+        if self.accounts_mode == "api":
+            self._api_removed_accounts.add(target)
         before = len(self._accounts)
         self._accounts = [
             x for x in self._accounts
@@ -2218,6 +2749,8 @@ class MicrosoftGraphService(MailServiceBase):
             return False
         if self._next_idx >= len(self._accounts):
             self._next_idx = 0
+        if self.accounts_mode == "api":
+            self._sync_api_account_index()
         self._save_accounts_refresh_tokens()
         return True
 
@@ -2225,10 +2758,156 @@ class MicrosoftGraphService(MailServiceBase):
         target = str(mailbox or "").strip().lower()
         if not target:
             raise MailServiceError("邮箱地址不能为空")
+
+        if self.accounts_mode == "api":
+            self._refresh_api_accounts_if_needed()
         for acc in self._accounts:
             if str(acc.get("email") or "").strip().lower() == target:
                 return acc
+        if self.accounts_mode == "api":
+            self._refresh_api_accounts_if_needed(force=True)
+            for acc in self._accounts:
+                if str(acc.get("email") or "").strip().lower() == target:
+                    return acc
+            raise MailServiceError(f"Graph 接口账号池中不存在该邮箱: {target}")
         raise MailServiceError(f"Graph 账号文件中不存在该邮箱: {target}")
+
+    @staticmethod
+    def _extract_api_account_payload(payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            for key in ("data", "item", "account", "result", "row"):
+                val = payload.get(key)
+                if isinstance(val, dict):
+                    return val
+            return payload
+        if isinstance(payload, list):
+            for it in payload:
+                if isinstance(it, dict):
+                    return it
+        return {}
+
+    @staticmethod
+    def _pick_str_value(*pairs: tuple[dict[str, Any], tuple[str, ...]]) -> str:
+        for src, keys in pairs:
+            if not isinstance(src, dict):
+                continue
+            for key in keys:
+                val = src.get(key)
+                if val is None:
+                    continue
+                text = str(val).strip()
+                if text:
+                    return text
+        return ""
+
+    def _load_api_account_detail(self, account_id: str, *, proxies: Any = None) -> dict[str, Any]:
+        aid = str(account_id or "").strip()
+        if not aid:
+            return {}
+        status, payload, text = self._api_request(
+            "GET",
+            f"/api/accounts/{urllib.parse.quote(aid, safe='')}",
+            proxies=proxies,
+            timeout=25,
+        )
+        if status == 404:
+            return {}
+        if not (200 <= status < 300):
+            if self._is_api_token_invalid(status, payload, text):
+                raise MailServiceError(
+                    "Graph 接口模式鉴权失败：开放接口 token 无效。"
+                    "请检查 graph_api_token 是否与上游 MAIL_API_TOKEN 一致。"
+                )
+            detail = self._api_error_message(payload, text)
+            raise MailServiceError(
+                f"Graph 接口读取账号详情失败: /api/accounts/{aid} HTTP {status}: {detail or text}"
+            )
+        return self._extract_api_account_payload(payload)
+
+    def mark_account_registered(
+        self,
+        mailbox: str,
+        *,
+        remark: str = "已注册",
+        proxies: Any = None,
+    ) -> bool:
+        if self.accounts_mode != "api":
+            return False
+
+        target = str(mailbox or "").strip().lower()
+        if not target or "@" not in target:
+            return False
+
+        acc = self._find_account(target)
+        account_id = str(acc.get("account_id") or self._api_account_id_map.get(target) or "").strip()
+        if not account_id:
+            return False
+
+        detail = {}
+        try:
+            detail = self._load_api_account_detail(account_id, proxies=proxies)
+        except Exception:
+            detail = {}
+
+        account_val = self._pick_str_value(
+            (detail, ("account", "email", "address", "mailbox")),
+            (acc, ("email",)),
+        )
+        password_val = self._pick_str_value(
+            (detail, ("password",)),
+            (acc, ("password",)),
+        )
+        client_id_val = self._pick_str_value(
+            (detail, ("clientId", "client_id")),
+            (acc, ("client_id", "clientId")),
+        )
+        refresh_token_val = self._pick_str_value(
+            (detail, ("refreshToken", "refresh_token")),
+            (acc, ("refresh_token", "refreshToken")),
+        )
+        if not account_val or "@" not in account_val:
+            account_val = target
+
+        missing: list[str] = []
+        if not account_val:
+            missing.append("account")
+        if not password_val:
+            missing.append("password")
+        if not client_id_val:
+            missing.append("clientId")
+        if not refresh_token_val:
+            missing.append("refreshToken")
+        if missing:
+            raise MailServiceError(
+                "Graph 接口更新账号备注失败：缺少字段 "
+                + ", ".join(missing)
+            )
+
+        body = {
+            "account": account_val,
+            "password": password_val,
+            "clientId": client_id_val,
+            "refreshToken": refresh_token_val,
+            "remark": str(remark or "已注册").strip() or "已注册",
+        }
+        status, payload, text = self._api_request(
+            "PUT",
+            f"/api/accounts/{urllib.parse.quote(account_id, safe='')}",
+            json_body=body,
+            proxies=proxies,
+            timeout=25,
+        )
+        if not (200 <= status < 300):
+            detail_msg = self._api_error_message(payload, text)
+            raise MailServiceError(
+                f"Graph 接口更新账号备注失败: /api/accounts/{account_id} HTTP {status}: {detail_msg or text}"
+            )
+
+        acc["password"] = password_val
+        acc["client_id"] = client_id_val
+        acc["refresh_token"] = refresh_token_val
+        acc["remark"] = body["remark"]
+        return True
 
     def _token_url(self) -> str:
         return f"https://login.microsoftonline.com/{urllib.parse.quote(self.tenant, safe='')}/oauth2/v2.0/token"
@@ -2387,8 +3066,189 @@ class MicrosoftGraphService(MailServiceBase):
     def _imap_message_id(folder: str, uid: str) -> str:
         return f"imap:{folder}:{uid}"
 
+    @staticmethod
+    def _extract_api_message_uid(item: dict[str, Any], idx: int) -> str:
+        for key in (
+            "id",
+            "message_id",
+            "messageId",
+            "uid",
+            "internetMessageId",
+            "mail_id",
+            "mailId",
+        ):
+            val = str(item.get(key) or "").strip()
+            if val:
+                return val
+        return f"msg-{idx}"
+
+    @staticmethod
+    def _extract_api_message_date(item: dict[str, Any]) -> str:
+        for key in (
+            "receivedAt",
+            "received_at",
+            "receivedDateTime",
+            "date",
+            "created_at",
+            "createdAt",
+            "time",
+            "timestamp",
+        ):
+            val = str(item.get(key) or "").strip()
+            if val:
+                return val
+        return "-"
+
+    def _api_message_detail_from_item(self, mailbox: str, item: dict[str, Any], idx: int) -> dict[str, Any]:
+        mid = self._extract_api_message_uid(item, idx)
+        sender = self._extract_sender_text(item.get("from") or item.get("sender")) or "-"
+        subject = str(item.get("subject") or item.get("title") or "(无主题)")
+        date_val = self._extract_api_message_date(item)
+
+        body_obj = item.get("body") if isinstance(item.get("body"), dict) else {}
+        text = str(
+            item.get("text")
+            or item.get("plain")
+            or item.get("plainText")
+            or body_obj.get("text")
+            or body_obj.get("plain")
+            or ""
+        )
+        html = str(
+            item.get("html")
+            or item.get("html_content")
+            or item.get("htmlBody")
+            or body_obj.get("html")
+            or (
+                body_obj.get("content")
+                if str(body_obj.get("contentType") or "").strip().lower() == "html"
+                else ""
+            )
+            or ""
+        )
+
+        content_type = str(item.get("contentType") or body_obj.get("contentType") or "").strip().lower()
+        content_val = str(item.get("content") or "")
+        if content_val:
+            if content_type == "html":
+                html = html or content_val
+            else:
+                text = text or content_val
+
+        preview = str(
+            item.get("preview")
+            or item.get("intro")
+            or item.get("snippet")
+            or item.get("bodyPreview")
+            or text
+            or self._strip_html_text(html)
+            or ""
+        )
+        preview = " ".join(str(preview or "").split())
+        if len(preview) > 220:
+            preview = preview[:220] + "…"
+
+        raw_json = json.dumps(item, ensure_ascii=False)
+        plain = text or self._strip_html_text(html)
+        content = self.merge_mail_content(
+            {
+                "subject": subject,
+                "intro": preview,
+                "text": plain,
+                "html": html,
+                "raw": raw_json,
+            }
+        )
+        return {
+            "id": self._api_message_id(mailbox, mid),
+            "raw_message_id": mid,
+            "mailbox": mailbox,
+            "from": sender,
+            "subject": subject,
+            "date": date_val,
+            "preview": preview,
+            "text": plain,
+            "html": html,
+            "raw": raw_json,
+            "content": content,
+            "payload": item,
+        }
+
+    def _cache_api_message_rows(self, mailbox: str, details: list[dict[str, Any]]) -> None:
+        target = str(mailbox or "").strip().lower()
+        if not target:
+            return
+        box_cache = self._api_message_cache.get(target)
+        if not isinstance(box_cache, dict):
+            box_cache = {}
+        for row in details:
+            rid = str((row or {}).get("raw_message_id") or "").strip()
+            if rid:
+                box_cache[rid] = dict(row)
+        self._api_message_cache[target] = box_cache
+
+    def _load_api_messages_for_mailbox(self, mailbox: str, *, proxies: Any = None) -> list[dict[str, Any]]:
+        target = str(mailbox or "").strip().lower()
+        if not target or "@" not in target:
+            raise MailServiceError("邮箱地址不能为空")
+
+        account_id = str(self._api_account_id_map.get(target) or "").strip()
+        if not account_id:
+            try:
+                self._refresh_api_accounts_if_needed(proxies=proxies)
+                account_id = str(self._api_account_id_map.get(target) or "").strip()
+            except Exception:
+                account_id = ""
+        mode = self._graph_api_mail_mode()
+
+        reqs: list[tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]] = []
+        if account_id:
+            reqs.append(("GET", f"/api/open/accounts/{urllib.parse.quote(account_id, safe='')}/messages", {"mode": mode}, None))
+            reqs.append(("GET", f"/api/open/accounts/{urllib.parse.quote(account_id, safe='')}/messages", None, None))
+        reqs.append(("POST", "/api/open/messages", None, {"account": target}))
+        reqs.append(("POST", "/api/open/messages", None, {"email": target}))
+        reqs.append(("POST", "/api/open/messages", None, {"mailbox": target}))
+        reqs.append(("GET", "/api/open/messages", {"account": target}, None))
+        reqs.append(("POST", "/api/open/messages", None, {"account": target, "mode": mode}))
+        reqs.append(("POST", "/api/open/messages", None, {"email": target, "mode": mode}))
+        reqs.append(("POST", "/api/open/messages", None, {"mailbox": target, "mode": mode}))
+        reqs.append(("GET", "/api/open/messages", {"account": target, "mode": mode}, None))
+
+        last_err = ""
+        for method, path, params, json_body in reqs:
+            status, payload, text = self._api_request(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                proxies=proxies,
+                timeout=30,
+            )
+            if status == 404:
+                continue
+            if not (200 <= status < 300):
+                if self._is_api_token_invalid(status, payload, text):
+                    raise MailServiceError(
+                        "Graph 接口模式鉴权失败：开放接口 token 无效。"
+                        "请检查 graph_api_token 是否与上游 MAIL_API_TOKEN 一致。"
+                    )
+                detail = self._api_error_message(payload, text)
+                last_err = f"{path} HTTP {status}: {detail or text}"
+                continue
+
+            items = self._extract_api_messages(payload)
+            details = [self._api_message_detail_from_item(target, it, idx) for idx, it in enumerate(items)]
+            self._cache_api_message_rows(target, details)
+            return details
+
+        raise MailServiceError(
+            "Graph 接口模式拉取邮件失败: "
+            f"{last_err or '未找到可用取件接口（需支持 /api/open/messages 或 /api/open/accounts/:id/messages）'}"
+        )
+
     def list_domains(self, *, proxies: Any = None) -> list[str]:
-        _ = proxies
+        if self.accounts_mode == "api":
+            self._refresh_api_accounts_if_needed(proxies=proxies)
         domains = []
         for acc in self._accounts:
             email = str(acc.get("email") or "").strip().lower()
@@ -2406,6 +3266,8 @@ class MicrosoftGraphService(MailServiceBase):
         proxies: Any = None,
     ) -> str:
         _ = (random_domain, local_prefix, random_length, proxies)
+        if self.accounts_mode == "api":
+            self._refresh_api_accounts_if_needed(proxies=proxies)
         pool = list(self._accounts)
         if isinstance(allowed_domains, list) and allowed_domains:
             allow = {str(x).strip().lower() for x in allowed_domains if str(x).strip()}
@@ -2427,6 +3289,16 @@ class MicrosoftGraphService(MailServiceBase):
         return email
 
     def refresh_mailbox_token(self, mailbox: str, *, proxies: Any = None) -> dict[str, Any]:
+        if self.accounts_mode == "api":
+            target = str(mailbox or "").strip().lower()
+            if not target or "@" not in target:
+                raise MailServiceError("邮箱地址不能为空")
+            self._load_api_messages_for_mailbox(target, proxies=proxies)
+            return {
+                "ok": True,
+                "mailbox": target,
+                "message": "api_probe_ok",
+            }
         acc = self._find_account(mailbox)
         token = self._refresh_access_token(acc, proxies=proxies, force_refresh=True)
         return {
@@ -2436,7 +3308,8 @@ class MicrosoftGraphService(MailServiceBase):
         }
 
     def list_mailboxes(self, *, limit: int = 100, offset: int = 0, proxies: Any = None) -> list[dict[str, Any]]:
-        _ = proxies
+        if self.accounts_mode == "api":
+            self._refresh_api_accounts_if_needed(proxies=proxies)
         lim = max(1, min(500, int(limit)))
         off = max(0, int(offset))
         rows: list[dict[str, Any]] = []
@@ -2444,13 +3317,18 @@ class MicrosoftGraphService(MailServiceBase):
             email = str(acc.get("email") or "").strip().lower()
             if not email:
                 continue
+            count = 0
+            if self.accounts_mode == "api":
+                box_cache = self._api_message_cache.get(email)
+                if isinstance(box_cache, dict):
+                    count = max(0, len(box_cache))
             rows.append(
                 {
                     "key": f"{email}:{idx}",
                     "address": email,
                     "created_at": "-",
                     "expires_at": "-",
-                    "count": 0,
+                    "count": count,
                 }
             )
         return rows[off: off + lim]
@@ -2460,6 +3338,22 @@ class MicrosoftGraphService(MailServiceBase):
         raise MailServiceError("Graph 模式不支持删除邮箱账号（仅支持删邮件）")
 
     def list_emails(self, mailbox: str, *, proxies: Any = None) -> list[dict[str, Any]]:
+        if self.accounts_mode == "api":
+            rows = self._load_api_messages_for_mailbox(mailbox, proxies=proxies)
+            rows.sort(key=lambda x: str(x.get("date") or ""), reverse=True)
+            return [
+                {
+                    "id": str(x.get("id") or ""),
+                    "from": str(x.get("from") or "-"),
+                    "subject": str(x.get("subject") or "(无主题)"),
+                    "date": str(x.get("date") or "-"),
+                    "preview": str(x.get("preview") or ""),
+                    "mailbox": str(x.get("mailbox") or str(mailbox or "").strip().lower()),
+                    "raw": x.get("payload") if isinstance(x.get("payload"), dict) else {},
+                }
+                for x in rows
+            ]
+
         acc = self._find_account(mailbox)
         if self.fetch_mode == "imap_xoauth2":
             rows: list[dict[str, Any]] = []
@@ -2568,6 +3462,28 @@ class MicrosoftGraphService(MailServiceBase):
         target = str(email_id or "").strip()
         if not target:
             raise MailServiceError("邮件 ID 不能为空")
+
+        if self.accounts_mode == "api":
+            mailbox, message_id = self._parse_api_message_id(target)
+            box_cache = self._api_message_cache.get(mailbox)
+            if not isinstance(box_cache, dict) or message_id not in box_cache:
+                self._load_api_messages_for_mailbox(mailbox, proxies=proxies)
+                box_cache = self._api_message_cache.get(mailbox)
+            detail = dict((box_cache or {}).get(message_id) or {})
+            if not detail:
+                raise MailServiceError("Graph 接口邮件详情不存在或缓存已失效")
+            return {
+                "id": str(detail.get("id") or target),
+                "from": str(detail.get("from") or "-"),
+                "subject": str(detail.get("subject") or "(无主题)"),
+                "date": str(detail.get("date") or "-"),
+                "text": str(detail.get("text") or ""),
+                "html": str(detail.get("html") or ""),
+                "raw": str(detail.get("raw") or ""),
+                "content": str(detail.get("content") or ""),
+                "payload": detail.get("payload") if isinstance(detail.get("payload"), dict) else {},
+            }
+
         if self.fetch_mode == "imap_xoauth2":
             parts = target.split(":", 2)
             if len(parts) != 3 or parts[0] != "imap":
@@ -2681,6 +3597,9 @@ class MicrosoftGraphService(MailServiceBase):
         target = str(email_id or "").strip()
         if not target:
             raise MailServiceError("邮件 ID 不能为空")
+        if self.accounts_mode == "api":
+            _ = proxies
+            raise MailServiceError("Graph 接口模式暂不支持删信，请在上游服务端执行")
         if self.fetch_mode == "imap_xoauth2":
             parts = target.split(":", 2)
             if len(parts) != 3 or parts[0] != "imap":
@@ -2729,6 +3648,9 @@ class MicrosoftGraphService(MailServiceBase):
         target = str(mailbox or "").strip().lower()
         if not target:
             raise MailServiceError("邮箱地址不能为空")
+        if self.accounts_mode == "api":
+            _ = proxies
+            raise MailServiceError("Graph 接口模式暂不支持清空邮箱，请在上游服务端执行")
         if self.fetch_mode == "imap_xoauth2":
             deleted = 0
             mails = self.list_emails(target, proxies=proxies)
